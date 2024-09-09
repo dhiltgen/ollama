@@ -697,18 +697,19 @@ func pickBestFullFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoL
 		numParallelToTry = []int{*numParallel}
 	}
 
-	for _, gl := range gpus.ByLibrary() {
-		var ok bool
-		sgl := append(make(gpu.GpuInfoList, 0, len(gl)), gl...)
+	for _, p := range numParallelToTry {
+		req.opts.NumCtx = req.origNumCtx * p
 
-		// TODO - potentially sort by performance capability, existing models loaded, etc.
-		// TODO - Eliminate any GPUs that already have envconfig.MaxRunners loaded on them
-		// Note: at present, this will favor more VRAM over faster GPU speed in mixed setups
-		sort.Sort(sort.Reverse(gpu.ByFreeMemory(sgl)))
+		for _, gl := range gpus.ByLibrary() {
+			var ok bool
+			sgl := append(make(gpu.GpuInfoList, 0, len(gl)), gl...)
 
-		// First attempt to fit the model into a single GPU
-		for _, p := range numParallelToTry {
-			req.opts.NumCtx = req.origNumCtx * p
+			// TODO - potentially sort by performance capability, existing models loaded, etc.
+			// TODO - Eliminate any GPUs that already have envconfig.MaxRunners loaded on them
+			// Note: at present, this will favor more VRAM over faster GPU speed in mixed setups
+			sort.Sort(sort.Reverse(gpu.ByFreeMemory(sgl)))
+
+			// First attempt to fit the model into a single GPU
 			if !envconfig.SchedSpread() {
 				for _, g := range sgl {
 					if ok, estimatedVRAM = llm.PredictServerFit([]gpu.GpuInfo{g}, ggml, req.model.AdapterPaths, req.model.ProjectorPaths, req.opts); ok {
@@ -718,15 +719,12 @@ func pickBestFullFitByLibrary(req *LlmRequest, ggml *llm.GGML, gpus gpu.GpuInfoL
 					}
 				}
 			}
-		}
 
-		// TODO future refinements
-		// - if multiple Libraries, see if any single GPU in any Library will fit
-		// - try subsets of GPUs instead of just falling back to 1 or all in a family
+			// TODO future refinements
+			// - if multiple Libraries, see if any single GPU in any Library will fit
+			// - try subsets of GPUs instead of just falling back to 1 or all in a family
 
-		// Now try all the GPUs
-		for _, p := range numParallelToTry {
-			req.opts.NumCtx = req.origNumCtx * p
+			// Now try all the GPUs
 			if ok, estimatedVRAM = llm.PredictServerFit(sgl, ggml, req.model.AdapterPaths, req.model.ProjectorPaths, req.opts); ok {
 				slog.Info("new model will fit in available VRAM, loading", "model", req.model.ModelPath, "library", sgl[0].Library, "parallel", p, "required", format.HumanBytes2(estimatedVRAM))
 				*numParallel = p

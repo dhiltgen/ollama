@@ -176,11 +176,12 @@ func EstimateGPULayers(gpus []gpu.GpuInfo, ggml *GGML, projectors []string, opts
 				"name", gpus[i].Name,
 				"total", format.HumanBytes2(gpus[i].TotalMemory),
 				"available", format.HumanBytes2(gpus[i].FreeMemory),
+				"num_ctx", opts.NumCtx,
 				"minimum_memory", gpus[i].MinimumMemory,
 				"layer_size", format.HumanBytes2(layerSize),
-				"gpu_zer_overhead", format.HumanBytes2(gzo),
-				"partial_offload", format.HumanBytes2(graphPartialOffload),
-				"full_offload", format.HumanBytes2(graphFullOffload),
+				"gpu_zero_overhead", format.HumanBytes2(gzo),
+				"graph_partial_offload", format.HumanBytes2(graphPartialOffload),
+				"graph_full_offload", format.HumanBytes2(graphFullOffload),
 			)
 			continue
 		}
