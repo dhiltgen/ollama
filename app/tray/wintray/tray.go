@@ -33,16 +33,16 @@ type winTray struct {
 
 	// menus keeps track of the submenus keyed by the menu item ID, plus 0
 	// which corresponds to the main popup menu.
-	menus    map[uint32]windows.Handle
+	menus    map[MenuID]windows.Handle
 	muMenus  sync.RWMutex
-	menuOf   map[uint32]windows.Handle
+	menuOf   map[MenuID]windows.Handle
 	muMenuOf sync.RWMutex
 	// menuItemIcons maintains the bitmap of each menu item (if applies). It's
 	// needed to show the icon correctly when showing a previously hidden menu
 	// item again.
 	// menuItemIcons   map[uint32]windows.Handle
 	// muMenuItemIcons sync.RWMutex
-	visibleItems   map[uint32][]uint32
+	visibleItems   map[MenuID][]MenuID
 	muVisibleItems sync.RWMutex
 
 	nid   *notifyIconData
@@ -71,6 +71,9 @@ func InitTray(icon, updateIcon []byte) (*winTray, error) {
 	wt.callbacks.Update = make(chan struct{})
 	wt.callbacks.ShowLogs = make(chan struct{})
 	wt.callbacks.DoFirstUse = make(chan struct{})
+	wt.callbacks.ExposeHost = make(chan bool)
+	wt.callbacks.ExposeBrowser = make(chan bool)
+	wt.callbacks.UpdateModelDir = make(chan string)
 	wt.normalIcon = icon
 	wt.updateIcon = updateIcon
 	if err := wt.initInstance(); err != nil {
@@ -99,9 +102,9 @@ func (t *winTray) initInstance() error {
 	)
 
 	t.wmSystrayMessage = WM_USER + 1
-	t.visibleItems = make(map[uint32][]uint32)
-	t.menus = make(map[uint32]windows.Handle)
-	t.menuOf = make(map[uint32]windows.Handle)
+	t.visibleItems = make(map[MenuID][]MenuID)
+	t.menus = make(map[MenuID]windows.Handle)
+	t.menuOf = make(map[MenuID]windows.Handle)
 
 	t.loadedImages = make(map[string]windows.Handle)
 
@@ -238,7 +241,36 @@ type menuItemInfo struct {
 	BMPItem                     windows.Handle
 }
 
-func (t *winTray) addOrUpdateMenuItem(menuItemId uint32, parentId uint32, title string, disabled bool) error {
+func (t *winTray) convertToSubMenu(menuItemId MenuID) (windows.Handle, error) {
+	const MIIM_SUBMENU = 0x00000004
+
+	res, _, err := pCreateMenu.Call()
+	if res == 0 {
+		return 0, err
+	}
+	menu := windows.Handle(res)
+
+	mi := menuItemInfo{Mask: MIIM_SUBMENU, SubMenu: menu}
+	mi.Size = uint32(unsafe.Sizeof(mi))
+	t.muMenuOf.RLock()
+	hMenu := t.menuOf[menuItemId]
+	t.muMenuOf.RUnlock()
+	res, _, err = pSetMenuItemInfo.Call(
+		uintptr(hMenu),
+		uintptr(menuItemId),
+		0,
+		uintptr(unsafe.Pointer(&mi)),
+	)
+	if res == 0 {
+		return 0, err
+	}
+	t.muMenus.Lock()
+	t.menus[menuItemId] = menu
+	t.muMenus.Unlock()
+	return menu, nil
+}
+
+func (t *winTray) addOrUpdateMenuItem(menuItemId, parentId MenuID, title string, disabled, checked bool) error {
 	titlePtr, err := windows.UTF16PtrFromString(title)
 	if err != nil {
 		return err
@@ -247,7 +279,7 @@ func (t *winTray) addOrUpdateMenuItem(menuItemId uint32, parentId uint32, title 
 	mi := menuItemInfo{
 		Mask:     MIIM_FTYPE | MIIM_STRING | MIIM_ID | MIIM_STATE,
 		Type:     MFT_STRING,
-		ID:       menuItemId,
+		ID:       uint32(menuItemId),
 		TypeData: titlePtr,
 		Cch:      uint32(len(title)),
 	}
@@ -255,20 +287,31 @@ func (t *winTray) addOrUpdateMenuItem(menuItemId uint32, parentId uint32, title 
 	if disabled {
 		mi.State |= MFS_DISABLED
 	}
+	if checked {
+		mi.State |= MFS_CHECKED
+	}
 
 	var res uintptr
 	t.muMenus.RLock()
-	menu := t.menus[parentId]
+	menu, exists := t.menus[parentId]
 	t.muMenus.RUnlock()
-	if t.getVisibleItemIndex(parentId, menuItemId) != -1 {
+	if !exists {
+		menu, err = t.convertToSubMenu(parentId)
+		if err != nil {
+			return err
+		}
+		t.muMenus.Lock()
+		t.menus[parentId] = menu
+		t.muMenus.Unlock()
+	} else if t.getVisibleItemIndex(parentId, menuItemId) != -1 {
 		// We set the menu item info based on the menuID
-		boolRet, _, err := pSetMenuItemInfo.Call(
+		res, _, err = pSetMenuItemInfo.Call(
 			uintptr(menu),
 			uintptr(menuItemId),
 			0,
 			uintptr(unsafe.Pointer(&mi)),
 		)
-		if boolRet == 0 {
+		if res == 0 {
 			return fmt.Errorf("failed to set menu item: %w", err)
 		}
 	}
@@ -302,11 +345,11 @@ func (t *winTray) addOrUpdateMenuItem(menuItemId uint32, parentId uint32, title 
 	return nil
 }
 
-func (t *winTray) addSeparatorMenuItem(menuItemId, parentId uint32) error {
+func (t *winTray) addSeparatorMenuItem(menuItemId, parentId MenuID) error {
 	mi := menuItemInfo{
 		Mask: MIIM_FTYPE | MIIM_ID | MIIM_STATE,
 		Type: MFT_SEPARATOR,
-		ID:   menuItemId,
+		ID:   uint32(menuItemId),
 	}
 
 	mi.Size = uint32(unsafe.Sizeof(mi))
@@ -375,7 +418,7 @@ func (t *winTray) showMenu() error {
 	return nil
 }
 
-func (t *winTray) delFromVisibleItems(parent, val uint32) {
+func (t *winTray) delFromVisibleItems(parent, val MenuID) {
 	t.muVisibleItems.Lock()
 	defer t.muVisibleItems.Unlock()
 	visibleItems := t.visibleItems[parent]
@@ -387,11 +430,11 @@ func (t *winTray) delFromVisibleItems(parent, val uint32) {
 	}
 }
 
-func (t *winTray) addToVisibleItems(parent, val uint32) {
+func (t *winTray) addToVisibleItems(parent, val MenuID) {
 	t.muVisibleItems.Lock()
 	defer t.muVisibleItems.Unlock()
 	if visibleItems, exists := t.visibleItems[parent]; !exists {
-		t.visibleItems[parent] = []uint32{val}
+		t.visibleItems[parent] = []MenuID{val}
 	} else {
 		newvisible := append(visibleItems, val)
 		sort.Slice(newvisible, func(i, j int) bool { return newvisible[i] < newvisible[j] })
@@ -399,7 +442,7 @@ func (t *winTray) addToVisibleItems(parent, val uint32) {
 	}
 }
 
-func (t *winTray) getVisibleItemIndex(parent, val uint32) int {
+func (t *winTray) getVisibleItemIndex(parent, val MenuID) int {
 	t.muVisibleItems.RLock()
 	defer t.muVisibleItems.RUnlock()
 	for i, itemval := range t.visibleItems[parent] {
@@ -479,8 +522,8 @@ func (t *winTray) loadIconFrom(src string) (windows.Handle, error) {
 func (t *winTray) DisplayFirstUseNotification() error {
 	t.muNID.Lock()
 	defer t.muNID.Unlock()
-	copy(t.nid.InfoTitle[:], windows.StringToUTF16(firstTimeTitle))
-	copy(t.nid.Info[:], windows.StringToUTF16(firstTimeMessage))
+	copy(t.nid.InfoTitle[:], windows.StringToUTF16(commontray.FirstTimeTitle))
+	copy(t.nid.Info[:], windows.StringToUTF16(commontray.FirstTimeMessage))
 	t.nid.Flags |= NIF_INFO
 	t.nid.Size = uint32(unsafe.Sizeof(*wt.nid))
 

@@ -13,8 +13,11 @@ import (
 )
 
 type Store struct {
-	ID           string `json:"id"`
-	FirstTimeRun bool   `json:"first-time-run"`
+	ID                       string `json:"id"`
+	FirstTimeRun             bool   `json:"first-time-run"`
+	AllowExternalConnections bool   `json:"external-connections"`
+	AllowBrowserConnections  bool   `json:"browser-connections"`
+	ModelDir                 string `json:"model-dir"`
 }
 
 var (
@@ -47,6 +50,63 @@ func SetFirstTimeRun(val bool) {
 		return
 	}
 	store.FirstTimeRun = val
+	writeStore(getStorePath())
+}
+
+func GetAllowExternalConnections() bool {
+	lock.Lock()
+	defer lock.Unlock()
+	if store.ID == "" {
+		initStore()
+	}
+	return store.AllowExternalConnections
+}
+
+func SetAllowExternalConnections(val bool) {
+	lock.Lock()
+	defer lock.Unlock()
+	if store.AllowExternalConnections == val {
+		return
+	}
+	store.AllowExternalConnections = val
+	writeStore(getStorePath())
+}
+
+func GetAllowBrowserConnections() bool {
+	lock.Lock()
+	defer lock.Unlock()
+	if store.ID == "" {
+		initStore()
+	}
+	return store.AllowBrowserConnections
+}
+
+func SetAllowBrowserConnections(val bool) {
+	lock.Lock()
+	defer lock.Unlock()
+	if store.AllowBrowserConnections == val {
+		return
+	}
+	store.AllowBrowserConnections = val
+	writeStore(getStorePath())
+}
+
+func GetModelDir() string {
+	lock.Lock()
+	defer lock.Unlock()
+	if store.ID == "" {
+		initStore()
+	}
+	return store.ModelDir
+}
+
+func SetModelDir(val string) {
+	lock.Lock()
+	defer lock.Unlock()
+	if store.ModelDir == val {
+		return
+	}
+	store.ModelDir = val
 	writeStore(getStorePath())
 }
 

@@ -28,6 +28,38 @@ func Run() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
+	// TODO - maybe move elsewhere
+	if store.GetAllowExternalConnections() && os.Getenv("OLLAMA_HOST") == "" {
+		os.Setenv("OLLAMA_HOST", "0.0.0.0")
+	}
+	if store.GetAllowBrowserConnections() && os.Getenv("OLLAMA_ORIGINS") == "" {
+		os.Setenv("OLLAMA_ORIGINS", "*")
+	}
+	modelDir := store.GetModelDir()
+	if modelDir != "" && os.Getenv("OLLAMA_MODELS") == "" {
+		os.Setenv("OLLAMA_MODELS", modelDir)
+
+	}
+
+	restartServer := func() {
+		cancel()
+		slog.Info("Waiting for ollama server to shutdown...")
+		if done != nil {
+			<-done
+		}
+		slog.Info("Restarting ollama server with new settings...")
+		ctx, cancel = context.WithCancel(context.Background())
+		done, err = SpawnServer(ctx, CLIName)
+		if err != nil {
+			// TODO - should we retry in a backoff loop?
+			// TODO - should we pop up a warning and maybe add a menu item to view application logs?
+			slog.Error(fmt.Sprintf("Failed to spawn ollama server %s", err))
+			done = make(chan int, 1)
+			done <- 1
+		}
+
+	}
+
 	go func() {
 		slog.Debug("starting callback loop")
 		for {
@@ -50,6 +82,24 @@ func Run() {
 				if err != nil {
 					slog.Warn(fmt.Sprintf("Failed to launch getting started shell: %s", err))
 				}
+			case val := <-callbacks.ExposeHost:
+				if val {
+					os.Setenv("OLLAMA_HOST", "0.0.0.0")
+				} else {
+					os.Setenv("OLLAMA_HOST", "")
+				}
+				restartServer()
+			case val := <-callbacks.ExposeBrowser:
+				if val {
+					os.Setenv("OLLAMA_ORIGINS", "*")
+				} else {
+					os.Setenv("OLLAMA_ORIGINS", "")
+				}
+				restartServer()
+			case val := <-callbacks.UpdateModelDir:
+				// TODO - should we validate the path?  What if it fails?
+				os.Setenv("OLLAMA_MODELS", val)
+				restartServer()
 			}
 		}
 	}()

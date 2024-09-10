@@ -8,6 +8,9 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/ollama/ollama/app/store"
+	"github.com/ollama/ollama/app/tray/commontray"
+	"github.com/ollama/ollama/envconfig"
 	"golang.org/x/sys/windows"
 )
 
@@ -64,7 +67,7 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 	)
 	switch message {
 	case WM_COMMAND:
-		menuItemId := int32(wParam)
+		menuItemId := MenuID(wParam)
 		// https://docs.microsoft.com/en-us/windows/win32/menurc/wm-command#menus
 		switch menuItemId {
 		case quitMenuID:
@@ -87,6 +90,45 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 			// should not happen but in case not listening
 			default:
 				slog.Error("no listener on ShowLogs")
+			}
+		case toggleHostMenuID:
+			newState := !store.GetAllowExternalConnections()
+			store.SetAllowExternalConnections(newState)
+			if err := t.addOrUpdateMenuItem(toggleHostMenuID, settingsMenuID, commontray.HostMenuTitle, false, newState); err != nil {
+				slog.Warn("unable to update menu entries", "error", err)
+			}
+			select {
+			case t.callbacks.ExposeHost <- newState:
+			// should not happen but in case not listening
+			default:
+				slog.Error("no listener on ExposeHost")
+			}
+		case toggleDomainsMenuID:
+			newState := !store.GetAllowBrowserConnections()
+			store.SetAllowBrowserConnections(newState)
+			if err := t.addOrUpdateMenuItem(toggleDomainsMenuID, settingsMenuID, commontray.DomainMenuTitle, false, newState); err != nil {
+				slog.Warn("unable to update menu entries", "error", err)
+			}
+			select {
+			case t.callbacks.ExposeBrowser <- newState:
+			// should not happen but in case not listening
+			default:
+				slog.Error("no listener on ExposeBrowser")
+			}
+		case setModelDirMenuID:
+			currentModelDir := envconfig.Models()
+			newLoc, err := BrowseForFolder(hWnd, currentModelDir, commontray.ModelDialogMessage)
+			if err != nil {
+				slog.Debug("ERROR", "error", err)
+			}
+			if newLoc != currentModelDir {
+				slog.Debug("Updating model dir location", "path", newLoc)
+				select {
+				case t.callbacks.UpdateModelDir <- newLoc:
+				// should not happen but in case not listening
+				default:
+					slog.Error("no listener on UpdateModelDir")
+				}
 			}
 		default:
 			slog.Debug(fmt.Sprintf("Unexpected menu item id: %d", menuItemId))

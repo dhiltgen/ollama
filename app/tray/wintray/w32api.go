@@ -12,9 +12,12 @@ var (
 	k32 = windows.NewLazySystemDLL("Kernel32.dll")
 	u32 = windows.NewLazySystemDLL("User32.dll")
 	s32 = windows.NewLazySystemDLL("Shell32.dll")
+	o32 = windows.NewLazySystemDLL("ole32.dll")
 
+	pCreateMenu            = u32.NewProc("CreateMenu")
 	pCreatePopupMenu       = u32.NewProc("CreatePopupMenu")
 	pCreateWindowEx        = u32.NewProc("CreateWindowExW")
+	pCoTaskMemFree         = o32.NewProc("CoTaskMemFree")
 	pDefWindowProc         = u32.NewProc("DefWindowProcW")
 	pDestroyWindow         = u32.NewProc("DestroyWindow")
 	pDispatchMessage       = u32.NewProc("DispatchMessageW")
@@ -25,14 +28,20 @@ var (
 	pLoadCursor            = u32.NewProc("LoadCursorW")
 	pLoadIcon              = u32.NewProc("LoadIconW")
 	pLoadImage             = u32.NewProc("LoadImageW")
+	pOleInitialize         = o32.NewProc("OleInitialize")
+	pOleUninitialize       = o32.NewProc("OleUninitialize")
 	pPostMessage           = u32.NewProc("PostMessageW")
 	pPostQuitMessage       = u32.NewProc("PostQuitMessage")
 	pRegisterClass         = u32.NewProc("RegisterClassExW")
 	pRegisterWindowMessage = u32.NewProc("RegisterWindowMessageW")
+	pSendMessage           = u32.NewProc("SendMessageW")
 	pSetForegroundWindow   = u32.NewProc("SetForegroundWindow")
 	pSetMenuInfo           = u32.NewProc("SetMenuInfo")
 	pSetMenuItemInfo       = u32.NewProc("SetMenuItemInfoW")
 	pShellNotifyIcon       = s32.NewProc("Shell_NotifyIconW")
+	pSHBrowseForFolderW    = s32.NewProc("SHBrowseForFolderW")
+	pSHParseDisplayName    = s32.NewProc("SHParseDisplayName")
+	pSHGetPathFromIDListW  = s32.NewProc("SHGetPathFromIDListW")
 	pShowWindow            = u32.NewProc("ShowWindow")
 	pTrackPopupMenu        = u32.NewProc("TrackPopupMenu")
 	pTranslateMessage      = u32.NewProc("TranslateMessage")
@@ -51,6 +60,7 @@ const (
 	LR_LOADFROMFILE     = 0x00000010 // Loads the stand-alone image from the file
 	MF_BYCOMMAND        = 0x00000000
 	MFS_DISABLED        = 0x00000003
+	MFS_CHECKED         = 0x00000008
 	MFT_SEPARATOR       = 0x00000800
 	MFT_STRING          = 0x00000000
 	MIIM_BITMAP         = 0x00000080
