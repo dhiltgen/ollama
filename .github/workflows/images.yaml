@@ -1,0 +1,28 @@
+name: images
+
+on:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: dhiltgen/ollama
+          flavor: |
+            latest=true
+          tags: |
+            type=ref,event=tag
+            type=ref,enable=true,priority=600,prefix=0.0.0-pr,suffix=,event=pr
+            type=semver,pattern={{version}}
+      - name: debug
+        run: |
+          env
+          exit 1
