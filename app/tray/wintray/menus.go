@@ -98,6 +98,8 @@ func (t *winTray) UpdateAvailable(ver string) error {
 		if err != nil {
 			return err
 		}
+		// TODO - if we want to reposition the dialog down in the tray area
+		// we can either build the window from scratch, or wire up
 		ret, _, _ := pMessageBoxTimeout.Call(
 			uintptr(t.window),
 			uintptr(unsafe.Pointer(updateMessage)),
