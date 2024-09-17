@@ -3,10 +3,11 @@
 package commontray
 
 const (
-	FirstTimeTitle   = "Ollama is running"
-	FirstTimeMessage = "Click here to get started"
-	UpdateTitle      = "Update available"
-	UpdateMessage    = "Ollama version %s is ready to install"
+	FirstTimeTitle       = "Ollama is running"
+	FirstTimeMessage     = "Click here to get started"
+	UpdateTitle          = "Update available"
+	UpdateMessage        = "A new Ollama version %s is ready to install\r\rWould you like to install it now?"
+	UpdateMessageTimeout = 10 // seconds
 
 	QuitMenuTitle            = "Quit Ollama"
 	UpdateAvailableMenuTitle = "An update is available"
