@@ -55,16 +55,7 @@ func nativeLoop() {
 // WindowProc callback function that processes messages sent to a window.
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ms633573(v=vs.85).aspx
 func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam uintptr) (lResult uintptr) {
-	const (
-		WM_RBUTTONUP   = 0x0205
-		WM_LBUTTONUP   = 0x0202
-		WM_COMMAND     = 0x0111
-		WM_ENDSESSION  = 0x0016
-		WM_CLOSE       = 0x0010
-		WM_DESTROY     = 0x0002
-		WM_MOUSEMOVE   = 0x0200
-		WM_LBUTTONDOWN = 0x0201
-	)
+	const ()
 	switch message {
 	case WM_COMMAND:
 		menuItemId := MenuID(wParam)
@@ -155,6 +146,9 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 			}
 		}
 		t.muNID.Unlock()
+	// case WM_WINDOWPOSCHANGING:
+	// Might be able to hook this and move the pop-up, but it might create a feedback loop
+
 	case t.wmSystrayMessage:
 		switch lParam {
 		case WM_MOUSEMOVE, WM_LBUTTONDOWN:
@@ -194,6 +188,7 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 		}
 		t.muNID.Unlock()
 	default:
+		// slog.Debug("XXX default wndProc handler", "message", message, "wParm", wParam, "lParm", lParam)
 		// Calls the default window procedure to provide default processing for any window messages that an application does not process.
 		// https://msdn.microsoft.com/en-us/library/windows/desktop/ms633572(v=vs.85).aspx
 		lResult, _, _ = pDefWindowProc.Call(
