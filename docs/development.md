@@ -1,183 +1,5 @@
 # Development
 
-> [!IMPORTANT]
-> The `llm` package that loads and runs models is being updated to use a new [Go runner](#transition-to-go-runner): this should only impact a small set of PRs however it does change how the project is built.
-
-Install required tools:
-
-- cmake version 3.24 or higher
-- go version 1.22 or higher
-- gcc version 11.4.0 or higher
-
-### MacOS
-
-```bash
-brew install go cmake gcc
-```
-
-Optionally enable debugging and more verbose logging:
-
-```bash
-# At build time
-export CGO_CFLAGS="-g"
-
-# At runtime
-export OLLAMA_DEBUG=1
-```
-
-Get the required libraries and build the native LLM code:
-
-```bash
-go generate ./...
-```
-
-Then build ollama:
-
-```bash
-go build .
-```
-
-Now you can run `ollama`:
-
-```bash
-./ollama
-```
-
-### Linux
-
-#### Linux CUDA (NVIDIA)
-
-_Your operating system distribution may already have packages for NVIDIA CUDA. Distro packages are often preferable, but instructions are distro-specific. Please consult distro-specific docs for dependencies if available!_
-
-Install `cmake` and `golang` as well as [NVIDIA CUDA](https://developer.nvidia.com/cuda-downloads)
-development and runtime packages.
-
-Typically the build scripts will auto-detect CUDA, however, if your Linux distro
-or installation approach uses unusual paths, you can specify the location by
-specifying an environment variable `CUDA_LIB_DIR` to the location of the shared
-libraries, and `CUDACXX` to the location of the nvcc compiler. You can customize
-a set of target CUDA architectures by setting `CMAKE_CUDA_ARCHITECTURES` (e.g. "50;60;70")
-
-Then generate dependencies:
-
-```
-go generate ./...
-```
-
-Then build the binary:
-
-```
-go build .
-```
-
-#### Linux ROCm (AMD)
-
-_Your operating system distribution may already have packages for AMD ROCm and CLBlast. Distro packages are often preferable, but instructions are distro-specific. Please consult distro-specific docs for dependencies if available!_
-
-Install [CLBlast](https://github.com/CNugteren/CLBlast/blob/master/doc/installation.md) and [ROCm](https://rocm.docs.amd.com/en/latest/) development packages first, as well as `cmake` and `golang`.
-
-Typically the build scripts will auto-detect ROCm, however, if your Linux distro
-or installation approach uses unusual paths, you can specify the location by
-specifying an environment variable `ROCM_PATH` to the location of the ROCm
-install (typically `/opt/rocm`), and `CLBlast_DIR` to the location of the
-CLBlast install (typically `/usr/lib/cmake/CLBlast`). You can also customize
-the AMD GPU targets by setting AMDGPU_TARGETS (e.g. `AMDGPU_TARGETS="gfx1101;gfx1102"`)
-
-```
-go generate ./...
-```
-
-Then build the binary:
-
-```
-go build .
-```
-
-ROCm requires elevated privileges to access the GPU at runtime. On most distros you can add your user account to the `render` group, or run as root.
-
-#### Advanced CPU Settings
-
-By default, running `go generate ./...` will compile a few different variations
-of the LLM library based on common CPU families and vector math capabilities,
-including a lowest-common-denominator which should run on almost any 64 bit CPU
-somewhat slowly. At runtime, Ollama will auto-detect the optimal variation to
-load. If you would like to build a CPU-based build customized for your
-processor, you can set `OLLAMA_CUSTOM_CPU_DEFS` to the llama.cpp flags you would
-like to use. For example, to compile an optimized binary for an Intel i9-9880H,
-you might use:
-
-```
-OLLAMA_CUSTOM_CPU_DEFS="-DGGML_AVX=on -DGGML_AVX2=on -DGGML_F16C=on -DGGML_FMA=on" go generate ./...
-go build .
-```
-
-#### Containerized Linux Build
-
-If you have Docker available, you can build linux binaries with `./scripts/build_linux.sh` which has the CUDA and ROCm dependencies included. The resulting binary is placed in `./dist`
-
-### Windows
-
-Note: The Windows build for Ollama is still under development.
-
-First, install required tools:
-
-- MSVC toolchain - C/C++ and cmake as minimal requirements
-- Go version 1.22 or higher
-- MinGW (pick one variant) with GCC.
-  - [MinGW-w64](https://www.mingw-w64.org/)
-  - [MSYS2](https://www.msys2.org/)
-- The `ThreadJob` Powershell module: `Install-Module -Name ThreadJob -Scope CurrentUser`
-
-Then, build the `ollama` binary:
-
-```powershell
-$env:CGO_ENABLED="1"
-go generate ./...
-go build .
-```
-
-#### Windows CUDA (NVIDIA)
-
-In addition to the common Windows development tools described above, install CUDA after installing MSVC.
-
-- [NVIDIA CUDA](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html)
-
-
-#### Windows ROCm (AMD Radeon)
-
-In addition to the common Windows development tools described above, install AMDs HIP package after installing MSVC.
-
-- [AMD HIP](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
-- [Strawberry Perl](https://strawberryperl.com/)
-
-Lastly, add `ninja.exe` included with MSVC to the system path (e.g. `C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja`).
-
-#### Windows arm64
-
-The default `Developer PowerShell for VS 2022` may default to x86 which is not what you want.  To ensure you get an arm64 development environment, start a plain PowerShell terminal and run:
-
-```powershell
-import-module 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\Tools\\Microsoft.VisualStudio.DevShell.dll'
-Enter-VsDevShell -Arch arm64 -vsinstallpath 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community' -skipautomaticlocation
-```
-
-You can confirm with `write-host $env:VSCMD_ARG_TGT_ARCH`
-
-Follow the instructions at https://www.msys2.org/wiki/arm64/ to set up an arm64 msys2 environment.  Ollama requires gcc and mingw32-make to compile, which is not currently available on Windows arm64, but a gcc compatibility adapter is available via `mingw-w64-clang-aarch64-gcc-compat`. At a minimum you will need to install the following:
-
-```
-pacman -S mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-gcc-compat mingw-w64-clang-aarch64-make make
-```
-
-You will need to ensure your PATH includes go, cmake, gcc and clang mingw32-make to build ollama from source. (typically `C:\msys64\clangarm64\bin\`)
-
-
-## Transition to Go runner
-
-The Ollama team is working on moving to a new Go based runner that loads and runs models in a subprocess to replace the previous code under `ext_server`. During this transition period, this new Go runner is "opt in" at build time, and requires using a different approach to build.
-
-After the transition to use the Go server exclusively, both `make` and `go generate` will build the Go runner.
-
 Install required tools:
 
 - go version 1.22 or higher
@@ -201,7 +23,7 @@ export OLLAMA_DEBUG=1
 Get the required libraries and build the native LLM code:  (Adjust the job count based on your number of processors for a faster build)
 
 ```bash
-make -C llama -j 5
+make -j 5
 ```
 
 Then build ollama:
@@ -238,7 +60,7 @@ a set of target CUDA architectures by setting `CMAKE_CUDA_ARCHITECTURES` (e.g. "
 Then generate dependencies:  (Adjust the job count based on your number of processors for a faster build)
 
 ```
-make -C llama -j 5
+make -j 5
 ```
 
 Then build the binary:
@@ -263,7 +85,7 @@ the AMD GPU targets by setting AMDGPU_TARGETS (e.g. `AMDGPU_TARGETS="gfx1101;gfx
 Then generate dependencies:  (Adjust the job count based on your number of processors for a faster build)
 
 ```
-make -C llama -j 5
+make -j 5
 ```
 
 Then build the binary:
@@ -305,7 +127,7 @@ Then, build the `ollama` binary:
 
 ```powershell
 $env:CGO_ENABLED="1"
-make -C llama -j 8
+make -j 8
 go build .
 ```
 
@@ -353,31 +175,17 @@ You will need to ensure your PATH includes go, cmake, gcc and clang mingw32-make
 
 Ollama is designed to support multiple LLM backends, and currently utilizes [llama.cpp](https://github.com/ggerganov/llama.cpp/) and [ggml](https://github.com/ggerganov/ggml) through a vendoring model.  While we generally strive to contribute changes back upstream to avoid drift, we cary a small set of patches which are applied to the tracking commit.  A set of make targets are available to aid developers in updating to a newer tracking commit, or to work on changes.
 
-> [!IMPORTANT]
-> Prior to merging #7157 we continue to leverage a submodule for llama.cpp which establishes the tracking commit.  After merging that PR a new manifest file we be utilized
-
 If you will be updating the vendoring code, you should start by running the following command to establish the tracking llama.cpp repo at the top of your ollama repo.
 
 ```
-make -C llama apply-patches
+make apply-patches
 ```
 
 ### Updating Base Commit
 
 **Pin to new base commit**
 
-To update to a newer base commit, select the upstream git tag or commit
-
-> [!IMPORTANT]
-> After merging #7157 a manifest will be used instead of the submodule
-
-```
-cd llm/llama.cpp
-git fetch
-git checkout NEW_BASE_COMMIT
-cd ..
-git add llama.cpp
-```
+To update to a newer base commit, select the upstream git tag or commit and update `llama/vendoring.env` at the top of the ollama tree
 
 **Apply Ollama Patches**
 
@@ -386,25 +194,25 @@ When updating to a newer base commit, the existing patches may not apply cleanly
 Start by applying the patches.  In our example scenario, 0001 applies, but 0002 fails.  The `apply-patches` target will stop at first failure.
 
 ```
-make -C llama apply-patches
+make apply-patches
 ```
 
 Now go into the llama.cpp tracking repo at the top of the ollama repo, and perform merge resolution using your preferred tool to the patch commit which failed (e.g. 0002)  Once that commit is resolved and commited, bring the refreshed patch back to ./llama/patches by running:
 
 ```
-make -C llama patch
+make patch
 ```
 
 This will refresh both 0001 and 0002 in our example scenario.  0001 may have minor line number changes (or no changes at all) while 0002 now contains your adjustments so it applies cleanly.  No other patches will be affected.  Now you can re-run the `apply-patches` target, which will succeed for 0001, 0002, and 0003
 
 ```
-make -C llama apply-patches
+make apply-patches
 ```
 
 Continue iterating until `apply-patches` succeeds at applying **all** the patches.  Once finished, run a final `patch` target to ensure everything is updated.
 
 ```
-make -C llama patch
+make patch
 ```
 
 Build and test Ollama, and make any necessary changes to the Go code based on the new base commit.  Submit your PR to the Ollama repo.
@@ -414,14 +222,14 @@ Build and test Ollama, and make any necessary changes to the Go code based on th
 When working on new fixes or features that impact vendored code, use the following model.  First get a clean tracking repo with all current patches applied:
 
 ```
-make -C llama apply-patches
+make apply-patches
 ```
 
 Now edit the upstream native code in the llama.cpp tracking repo at the top of the ollama repo.  You do not need to commit every change in order to build, a dirty working tree in the tracking repo is OK while developing.  Simply save in your editor, and run the following to refresh the vendored code with your changes, build the backend(s) and build ollama:
 
 ```
-make -C llama sync
-make -C llama -j 8
+make sync
+make -j 8
 go build .
 ```
 
@@ -431,7 +239,7 @@ go build .
 Iterate until you're ready to submit PRs.  Once your code is ready, commit a change in the llama.cpp tracking repo, then generate a new patch for ollama with
 
 ```
-make -C llama patch
+make patch
 ```
 
 > [!IMPORTANT]
