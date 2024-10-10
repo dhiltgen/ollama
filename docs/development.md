@@ -348,3 +348,97 @@ pacman -S mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-gcc-compat mingw
 ```
 
 You will need to ensure your PATH includes go, cmake, gcc and clang mingw32-make to build ollama from source. (typically `C:\msys64\clangarm64\bin\`)
+
+## Vendoring
+
+Ollama is designed to support multiple LLM backends, and currently utilizes [llama.cpp](https://github.com/ggerganov/llama.cpp/) and [ggml](https://github.com/ggerganov/ggml) through a vendoring model.  While we generally strive to contribute changes back upstream to avoid drift, we cary a small set of patches which are applied to the tracking commit.  A set of make targets are available to aid developers in updating to a newer tracking commit, or to work on changes.
+
+> [!IMPORTANT]
+> Prior to merging #7157 we continue to leverage a submodule for llama.cpp which establishes the tracking commit.  After merging that PR a new manifest file we be utilized
+
+If you will be updating the vendoring code, you should start by running the following command to establish the tracking llama.cpp repo at the top of your ollama repo.
+
+```
+make -C llama apply-patches
+```
+
+### Updating Base Commit
+
+**Pin to new base commit**
+
+To update to a newer base commit, select the upstream git tag or commit
+
+> [!IMPORTANT]
+> After merging #7157 a manifest will be used instead of the submodule
+
+```
+cd llm/llama.cpp
+git fetch
+git checkout NEW_BASE_COMMIT
+cd ..
+git add llama.cpp
+```
+
+**Apply Ollama Patches**
+
+When updating to a newer base commit, the existing patches may not apply cleanly and require manual merge resolution.  In the following example, we'll assume patch 0001 applies cleanly, 0002 needs adjustments, and 0003 is clean as well.
+
+Start by applying the patches.  In our example scenario, 0001 applies, but 0002 fails.  The `apply-patches` target will stop at first failure.
+
+```
+make -C llama apply-patches
+```
+
+Now go into the llama.cpp tracking repo at the top of the ollama repo, and perform merge resolution using your preferred tool to the patch commit which failed (e.g. 0002)  Once that commit is resolved and commited, bring the refreshed patch back to ./llama/patches by running:
+
+```
+make -C llama patch
+```
+
+This will refresh both 0001 and 0002 in our example scenario.  0001 may have minor line number changes (or no changes at all) while 0002 now contains your adjustments so it applies cleanly.  No other patches will be affected.  Now you can re-run the `apply-patches` target, which will succeed for 0001, 0002, and 0003
+
+```
+make -C llama apply-patches
+```
+
+Continue iterating until `apply-patches` succeeds at applying **all** the patches.  Once finished, run a final `patch` target to ensure everything is updated.
+
+```
+make -C llama patch
+```
+
+Build and test Ollama, and make any necessary changes to the Go code based on the new base commit.  Submit your PR to the Ollama repo.
+
+### New Development
+
+When working on new fixes or features that impact vendored code, use the following model.  First get a clean tracking repo with all current patches applied:
+
+```
+make -C llama apply-patches
+```
+
+Now edit the upstream native code in the llama.cpp tracking repo at the top of the ollama repo.  You do not need to commit every change in order to build, a dirty working tree in the tracking repo is OK while developing.  Simply save in your editor, and run the following to refresh the vendored code with your changes, build the backend(s) and build ollama:
+
+```
+make -C llama sync
+make -C llama -j 8
+go build .
+```
+
+> [!IMPORTANT]
+> Do **NOT** run `apply-patches` while you're iterating as that will reset the tracking repo.  It will detect a dirty tree and abort, but if your tree is clean and you accidentally ran this target, use `git reflog` to recover your commit(s).
+
+Iterate until you're ready to submit PRs.  Once your code is ready, commit a change in the llama.cpp tracking repo, then generate a new patch for ollama with
+
+```
+make -C llama patch
+```
+
+> [!IMPORTANT]
+> Once you have completed this step, it is safe to run `apply-patches` since your change is preserved as a new patch.
+
+In your llama.cpp tracking repo, create a branch, and cherry-pick the new commit to that branch, then submit a PR upstream to llama.cpp.
+
+Commit the changes in the ollama repo and submit a PR to Ollama, which will include the vendored code update with your change, along with a new patch.
+
+After your PR upstream is merged, follow the **Updating Base Commit** instructions above, however first remove your patch before running `apply-patches` since the new base commit contains your change already.
