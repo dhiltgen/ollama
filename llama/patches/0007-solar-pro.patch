@@ -1,7 +1,7 @@
-From 81425c94ceebfb1f4a62af11694ead3186319aa0 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Michael Yang <mxyng@pm.me>
 Date: Mon, 16 Sep 2024 15:53:16 -0700
-Subject: [PATCH 7/9] solar-pro
+Subject: [PATCH] solar-pro
 
 solar-pro introduces block skip connections where blocks are connected
 to other, non-sequential blocks with a scale multiple
@@ -397,6 +397,3 @@ index 614cfc1d..29a21ebb 100644
              return LLAMA_ROPE_TYPE_NORM;
  
          // the pairs of head values are offset by n_rot/2
--- 
-2.30.1 (Apple Git-130)
-

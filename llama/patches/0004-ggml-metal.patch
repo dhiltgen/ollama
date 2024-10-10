@@ -1,7 +1,7 @@
-From 95410b5c3ab52aea2cac9533ff3e7f3820b44ba5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jmorganca <jmorganca@gmail.com>
 Date: Wed, 12 Jun 2024 12:18:40 -0700
-Subject: [PATCH 4/9] ggml-metal
+Subject: [PATCH] ggml-metal
 
 ---
  ggml/src/ggml-metal.m | 4 ++--
@@ -22,6 +22,3 @@ index 9cfa72ac..99310e67 100644
  
              NSString * src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
  #else
--- 
-2.30.1 (Apple Git-130)
-
