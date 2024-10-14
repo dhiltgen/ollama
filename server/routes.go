@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -42,8 +43,9 @@ import (
 var mode string = gin.DebugMode
 
 type Server struct {
-	addr  net.Addr
-	sched *Scheduler
+	addr      net.Addr
+	sched     *Scheduler
+	runnerDir string
 }
 
 func init() {
@@ -1127,6 +1129,7 @@ func (s *Server) GenerateRoutes() http.Handler {
 	r.POST("/api/blobs/:digest", s.CreateBlobHandler)
 	r.HEAD("/api/blobs/:digest", s.HeadBlobHandler)
 	r.GET("/api/ps", s.PsHandler)
+	r.GET("/api/info", s.InfoHandler)
 
 	// Compatibility endpoints
 	r.POST("/v1/chat/completions", openai.ChatMiddleware(), s.ChatHandler)
@@ -1227,9 +1230,11 @@ func Serve(ln net.Listener) error {
 		done()
 	}()
 
-	if _, err := runners.Refresh(build.EmbedFS); err != nil {
+	runnerDir, err := runners.Refresh(build.EmbedFS)
+	if err != nil {
 		return fmt.Errorf("unable to initialize llm runners %w", err)
 	}
+	s.runnerDir = runnerDir
 
 	s.sched.Run(schedCtx)
 
@@ -1341,6 +1346,76 @@ func (s *Server) PsHandler(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
+}
+
+func (s *Server) InfoHandler(c *gin.Context) {
+	runnerMap := runners.GetAvailableServers(s.runnerDir)
+	runners := []string{}
+	for k := range runnerMap {
+		runners = append(runners, k)
+	}
+	sort.Strings(runners)
+
+	sysInfo := gpu.GetSystemInfo()
+	ms, _ := Manifests()
+
+	supportedGPUs := make([]api.GPUInfo, len(sysInfo.GPUs))
+	for i, gpu := range sysInfo.GPUs {
+		supportedGPUs[i].ID = gpu.ID
+		supportedGPUs[i].Name = gpu.Name
+		supportedGPUs[i].TotalMemory = gpu.TotalMemory
+		supportedGPUs[i].FreeMemory = gpu.FreeMemory
+		supportedGPUs[i].Compute = gpu.Compute
+		if gpu.DriverMajor > 0 {
+			supportedGPUs[i].Driver = fmt.Sprintf("%d.%d", gpu.DriverMajor, gpu.DriverMinor)
+		} else {
+			supportedGPUs[i].Driver = "upstream driver"
+		}
+		supportedGPUs[i].Runner = gpu.Library
+		if gpu.Variant != "" {
+			supportedGPUs[i].Runner += "_" + gpu.Variant
+		}
+	}
+	unsupportedGPUs := make([]api.UnsupportedGPUInfo, len(sysInfo.UnsupportedGPUs))
+	for i, gpu := range sysInfo.UnsupportedGPUs {
+		unsupportedGPUs[i].Error = gpu.Reason
+		unsupportedGPUs[i].ID = gpu.ID
+		unsupportedGPUs[i].Name = gpu.Name
+		unsupportedGPUs[i].TotalMemory = gpu.TotalMemory
+		unsupportedGPUs[i].FreeMemory = gpu.FreeMemory
+		unsupportedGPUs[i].Compute = gpu.Compute
+		if gpu.DriverMajor > 0 {
+			unsupportedGPUs[i].Driver = fmt.Sprintf("%d.%d", gpu.DriverMajor, gpu.DriverMinor)
+		} else {
+			unsupportedGPUs[i].Driver = "upstream driver"
+		}
+		unsupportedGPUs[i].Runner = gpu.Library
+		if gpu.Variant != "" {
+			unsupportedGPUs[i].Runner += "_" + gpu.Variant
+		}
+	}
+
+	info := api.InfoResponse{
+		Version: version.Version,
+		Models: api.SystemModelInfo{
+			Store:   envconfig.Models(),
+			Count:   len(ms), // TODO filter bad models?
+			Running: len(s.sched.loaded),
+		},
+		ComputeInfo: api.ComputeInfo{
+			AvailableRunners: runners,
+			SystemCompute: api.SystemComputeInfo{
+				CPUCores:    0, // TODO wire up with #6264
+				TotalMemory: sysInfo.System.TotalMemory,
+				FreeMemory:  sysInfo.System.FreeMemory,
+				FreeSwap:    sysInfo.System.FreeSwap,
+			},
+			SupportedGPUs:   supportedGPUs,
+			UnsupportedGPUs: unsupportedGPUs,
+			DiscoveryErrors: sysInfo.DiscoveryErrors,
+		},
+	}
+	c.JSON(http.StatusOK, info)
 }
 
 func (s *Server) ChatHandler(c *gin.Context) {
