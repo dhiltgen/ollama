@@ -209,6 +209,27 @@ ENV OLLAMA_HOST 0.0.0.0
 ENTRYPOINT ["/bin/ollama"]
 CMD ["serve"]
 
+# Custom target for minimal CPU only image
+FROM rockylinux:8 AS cpu-builder
+ARG GOLANG_VERSION
+COPY ./scripts/rh_linux_deps.sh /
+RUN GOLANG_VERSION=${GOLANG_VERSION} sh /rh_linux_deps.sh
+ENV PATH /opt/rh/gcc-toolset-10/root/usr/bin:$PATH:/usr/local/cuda/bin
+WORKDIR /go/src/github.com/ollama/ollama
+COPY . .
+ARG GOFLAGS
+RUN --mount=type=cache,target=/root/.ccache \
+    make -j 8 && \
+    go build -trimpath .
+FROM rockylinux:8 as cpu
+EXPOSE 11434
+ENV OLLAMA_HOST 0.0.0.0
+COPY --from=cpu-builder /go/src/github.com/ollama/ollama/ollama /bin/
+COPY --from=cpu-builder /go/src/github.com/ollama/ollama/dist/linux-*/lib/ /lib/
+ENTRYPOINT ["/bin/ollama"]
+CMD ["serve"]
+
+
 FROM runtime-$TARGETARCH
 EXPOSE 11434
 ENV OLLAMA_HOST 0.0.0.0
