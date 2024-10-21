@@ -4,20 +4,11 @@ package integration
 
 import (
 	"context"
-	"math"
 	"testing"
 	"time"
 
 	"github.com/ollama/ollama/api"
 )
-
-func floatsEqual32(a, b float32) bool {
-	return math.Abs(float64(a-b)) <= 1e-4
-}
-
-func floatsEqual64(a, b float64) bool {
-	return math.Abs(a-b) <= 1e-4
-}
 
 func TestAllMiniLMEmbeddings(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -38,8 +29,11 @@ func TestAllMiniLMEmbeddings(t *testing.T) {
 		t.Fatalf("expected 384 floats, got %d", len(res.Embedding))
 	}
 
-	if !floatsEqual64(res.Embedding[0], 0.06642947345972061) {
-		t.Fatalf("expected 0.06642947345972061, got %.16f", res.Embedding[0])
+	// Different GPU kernels have slightly different behavior
+	min := float64(0.064948)
+	max := float64(0.068516)
+	if res.Embedding[0] < min || res.Embedding[0] > max {
+		t.Fatalf("expected in the range %.16f - %.16f, got %.16f", min, max, res.Embedding[0])
 	}
 }
 
@@ -66,8 +60,11 @@ func TestAllMiniLMEmbed(t *testing.T) {
 		t.Fatalf("expected 384 floats, got %d", len(res.Embeddings[0]))
 	}
 
-	if !floatsEqual32(res.Embeddings[0][0], 0.010071031) {
-		t.Fatalf("expected 0.010071031, got %.8f", res.Embeddings[0][0])
+	// Different GPU kernels have slightly different behavior
+	min := float32(0.00006309)
+	max := float32(0.01038676)
+	if res.Embeddings[0][0] < min || res.Embeddings[0][0] > max {
+		t.Fatalf("expected in the range %.8f - %.8f, got %.8f", min, max, res.Embeddings[0][0])
 	}
 
 	if res.PromptEvalCount != 6 {
@@ -98,8 +95,13 @@ func TestAllMiniLMBatchEmbed(t *testing.T) {
 		t.Fatalf("expected 384 floats, got %d", len(res.Embeddings[0]))
 	}
 
-	if !floatsEqual32(res.Embeddings[0][0], 0.010071031) || !floatsEqual32(res.Embeddings[1][0], -0.009802706) {
-		t.Fatalf("expected 0.010071031 and -0.009802706, got %.8f and %.8f", res.Embeddings[0][0], res.Embeddings[1][0])
+	// Different GPU kernels have slightly different behavior
+	min0 := float32(0.00984993)
+	max0 := float32(0.03093774)
+	min1 := float32(-0.04268764)
+	max1 := float32(-0.00977226)
+	if res.Embeddings[0][0] < min0 || res.Embeddings[0][0] > max0 || res.Embeddings[1][0] < min1 || res.Embeddings[1][0] > max1 {
+		t.Fatalf("expected between %.8f - %.8f and %.8f - %.8f, got %.8f and %.8f", min0, max0, min1, max1, res.Embeddings[0][0], res.Embeddings[1][0])
 	}
 
 	if res.PromptEvalCount != 12 {
