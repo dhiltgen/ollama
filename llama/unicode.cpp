@@ -28,6 +28,19 @@
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+    #define NOMINMAX
+#endif
+#include <windows.h>
+#if __GLIBCXX__
+#include <cstdio>
+#include <ext/stdio_filebuf.h>
+#include <fcntl.h>
+#endif
+#endif
+
 #include "unicode.h"
 #include "unicode-data.h"
 
@@ -227,8 +240,39 @@ static std::unordered_map<std::string, uint8_t> unicode_utf8_to_byte_map() {
 }
 
 static inline std::wstring unicode_wstring_from_utf8(const std::string & s) {
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> conv;
-    return conv.from_bytes(s);
+#ifdef _WIN32
+
+    printf("XXX unicode_wstring_from_utf8 A\n");
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
+    wchar_t * wbuf = (wchar_t *) malloc(wlen * sizeof(wchar_t));
+    wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, wbuf, wlen);
+    if (!wlen) {
+        free(wbuf);
+        throw std::invalid_argument("failed to convert regex");
+    }
+    std::wstring ret = std::wstring(wbuf);
+    free(wbuf);
+
+
+
+    // std::wstring_convert<std::codecvt_utf8_utf16<wchar_t, 0x10ffff, std::little_endian>, wchar_t> conv;
+    // auto tmp = s.begin();
+    // printf("XXX sizeof chars in string: %d\n", sizeof(tmp));
+    // for (auto it = s.begin(); it != s.end(); ++it) {
+    //     // if (*it & 0x10ffff != *it) {
+    //     //     printf("XXX masked doesn't match! 0x%x != 0x%x\n", *it, *it & 0x10ffff);
+    //     // }
+    //     printf("XXX 0x%02x %c\n", *it, *it);
+    // }
+    // std::wstring_convert<std::codecvt_utf8<wchar_t, 0x10ffff, std::little_endian>, wchar_t> conv;
+    // std::wstring ret = std::wstring(s.begin(), s.end());
+    printf("XXX unicode_wstring_from_utf8 B\n");
+    // auto ret = conv.from_bytes(s);
+    // printf("XXX unicode_wstring_from_utf8 C\n");
+    return ret;
+#else
+#error put old code back here
+#endif
 }
 
 static std::vector<std::string> unicode_byte_encoding_process(const std::vector<std::string> & bpe_words) {
@@ -510,16 +554,23 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
 
 // use std::wregex to split the text
 static std::vector<size_t> unicode_regex_split_stl(const std::wstring & wtext, const std::wstring & regex_expr, const std::vector<size_t> & offsets) {
-    std::wregex expr(regex_expr);
+    printf("XXX unicode_regex_split_stl A\n");
+    // std::wregex expr(regex_expr); // XXX this blows up with "Invalid range in bracket expression."
+    std::basic_regex<wchar_t> expr(regex_expr); // XXX this blows up with "Invalid range in bracket expression."
+    printf("XXX unicode_regex_split_stl A2\n");
     std::vector<size_t> bpe_offsets; // store the offset of each word
+    printf("XXX unicode_regex_split_stl B\n");
     bpe_offsets.reserve(offsets.size()); // Reserve memory for the approximate size
     size_t start = 0;
+    printf("XXX unicode_regex_split_stl C\n");
     for (auto offset : offsets) {
+        printf("XXX unicode_regex_split_stl D\n");
         std::wcregex_iterator it(wtext.data() + start, wtext.data() + start + offset, expr);
         std::wcregex_iterator end;
 
         int64_t start_idx = 0;
         while (it != end) {
+            printf("XXX unicode_regex_split_stl E\n");
             std::wcmatch match = *it;
             if (match.position() > start_idx) {
                 bpe_offsets.emplace_back(match.position() - start_idx);
@@ -528,12 +579,15 @@ static std::vector<size_t> unicode_regex_split_stl(const std::wstring & wtext, c
             start_idx = match.position() + match.length();
             ++it;
         }
+        printf("XXX unicode_regex_split_stl F\n");
 
         if (start_idx < (int64_t) offset) {
             bpe_offsets.emplace_back(offset - start_idx);
         }
         start += offset;
+        printf("XXX unicode_regex_split_stl G\n");
     }
+    printf("XXX unicode_regex_split_stl H\n");
 
     return bpe_offsets;
 }
@@ -570,15 +624,19 @@ static std::vector<size_t> unicode_regex_split_stl(const std::string & text, con
 
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
+    printf("XXX unicode_regex_split_custom A\n");
 
     if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
+        printf("XXX unicode_regex_split_custom B\n");
         bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
     } else if (
+        printf("XXX unicode_regex_split_custom C\n");
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
 
         bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
     }
+    printf("XXX unicode_regex_split_custom D\n");
 
     return bpe_offsets;
 }
@@ -671,27 +729,32 @@ uint32_t unicode_tolower(uint32_t cp) {
 
 std::vector<std::string> unicode_regex_split(const std::string & text, const std::vector<std::string> & regex_exprs) {
     // unicode categories
+    printf("XXX unicode_regex_split A\n");
     static const std::map<std::string, int> k_ucat_enum = {
         { "\\p{N}", codepoint_flags::NUMBER },
         { "\\p{L}", codepoint_flags::LETTER },
         { "\\p{P}", codepoint_flags::PUNCTUATION },
     };
+    printf("XXX unicode_regex_split B\n");
 
     static const std::map<int, int> k_ucat_cpt = {
         { codepoint_flags::NUMBER,        0xD1 },
         { codepoint_flags::LETTER,        0xD2 },
         { codepoint_flags::PUNCTUATION,   0xD3 },
     };
+    printf("XXX unicode_regex_split C\n");
 
     static const std::map<int, std::string> k_ucat_map = {
         { codepoint_flags::NUMBER,        "\x30-\x39" }, // 0-9
         { codepoint_flags::LETTER,        "\x41-\x5A\x61-\x7A" }, // A-Za-z
         { codepoint_flags::PUNCTUATION,   "\x21-\x23\x25-\x2A\x2C-\x2F\x3A-\x3B\x3F-\x40\\\x5B-\\\x5D\x5F\\\x7B\\\x7D" }, // !-#%-*,-/:-;?-@\[-\]_\{\}
     };
+    printf("XXX unicode_regex_split D\n");
 
     // compute collapsed codepoints only if needed by at least one regex
     bool need_collapse = false;
     for (auto & regex_expr : regex_exprs) {
+        printf("XXX unicode_regex_split E\n");
         // search for unicode categories
         for (const auto & ucat : k_ucat_enum) {
             if (std::string::npos != regex_expr.find(ucat.first)) {
@@ -700,12 +763,14 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
             }
         }
     }
+    printf("XXX unicode_regex_split F\n");
 
     const auto cpts = unicode_cpts_from_utf8(text);
 
     // generate a "collapsed" representation of the text, where all codepoints are replaced by a single byte
     // ref: https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2081479935
     std::string text_collapsed;
+    printf("XXX unicode_regex_split G\n");
     if (need_collapse) {
         // collapse all unicode categories
         text_collapsed.resize(cpts.size());
@@ -730,12 +795,15 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
             }
         }
     }
+    printf("XXX unicode_regex_split H\n");
 
     std::vector<size_t> bpe_offsets = { cpts.size() };
 
     for (auto & regex_expr : regex_exprs) {
+        printf("XXX unicode_regex_split I\n");
         // first, see if we have an efficient custom regex implementation
         auto tmp = unicode_regex_split_custom(text, regex_expr, bpe_offsets);
+        printf("XXX unicode_regex_split I2\n");
 
         if (!tmp.empty()) {
             bpe_offsets = std::move(tmp);
@@ -744,6 +812,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
 
         // fallback to general-purpose std::regex / std::wregex
         try {
+            printf("XXX unicode_regex_split I3\n");
             // if a unicode category is used in the regex, we use the collapsed text and replace the unicode category
             // with the corresponding collapsed representation
             bool use_collapsed = false;
@@ -753,6 +822,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
                     break;
                 }
             }
+            printf("XXX unicode_regex_split I4\n");
 
             if (use_collapsed) {
                 // sanity-check that the original regex does not contain any non-ASCII characters
@@ -762,6 +832,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
                         throw std::runtime_error("Regex includes both unicode categories and non-ASCII characters - not supported");
                     }
                 }
+                printf("XXX unicode_regex_split I5\n");
 
                 // generate a collapsed representation of the regex
                 std::string regex_expr_collapsed;
@@ -769,6 +840,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
                 // track if we are inside [], because nested [] are not allowed
                 bool inside = false;
                 for (size_t i = 0; i < regex_expr.size(); ++i) {
+                    printf("XXX unicode_regex_split I6\n");
                     if (regex_expr[i] == '[' && (i == 0 || regex_expr[i - 1] != '\\')) {
                         regex_expr_collapsed += '[';
                         inside = true;
@@ -802,25 +874,32 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
 
                     regex_expr_collapsed += regex_expr[i];
                 }
+                printf("XXX unicode_regex_split I7\n");
 
                 //printf("text_collapsed: %s\n", text_collapsed.c_str());
                 //printf("regex_expr_collapsed: %s\n", regex_expr_collapsed.c_str());
                 bpe_offsets = unicode_regex_split_stl(text_collapsed, regex_expr_collapsed, bpe_offsets);
             } else {
+                printf("XXX unicode_regex_split I8\n");
                 // no unicode category used, we can use std::wregex directly
                 const std::wstring wregex_expr = unicode_wstring_from_utf8(regex_expr);
+                printf("XXX unicode_regex_split I9\n");
 
                 // std::wregex \s does not mach non-ASCII whitespaces, using 0x0B as fallback
                 std::wstring wtext(cpts.begin(), cpts.end());
+                printf("XXX unicode_regex_split I10\n");
                 for (size_t i = 0; i < wtext.size(); ++i) {
+                    printf("XXX unicode_regex_split I11\n");
                     if (wtext[i] > 0x7F && unicode_cpt_flags(wtext[i]).is_whitespace) {
                         wtext[i] = 0x0B;
                     }
                 }
+                printf("XXX unicode_regex_split I12\n");
 
                 //printf("text: %s\n", text.c_str());
                 //printf("regex_expr: %s\n", regex_expr.c_str());
                 bpe_offsets = unicode_regex_split_stl(wtext, wregex_expr, bpe_offsets);
+                printf("XXX unicode_regex_split I13\n");
             }
         } catch (std::regex_error & e) {
             fprintf(stderr, "Failed to process regex: '%s'\n", regex_expr.c_str());
@@ -828,6 +907,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
             throw std::runtime_error("Failed to process regex");
         }
     }
+    printf("XXX unicode_regex_split J\n");
 
     std::vector<std::string> bpe_words;
     bpe_words.reserve(bpe_offsets.size()); // reserve memory for the approximate size
@@ -840,6 +920,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
         }
         start += offset;
     }
+    printf("XXX unicode_regex_split K\n");
 
     return unicode_byte_encoding_process(bpe_words);
 }
