@@ -38,6 +38,13 @@
 #include <queue>
 #include <sstream>
 
+#include <codecvt>
+#include <locale>
+#include <cstdio>
+#include <string>
+#include <windows.h>
+
+
 //
 // helpers
 //
@@ -1281,18 +1288,23 @@ private:
 void llama_vocab::init_tokenizer() {
     switch (type) {
         case LLAMA_VOCAB_TYPE_SPM:
+    printf("XXX init_tokenizer A\n");
             tokenizer = new llm_tokenizer_spm(*this);
             break;
         case LLAMA_VOCAB_TYPE_BPE:
+    printf("XXX init_tokenizer B\n");
             tokenizer = new llm_tokenizer_bpe(*this);
             break;
         case LLAMA_VOCAB_TYPE_WPM:
+    printf("XXX init_tokenizer C\n");
             tokenizer = new llm_tokenizer_wpm(*this);
             break;
         case LLAMA_VOCAB_TYPE_UGM:
+    printf("XXX init_tokenizer D\n");
             tokenizer = new llm_tokenizer_ugm(*this);
             break;
         case LLAMA_VOCAB_TYPE_RWKV:
+    printf("XXX init_tokenizer E\n");
             tokenizer = new llm_tokenizer_rwkv(*this);
             break;
         default:
@@ -1466,18 +1478,23 @@ std::vector<llama_vocab::id> llama_tokenize_internal(
         bool add_special,
         bool parse_special) {
     GGML_ASSERT(vocab.tokenizer && "Tokenizer not initialized. Call llama_vocab::init_tokenizer() first.");
+            printf("XXX llama_tokenize_internal A\n");
 
     std::vector<llama_vocab::id> output;
     std::forward_list<fragment_buffer_variant> fragment_buffer;
 
     if (!raw_text.empty()) {
+            printf("XXX llama_tokenize_internal B\n");
         fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
         tokenizer_st_partition(vocab, fragment_buffer, parse_special);
     }
+            printf("XXX llama_tokenize_internal C\n");
 
     switch (vocab.type) {
         case LLAMA_VOCAB_TYPE_SPM:
             {
+                            printf("XXX llama_tokenize_internal D\n");
+
                 // OG tokenizer behavior:
                 //
                 // tokenizer.encode('', add_special_tokens=True)  returns [1]
@@ -1527,32 +1544,45 @@ std::vector<llama_vocab::id> llama_tokenize_internal(
             } break;
         case LLAMA_VOCAB_TYPE_BPE:
             {
+                printf("XXX llama_tokenize_internal E\n");
                 llm_tokenizer_bpe_session session(vocab);
                 // it calls some other methods that are not exist in llm_tokenizer,
                 // here just cast it to bpe tokenizer object
+                printf("XXX llama_tokenize_internal E1\n");
                 if (add_special) {
                     session.append_bos(output);
                 }
+                printf("XXX llama_tokenize_internal E2\n");
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
-                        auto raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
+                        printf("XXX llama_tokenize_internal E3\n");
+                        std::wstring_convert<std::codecvt_utf8<wchar_t, 0x10ffff, std::little_endian>, wchar_t> raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
 
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", raw_text.length(), fragment.offset, fragment.length, raw_text.c_str());
 #endif
+                        printf("XXX llama_tokenize_internal E3b\n");
+
                         session.tokenize(raw_text, output);
+                                                printf("XXX llama_tokenize_internal E3c\n");
+
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
+                    printf("XXX llama_tokenize_internal E3d\n");
                         session.append(fragment.token, output);
+                        printf("XXX llama_tokenize_internal E3e\n");
                     }
                 }
+                printf("XXX llama_tokenize_internal E4\n");
 
                 if (add_special) {
+                    printf("XXX llama_tokenize_internal E5\n");
                     session.append_eos(output);
                     session.check_double_bos_eos(output);
                 }
             } break;
         case LLAMA_VOCAB_TYPE_WPM:
             {
+                printf("XXX llama_tokenize_internal F\n");
                 if (add_special) {
                     GGML_ASSERT(vocab.special_cls_id != -1);
                     output.push_back(vocab.special_cls_id);
@@ -1580,6 +1610,7 @@ std::vector<llama_vocab::id> llama_tokenize_internal(
             } break;
         case LLAMA_VOCAB_TYPE_UGM:
             {
+                printf("XXX llama_tokenize_internal G\n");
                 if (add_special && vocab.tokenizer_add_bos) {
                     GGML_ASSERT(vocab.special_bos_id != -1);
                     output.push_back(vocab.special_bos_id);
@@ -1612,6 +1643,7 @@ std::vector<llama_vocab::id> llama_tokenize_internal(
             } break;
         case LLAMA_VOCAB_TYPE_RWKV:
             {
+                printf("XXX llama_tokenize_internal H\n");
                 llm_tokenizer_rwkv_session session(vocab);
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {

@@ -6320,6 +6320,7 @@ static void llm_load_hparams(
 static void llm_load_vocab(
         llama_model_loader & ml,
         llama_model & model) {
+    printf("XXX llm_load_vocab A\n");
     auto & vocab = model.vocab;
 
     struct gguf_context * ctx = ml.meta;
@@ -6469,10 +6470,14 @@ static void llm_load_vocab(
                 vocab.tokenizer_add_bos = true;
             } else if (
                     tokenizer_pre == "deepseek-llm") {
+                            printf("XXX llm_load_vocab B\n");
+
                 vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM;
                 vocab.tokenizer_clean_spaces = false;
             } else if (
                     tokenizer_pre == "deepseek-coder") {
+                            printf("XXX llm_load_vocab C\n");
+
                 vocab.type_pre = LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_CODER;
                 vocab.tokenizer_clean_spaces = false;
             } else if (
@@ -6592,6 +6597,7 @@ static void llm_load_vocab(
         ml.get_key(LLM_KV_TOKENIZER_ADD_PREFIX,      vocab.tokenizer_add_space_prefix,         false);
         ml.get_key(LLM_KV_TOKENIZER_REMOVE_EXTRA_WS, vocab.tokenizer_remove_extra_whitespaces, false);
     }
+    printf("XXX llm_load_vocab D\n");
 
     const int token_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_LIST).c_str());
     if (token_idx == -1) {
@@ -6614,6 +6620,7 @@ static void llm_load_vocab(
 
     vocab.n_vocab = n_vocab;
     vocab.id_to_token.resize(n_vocab);
+    printf("XXX llm_load_vocab E\n");
 
     for (uint32_t i = 0; i < n_vocab; i++) {
         std::string word = gguf_get_arr_str(ctx, token_idx, i);
@@ -6646,8 +6653,10 @@ static void llm_load_vocab(
         }
     }
     GGML_ASSERT(vocab.id_to_token.size() == vocab.token_to_id.size());
+    printf("XXX llm_load_vocab F\n");
 
     vocab.init_tokenizer();
+    printf("XXX llm_load_vocab F2\n");
 
     // determine the newline token: LLaMA "<0x0A>" == 10 == '\n', Falcon 193 == '\n'
     if (vocab.type == LLAMA_VOCAB_TYPE_SPM) {
@@ -6657,6 +6666,8 @@ static void llm_load_vocab(
         // of the known models are currently CodeLlama (LLM_ARCH_LLAMA) and
         // CodeGemma (LLM_ARCH_GEMMA). This can potentially be removed once
         // new versions of these models have been published.
+            printf("XXX llm_load_vocab G\n");
+
         std::string gen_name;
         ml.get_key(LLM_KV_GENERAL_NAME, gen_name, false);
 
@@ -6664,6 +6675,8 @@ static void llm_load_vocab(
             [](unsigned char c){ return std::tolower(c); });
 
         if (gen_name.find("code") != std::string::npos) {
+                printf("XXX llm_load_vocab H\n");
+
             if (model.arch == LLM_ARCH_LLAMA
               && 32010 < vocab.id_to_token.size()
               && vocab.id_to_token[32007].text.find("<PRE>") != std::string::npos
@@ -6689,6 +6702,8 @@ static void llm_load_vocab(
                 vocab.special_eot_id    = 107;
             }
         }
+            printf("XXX llm_load_vocab I\n");
+
         try {
             vocab.linefeed_id = llama_byte_to_token_impl(vocab, '\n');
         } catch (const std::exception & e) {
@@ -6696,12 +6711,15 @@ static void llm_load_vocab(
             vocab.linefeed_id = vocab.special_pad_id;
         }
     } else if (vocab.type == LLAMA_VOCAB_TYPE_WPM) {
+            printf("XXX llm_load_vocab I2\n");
         vocab.linefeed_id = vocab.special_pad_id;
     } else if (vocab.type == LLAMA_VOCAB_TYPE_RWKV) {
+            printf("XXX llm_load_vocab I3\n");
         const std::vector<int> ids = llama_tokenize_internal(vocab, "\n", false);
         GGML_ASSERT(!ids.empty() && "model vocab missing newline token");
         vocab.linefeed_id = ids[0];
     } else {
+            printf("XXX llm_load_vocab I4\n");
         const std::vector<int> ids = llama_tokenize_internal(vocab, "\xC4\x8A", false); // U+010A
 
         //GGML_ASSERT(!ids.empty() && "model vocab missing newline token");
@@ -6712,6 +6730,7 @@ static void llm_load_vocab(
             vocab.linefeed_id = ids[0];
         }
     }
+    printf("XXX llm_load_vocab J\n");
 
     // special tokens
     {
@@ -6757,6 +6776,7 @@ static void llm_load_vocab(
                 vocab.tokenizer_add_eos = temp;
             }
         }
+    printf("XXX llm_load_vocab K\n");
 
         // find EOT token: "<|eot_id|>", "<|im_end|>", "<end_of_turn>", etc.
         //
@@ -6785,6 +6805,7 @@ static void llm_load_vocab(
                 }
             }
         }
+    printf("XXX llm_load_vocab L\n");
 
         // find EOM token: "<|eom_id|>"
         //
@@ -6801,6 +6822,7 @@ static void llm_load_vocab(
                 }
             }
         }
+    printf("XXX llm_load_vocab M\n");
 
         // maintain a list of tokens that cause end-of-generation
         // this is currently determined based on the token text, which is obviously not ideal
@@ -6840,6 +6862,7 @@ static void llm_load_vocab(
             LLAMA_LOG_WARN("%s: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect\n", __func__);
         }
     }
+    printf("XXX llm_load_vocab N\n");
 
     // build special tokens cache
     {
@@ -6857,6 +6880,7 @@ static void llm_load_vocab(
 
         LLAMA_LOG_INFO("%s: special tokens cache size = %u\n", __func__, (uint32_t)vocab.cache_special_tokens.size());
     }
+    printf("XXX llm_load_vocab O\n");
 
     // build token to piece cache
     {
@@ -6874,6 +6898,7 @@ static void llm_load_vocab(
 
         LLAMA_LOG_INFO("%s: token to piece cache size = %.4f MB\n", __func__, size_cache / 1024.0 / 1024.0);
     }
+    printf("XXX llm_load_vocab P\n");
 
     // Handle per token attributes
     //NOTE: Each model customizes per token attributes.
@@ -6927,6 +6952,8 @@ static void llm_load_vocab(
             }
         }
     }
+        printf("XXX llm_load_vocab Q\n");
+
 }
 
 static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {

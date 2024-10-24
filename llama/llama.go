@@ -44,15 +44,11 @@ package llama
 #cgo rocm CFLAGS: -DGGML_USE_CUDA -DGGML_USE_HIPBLAS -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -DGGML_CUDA_MMV_Y=1 -DGGML_BUILD=1
 #cgo rocm CXXFLAGS: -DGGML_USE_CUDA -DGGML_USE_HIPBLAS -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -DGGML_CUDA_MMV_Y=1 -DGGML_BUILD=1
 #cgo rocm LDFLAGS: -L${SRCDIR} -lggml_rocm -lhipblas -lamdhip64 -lrocblas
-#cgo windows CFLAGS: -Wno-discarded-qualifiers
-#cgo windows CFLAGS: -Wno-discarded-qualifiers
-#cgo windows LDFLAGS: -lmsvcrt
+#cgo windows CFLAGS: -Wno-discarded-qualifiers -D_UNICODE -DUNICODE
 #cgo windows LDFLAGS: -lmsvcrt -static-libstdc++ -static-libgcc -static
-#cgo windows,amd64 LDFLAGS: -L${SRCDIR}/build/Windows/amd64
 #cgo windows,amd64 LDFLAGS: -L${SRCDIR}/build/Windows/amd64
 #cgo windows,arm64 CFLAGS: -D__aarch64__ -D__ARM_NEON -D__ARM_FEATURE_FMA
 #cgo windows,arm64 CXXFLAGS: -D__aarch64__ -D__ARM_NEON -D__ARM_FEATURE_FMA
-#cgo windows,arm64 LDFLAGS: -L${SRCDIR}/build/Windows/arm64
 #cgo windows,arm64 LDFLAGS: -L${SRCDIR}/build/Windows/arm64
 #cgo windows,cuda LDFLAGS: -lcuda -lcudart -lcublas -lcublasLt
 #cgo windows,rocm LDFLAGS: -lggml_rocm -lhipblas -lamdhip64 -lrocblas
