@@ -555,8 +555,8 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
 // use std::wregex to split the text
 static std::vector<size_t> unicode_regex_split_stl(const std::wstring & wtext, const std::wstring & regex_expr, const std::vector<size_t> & offsets) {
     printf("XXX unicode_regex_split_stl A\n");
-    // std::wregex expr(regex_expr); // XXX this blows up with "Invalid range in bracket expression."
-    std::basic_regex<wchar_t> expr(regex_expr); // XXX this blows up with "Invalid range in bracket expression."
+    std::wregex expr(regex_expr); // XXX this blows up with "Invalid range in bracket expression."
+    // std::basic_regex<wchar_t> expr(regex_expr); // XXX this blows up with "Invalid range in bracket expression."
     printf("XXX unicode_regex_split_stl A2\n");
     std::vector<size_t> bpe_offsets; // store the offset of each word
     printf("XXX unicode_regex_split_stl B\n");
