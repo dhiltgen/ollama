@@ -186,11 +186,6 @@ check_gpu() {
     esac
 }
 
-if check_gpu nvidia-smi; then
-    status "NVIDIA GPU installed."
-    exit 0
-fi
-
 if ! check_gpu lspci nvidia && ! check_gpu lshw nvidia && ! check_gpu lspci amdgpu && ! check_gpu lshw amdgpu; then
     install_success
     warning "No NVIDIA/AMD GPU detected. Ollama will run in CPU-only mode."
@@ -206,26 +201,16 @@ if check_gpu lspci amdgpu || check_gpu lshw amdgpu; then
 
         install_success
         status "AMD GPU ready."
-        exit 0
+    else
+        status "Downloading AMD GPU dependencies..."
+        $SUDO rm -rf /usr/share/ollama/lib
+        $SUDO chmod o+x /usr/share/ollama
+        $SUDO install -o ollama -g ollama -m 755 -d /usr/share/ollama/lib/rocm
+        curl --fail --show-error --location --progress-bar "https://ollama.com/download/ollama-linux-amd64-rocm.tgz${VER_PARAM}" \
+            | $SUDO tar zx --owner ollama --group ollama -C /usr/share/ollama/lib/rocm .
+        install_success
+        status "AMD GPU ready."
     fi
-    # Look for pre-existing ROCm v6 before downloading the dependencies
-    for search in "${HIP_PATH:-''}" "${ROCM_PATH:-''}" "/opt/rocm" "/usr/lib64"; do
-        if [ -n "${search}" ] && [ -e "${search}/libhipblas.so.2" -o -e "${search}/lib/libhipblas.so.2" ]; then
-            status "Compatible AMD GPU ROCm library detected at ${search}"
-            install_success
-            exit 0
-        fi
-    done
-
-    status "Downloading AMD GPU dependencies..."
-    $SUDO rm -rf /usr/share/ollama/lib
-    $SUDO chmod o+x /usr/share/ollama
-    $SUDO install -o ollama -g ollama -m 755 -d /usr/share/ollama/lib/rocm
-    curl --fail --show-error --location --progress-bar "https://ollama.com/download/ollama-linux-amd64-rocm.tgz${VER_PARAM}" \
-        | $SUDO tar zx --owner ollama --group ollama -C /usr/share/ollama/lib/rocm .
-    install_success
-    status "AMD GPU ready."
-    exit 0
 fi
 
 CUDA_REPO_ERR_MSG="NVIDIA GPU detected, but your OS and Architecture are not supported by NVIDIA.  Please install the CUDA driver manually https://docs.nvidia.com/cuda/cuda-installation-guide-linux/"
@@ -299,72 +284,77 @@ install_cuda_driver_apt() {
     DEBIAN_FRONTEND=noninteractive $SUDO_E apt-get -y install cuda-drivers -q
 }
 
-if [ ! -f "/etc/os-release" ]; then
-    error "Unknown distribution. Skipping CUDA installation."
-fi
-
-. /etc/os-release
-
-OS_NAME=$ID
-OS_VERSION=$VERSION_ID
-
-PACKAGE_MANAGER=
-for PACKAGE_MANAGER in dnf yum apt-get; do
-    if available $PACKAGE_MANAGER; then
-        break
-    fi
-done
-
-if [ -z "$PACKAGE_MANAGER" ]; then
-    error "Unknown package manager. Skipping CUDA installation."
-fi
-
-if ! check_gpu nvidia-smi || [ -z "$(nvidia-smi | grep -o "CUDA Version: [0-9]*\.[0-9]*")" ]; then
-    case $OS_NAME in
-        centos|rhel) install_cuda_driver_yum 'rhel' $(echo $OS_VERSION | cut -d '.' -f 1) ;;
-        rocky) install_cuda_driver_yum 'rhel' $(echo $OS_VERSION | cut -c1) ;;
-        fedora) [ $OS_VERSION -lt '39' ] && install_cuda_driver_yum $OS_NAME $OS_VERSION || install_cuda_driver_yum $OS_NAME '39';;
-        amzn) install_cuda_driver_yum 'fedora' '37' ;;
-        debian) install_cuda_driver_apt $OS_NAME $OS_VERSION ;;
-        ubuntu) install_cuda_driver_apt $OS_NAME $(echo $OS_VERSION | sed 's/\.//') ;;
-        *) exit ;;
-    esac
-fi
-
-if ! lsmod | grep -q nvidia || ! lsmod | grep -q nvidia_uvm; then
-    KERNEL_RELEASE="$(uname -r)"
-    case $OS_NAME in
-        rocky) $SUDO $PACKAGE_MANAGER -y install kernel-devel kernel-headers ;;
-        centos|rhel|amzn) $SUDO $PACKAGE_MANAGER -y install kernel-devel-$KERNEL_RELEASE kernel-headers-$KERNEL_RELEASE ;;
-        fedora) $SUDO $PACKAGE_MANAGER -y install kernel-devel-$KERNEL_RELEASE ;;
-        debian|ubuntu) $SUDO apt-get -y install linux-headers-$KERNEL_RELEASE ;;
-        *) exit ;;
-    esac
-
-    NVIDIA_CUDA_VERSION=$($SUDO dkms status | awk -F: '/added/ { print $1 }')
-    if [ -n "$NVIDIA_CUDA_VERSION" ]; then
-        $SUDO dkms install $NVIDIA_CUDA_VERSION
-    fi
-
-    if lsmod | grep -q nouveau; then
-        status 'Reboot to complete NVIDIA CUDA driver install.'
-        exit 0
-    fi
-
-    $SUDO modprobe nvidia
-    $SUDO modprobe nvidia_uvm
-fi
-
-# make sure the NVIDIA modules are loaded on boot with nvidia-persistenced
-if available nvidia-persistenced; then
-    $SUDO touch /etc/modules-load.d/nvidia.conf
-    MODULES="nvidia nvidia-uvm"
-    for MODULE in $MODULES; do
-        if ! grep -qxF "$MODULE" /etc/modules-load.d/nvidia.conf; then
-            echo "$MODULE" | $SUDO tee -a /etc/modules-load.d/nvidia.conf > /dev/null
+if ! check_gpu nvidia-smi; then
+    if check_gpu lspci nvidia || check_gpu lshw nvidia; then
+        if [ ! -f "/etc/os-release" ]; then
+            error "Unknown distribution. Skipping CUDA installation."
         fi
-    done
+
+        . /etc/os-release
+
+        OS_NAME=$ID
+        OS_VERSION=$VERSION_ID
+
+        PACKAGE_MANAGER=
+        for PACKAGE_MANAGER in dnf yum apt-get; do
+            if available $PACKAGE_MANAGER; then
+                break
+            fi
+        done
+
+        if [ -z "$PACKAGE_MANAGER" ]; then
+            error "Unknown package manager. Skipping CUDA installation."
+        fi
+
+        if ! check_gpu nvidia-smi || [ -z "$(nvidia-smi | grep -o "CUDA Version: [0-9]*\.[0-9]*")" ]; then
+            case $OS_NAME in
+                centos|rhel) install_cuda_driver_yum 'rhel' $(echo $OS_VERSION | cut -d '.' -f 1) ;;
+                rocky) install_cuda_driver_yum 'rhel' $(echo $OS_VERSION | cut -c1) ;;
+                fedora) [ $OS_VERSION -lt '39' ] && install_cuda_driver_yum $OS_NAME $OS_VERSION || install_cuda_driver_yum $OS_NAME '39';;
+                amzn) install_cuda_driver_yum 'fedora' '37' ;;
+                debian) install_cuda_driver_apt $OS_NAME $OS_VERSION ;;
+                ubuntu) install_cuda_driver_apt $OS_NAME $(echo $OS_VERSION | sed 's/\.//') ;;
+                *) exit ;;
+            esac
+        fi
+
+        if ! lsmod | grep -q nvidia || ! lsmod | grep -q nvidia_uvm; then
+            KERNEL_RELEASE="$(uname -r)"
+            case $OS_NAME in
+                rocky) $SUDO $PACKAGE_MANAGER -y install kernel-devel kernel-headers ;;
+                centos|rhel|amzn) $SUDO $PACKAGE_MANAGER -y install kernel-devel-$KERNEL_RELEASE kernel-headers-$KERNEL_RELEASE ;;
+                fedora) $SUDO $PACKAGE_MANAGER -y install kernel-devel-$KERNEL_RELEASE ;;
+                debian|ubuntu) $SUDO apt-get -y install linux-headers-$KERNEL_RELEASE ;;
+                *) exit ;;
+            esac
+
+            NVIDIA_CUDA_VERSION=$($SUDO dkms status | awk -F: '/added/ { print $1 }')
+            if [ -n "$NVIDIA_CUDA_VERSION" ]; then
+                $SUDO dkms install $NVIDIA_CUDA_VERSION
+            fi
+
+            if lsmod | grep -q nouveau; then
+                status 'Reboot to complete NVIDIA CUDA driver install.'
+                exit 0
+            fi
+
+            $SUDO modprobe nvidia
+            $SUDO modprobe nvidia_uvm
+        fi
+
+        # make sure the NVIDIA modules are loaded on boot with nvidia-persistenced
+        if available nvidia-persistenced; then
+            $SUDO touch /etc/modules-load.d/nvidia.conf
+            MODULES="nvidia nvidia-uvm"
+            for MODULE in $MODULES; do
+                if ! grep -qxF "$MODULE" /etc/modules-load.d/nvidia.conf; then
+                    echo "$MODULE" | $SUDO tee -a /etc/modules-load.d/nvidia.conf > /dev/null
+                fi
+            done
+        fi
+
+        status "NVIDIA GPU ready."
+    fi
 fi
 
-status "NVIDIA GPU ready."
 install_success
