@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Hiltgen <daniel@ollama.com>
+Date: Thu, 21 Nov 2024 12:44:55 -0800
+Subject: [PATCH] temporary header hack
+
+adjust include paths until upstream moves this around
+---
+ ggml/src/ggml-cpu/llamafile/sgemm.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index b2ce2e66..64a7020b 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -50,8 +50,8 @@
+ 
+ #include "sgemm.h"
+ #include "ggml-impl.h"
+-// hack until moved into the CPU backend
+-#include "../ggml-cpu-impl.h"
++// alternate hack until moved into the CPU backend
++#include "ggml-cpu/ggml-cpu-impl.h"
+ #include "ggml-quants.h"
+ 
+ #ifdef _MSC_VER

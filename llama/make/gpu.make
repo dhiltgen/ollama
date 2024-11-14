@@ -35,10 +35,10 @@ GPU_RUNNER_LIBS = $(wildcard $(addsuffix .$(SHARED_EXT).*,$(addprefix $(GPU_LIB_
 DIST_GPU_RUNNER_LIB_DEPS = $(addprefix $(DIST_GPU_RUNNER_DEPS_DIR)/,$(notdir $(GPU_RUNNER_LIBS)))
 
 GPU_RUNNER_SRCS := \
-	ggml-cuda.cu \
+	ggml-cuda/ggml-cuda.cu \
 	$(filter-out $(wildcard ggml-cuda/fattn*.cu),$(wildcard ggml-cuda/*.cu)) \
 	$(wildcard ggml-cuda/template-instances/mmq*.cu) \
-	ggml.c ggml-backend.c ggml-alloc.c ggml-quants.c sgemm.cpp ggml-aarch64.c
+	ggml.c ggml-backend.c ggml-alloc.c ggml-quants.c sgemm.cpp ggml-aarch64.c ggml-threading.cpp
 GPU_RUNNER_HDRS := \
 	$(wildcard ggml-cuda/*.cuh)
 

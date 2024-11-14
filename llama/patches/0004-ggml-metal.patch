@@ -4,16 +4,16 @@ Date: Wed, 12 Jun 2024 12:18:40 -0700
 Subject: [PATCH] ggml-metal
 
 ---
- ggml/src/ggml-metal.m | 4 ++--
+ ggml/src/ggml-metal/ggml-metal.m | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)
 
-diff --git a/ggml/src/ggml-metal.m b/ggml/src/ggml-metal.m
-index 3a433703..829c5e39 100644
---- a/ggml/src/ggml-metal.m
-+++ b/ggml/src/ggml-metal.m
-@@ -392,8 +392,8 @@ static void ggml_metal_log(enum ggml_log_level level, const char * format, ...){
+diff --git a/ggml/src/ggml-metal/ggml-metal.m b/ggml/src/ggml-metal/ggml-metal.m
+index 4a7cd6e7..2895c8ad 100644
+--- a/ggml/src/ggml-metal/ggml-metal.m
++++ b/ggml/src/ggml-metal/ggml-metal.m
+@@ -478,8 +478,8 @@ @implementation GGMLMetalClass
  #if GGML_METAL_EMBED_LIBRARY
-             GGML_METAL_LOG_INFO("%s: using embedded metal library\n", __func__);
+             GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
  
 -            extern const char ggml_metallib_start[];
 -            extern const char ggml_metallib_end[];
