@@ -23,7 +23,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ollama/ollama/ml/backend/ggml/ggml/src"
+	ggml "github.com/ollama/ollama/ml/backend/ggml/ggml/src"
 )
 
 type device struct {
@@ -566,7 +566,11 @@ const (
 	ropeTypeNorm C.int = iota
 )
 
-func (t *Tensor) Rope(ctx ml.Context, positionIDs, ropeFactors ml.Tensor, ropeDim uint32, ropeBase, ropeScale float32) ml.Tensor {
+func (t *Tensor) Rope(ctx ml.Context, offset int32, ropeFactors ml.Tensor, ropeDim uint32, ropeBase, ropeScale float32) ml.Tensor {
+	positionIDs, err := ctx.FromIntSlice([]int32{0}, 1) // TODO - actual impl
+	if err != nil {
+		panic(err.Error())
+	}
 	return &Tensor{
 		t: C.ggml_rope_ext(
 			ctx.(*Context).ctx, t.t, positionIDs.(*Tensor).t, ropeFactors.(*Tensor).t,
@@ -599,4 +603,49 @@ func (t *Tensor) Conv2D(ctx ml.Context, t2 ml.Tensor, s0, s1, p0, p1, d0, d1 int
 	return &Tensor{
 		t: C.ggml_conv_2d(ctx.(*Context).ctx, t.t, t2.(*Tensor).t, C.int(s0), C.int(s1), C.int(p0), C.int(p1), C.int(d0), C.int(d1)),
 	}
+}
+
+func (t *Tensor) Repeat(ctx ml.Context, repeats, axis int) ml.Tensor {
+	panic("not yet implemented")
+}
+
+func (ctx *Context) Arange(start float64, stop float64, step float64, dtype ml.DType) ml.Tensor {
+	// TODO handle dtype
+	return &Tensor{
+		t: C.ggml_arange(ctx.ctx, C.float(start), C.float(stop), C.float(step)),
+	}
+}
+
+func (t *Tensor) Greater(ctx ml.Context, b ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
+}
+func (t *Tensor) Less(ctx ml.Context, b ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
+}
+func (c *Context) Where(condition ml.Tensor, x ml.Tensor, y ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
+}
+func (t *Tensor) BitwiseAnd(ctx ml.Context, b ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
+}
+func (t *Tensor) BitwiseOr(ctx ml.Context, b ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
+}
+
+func (t *Tensor) Divide(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
+	return &Tensor{
+		t: C.ggml_div(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
+	}
+}
+func (t *Tensor) Subtract(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
+	return &Tensor{
+		t: C.ggml_sub(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
+	}
+}
+func (t *Tensor) Power(ctx ml.Context, b ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
+}
+
+func (ctx *Context) FastScaledDotProductAttention(queries, keys, values ml.Tensor, scale float32, mask ml.Tensor) ml.Tensor {
+	panic("not yet implemented")
 }
