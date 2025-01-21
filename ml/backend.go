@@ -52,8 +52,6 @@ type Context interface {
 	FromFloatSlice(s []float32, shape ...int) (Tensor, error)
 	FromIntSlice(s []int32, shape ...int) (Tensor, error)
 
-	Arange(start float64, stop float64, step float64, dtype DType) Tensor
-	Where(condition, x, y Tensor) Tensor
 	FastScaledDotProductAttention(queries, keys, values Tensor, scale float32, mask Tensor) Tensor
 
 	Forward(Tensor)
@@ -100,13 +98,6 @@ type Tensor interface {
 	Rows(ctx Context, t2 Tensor) Tensor
 	Copy(ctx Context, t2 Tensor) Tensor
 	Repeat(ctx Context, repeats, axis int) Tensor
-	Greater(ctx Context, b Tensor) Tensor
-	Less(ctx Context, b Tensor) Tensor
-	BitwiseAnd(ctx Context, b Tensor) Tensor
-	BitwiseOr(ctx Context, b Tensor) Tensor
-	Divide(ctx Context, b Tensor) Tensor
-	Subtract(ctx Context, b Tensor) Tensor
-	Power(ctx Context, b Tensor) Tensor
 }
 
 type number interface {

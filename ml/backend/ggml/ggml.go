@@ -609,43 +609,6 @@ func (t *Tensor) Repeat(ctx ml.Context, repeats, axis int) ml.Tensor {
 	panic("not yet implemented")
 }
 
-func (ctx *Context) Arange(start float64, stop float64, step float64, dtype ml.DType) ml.Tensor {
-	// TODO handle dtype
-	return &Tensor{
-		t: C.ggml_arange(ctx.ctx, C.float(start), C.float(stop), C.float(step)),
-	}
-}
-
-func (t *Tensor) Greater(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (t *Tensor) Less(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (c *Context) Where(condition ml.Tensor, x ml.Tensor, y ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (t *Tensor) BitwiseAnd(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (t *Tensor) BitwiseOr(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-
-func (t *Tensor) Divide(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return &Tensor{
-		t: C.ggml_div(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
-	}
-}
-func (t *Tensor) Subtract(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return &Tensor{
-		t: C.ggml_sub(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
-	}
-}
-func (t *Tensor) Power(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-
 func (ctx *Context) FastScaledDotProductAttention(queries, keys, values ml.Tensor, scale float32, mask ml.Tensor) ml.Tensor {
 	panic("not yet implemented")
 }

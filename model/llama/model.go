@@ -124,36 +124,52 @@ func (sa *SelfAttention) Rope(ctx ml.Context, x ml.Tensor, offset int32, opts *O
 			base = 10000.0
 		}
 		low_freq_factor := opts.ropeScale // ???
-		low_freq_factorA, _ := ctx.FromFloatSlice([]float32{low_freq_factor}, 1)
-		high_freq_factor := float32(4.0) // TODO should attempt to get from metadata
-		factor := float32(8.0)           // metadata?
-		factorA, _ := ctx.FromFloatSlice([]float32{factor}, 1)
-		old_context_len := float32(8192) // metadata?  (aka original_max_position_embeddings)
-		old_context_lenA, _ := ctx.FromFloatSlice([]float32{old_context_len}, 1)
+		high_freq_factor := float32(4.0)  // TODO should attempt to get from metadata
+		factor := float32(8.0)            // metadata?
+		old_context_len := float32(8192)  // metadata?  (aka original_max_position_embeddings)
 
 		// Calcs...
 		low_freq_wavelen := float32(old_context_len) / low_freq_factor
-		low_freq_wavelenA, _ := ctx.FromFloatSlice([]float32{low_freq_wavelen}, 1)
 		high_freq_wavelen := float32(old_context_len) / high_freq_factor
-		high_freq_wavelenA, _ := ctx.FromFloatSlice([]float32{high_freq_wavelen}, 1)
 
 		// freqs = base ** (mx.arange(0, dims, 2) / dims)
-		tmp := ctx.Arange(0, float64(dims), 2, ml.DTypeI32)
-		dimsA, _ := ctx.FromFloatSlice([]float32{float32(dims)}, 1)
-		tmp = tmp.Divide(ctx, dimsA)
-		baseA, _ := ctx.FromFloatSlice([]float32{float32(base)}, 1)
-		freqs := baseA.Power(ctx, ctx.Arange(0, float64(dims), 2, ml.DTypeF32).Divide(ctx, dimsA))
-		two_pi, _ := ctx.FromFloatSlice([]float32{2 * math.Pi}, 1)
-		wavelens := freqs.Mul(ctx, two_pi)
-		freqs = ctx.Where(wavelens.Greater(ctx, low_freq_wavelenA), freqs.Mul(ctx, factorA), freqs)
-		is_medium_freq := wavelens.Greater(ctx, high_freq_wavelenA).BitwiseAnd(ctx, wavelens.Less(ctx, low_freq_wavelenA))
+		freqs := arange(0, float32(dims), 2)
+		for i := range freqs {
+			freqs[i] = (float32)(math.Pow(float64(base), float64(freqs[i])/float64(dims)))
+		}
+		// wavelens = 2 * mx.pi * freqs
+		wavelens := make([]float32, len(freqs))
+		for i := range wavelens {
+			wavelens[i] = freqs[i] * 2 * float32(math.Pi)
+		}
+		// freqs = mx.where(wavelens > low_freq_wavelen, freqs * factor, freqs)
+		for i := range freqs {
+			if wavelens[i] > low_freq_wavelen {
+				freqs[i] = freqs[i] * factor
+			}
+		}
+		// is_medium_freq = (wavelens > high_freq_wavelen) & (wavelens < low_freq_wavelen)
+		is_medium_freq := make([]bool, len(freqs))
+		for i := range freqs {
+			is_medium_freq[i] = (wavelens[i] > high_freq_wavelen) && (wavelens[i] < low_freq_wavelen)
+		}
 		// smooth_factors = (old_context_len / wavelens - low_freq_factor) / (high_freq_factor - low_freq_factor)
-		high_minus_low, _ := ctx.FromFloatSlice([]float32{high_freq_factor - low_freq_factor}, 1)
-		smooth_factors := old_context_lenA.Divide(ctx, wavelens).Subtract(ctx, low_freq_factorA).Divide(ctx, high_minus_low)
+		smooth_factors := make([]float32, len(freqs))
+		for i := range freqs {
+			smooth_factors[i] = ((old_context_len)/wavelens[i] - (low_freq_factor)) / ((high_freq_factor) - (low_freq_factor))
+		}
 		// smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
-		oneA, _ := ctx.FromFloatSlice([]float32{1}, 1)
-		smooth_freqs := freqs.Divide(ctx, oneA.Subtract(ctx, smooth_factors).Divide(ctx, factorA).Add(ctx, smooth_factors))
-		_freqs = ctx.Where(is_medium_freq, smooth_freqs, freqs)
+		smooth_freqs := make([]float32, len(freqs))
+		for i := range freqs {
+			smooth_freqs[i] = freqs[i] / ((1-smooth_factors[i])/factor + (smooth_factors[i]))
+		}
+		// _freqs = mx.where(is_medium_freq, smooth_freqs, freqs)
+		for i := range freqs {
+			if is_medium_freq[i] {
+				freqs[i] = float32(smooth_freqs[i])
+			}
+		}
+		_freqs, _ = ctx.FromFloatSlice(freqs, len(freqs))
 	}
 	once.Do(onceBody)
 
@@ -165,6 +181,17 @@ func (sa *SelfAttention) Rope(ctx ml.Context, x ml.Tensor, offset int32, opts *O
 		0,   // base unused
 		1.0, // scale
 	)
+}
+
+func arange(start, end, step float32) []float32 {
+	if step == 0 || start >= end {
+		return nil
+	}
+	var res []float32
+	for i := float32(start); i < end; i += step {
+		res = append(res, i)
+	}
+	return res
 }
 
 type MLP struct {
@@ -189,7 +216,6 @@ type Layer struct {
 
 func (l *Layer) Forward(ctx ml.Context, hiddenState ml.Tensor, offset int32, cache model.Cache, opts *Options) ml.Tensor {
 	residual := hiddenState
-	// slog.Info("XXX Before AttentionNorm")
 	hiddenState = l.AttentionNorm.Forward(ctx, hiddenState, opts.eps)
 	hiddenState = l.SelfAttention.Forward(ctx, hiddenState, offset, cache, opts)
 	hiddenState = hiddenState.Add(ctx, residual)
