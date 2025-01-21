@@ -2,6 +2,7 @@ package llama
 
 import (
 	"math"
+	"sync"
 
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
@@ -53,111 +54,117 @@ type SelfAttention struct {
 }
 
 func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState ml.Tensor, offset int32, cache model.Cache, opts *Options) ml.Tensor {
-	// Note: this impl was derived from multiple references and is not necessarily the most optimal.
-	// https://github.com/meta-llama/llama-models/blob/main/models/llama3/reference_impl/model.py
-	// https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/llama.py
+	// Ref: https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/llama.py
 	shape := hiddenState.Shape()
-	bsz := shape[0]
-	seqlen := shape[1]
-	n_local_heads := opts.numHeads
-	n_local_kv_heads := opts.numKVHeads
-	// n_rep := int(n_local_heads / n_local_kv_heads)
+	B := shape[0]
+	L := shape[1]
+	n_heads := opts.numHeads
+	n_kv_heads := opts.numKVHeads
 
 	head_dim := opts.hiddenSize / opts.numHeads
 	scale := math.Pow(float64(head_dim), -0.5)
 
-	xq := sa.Query.Forward(ctx, hiddenState)
-	xk := sa.Key.Forward(ctx, hiddenState)
-	xv := sa.Value.Forward(ctx, hiddenState)
+	queries := sa.Query.Forward(ctx, hiddenState)
+	keys := sa.Key.Forward(ctx, hiddenState)
+	values := sa.Value.Forward(ctx, hiddenState)
 
-	xq = xq.Reshape(ctx, bsz, seqlen, n_local_heads, head_dim).Permute(ctx, 0, 2, 1, 3)
-	xk = xk.Reshape(ctx, bsz, seqlen, n_local_kv_heads, head_dim).Permute(ctx, 0, 2, 1, 3)
-	xv = xv.Reshape(ctx, bsz, seqlen, n_local_kv_heads, head_dim).Permute(ctx, 0, 2, 1, 3)
+	queries = queries.Reshape(ctx, B, L, n_heads, -1).Permute(ctx, 0, 2, 1, 3)
+	keys = keys.Reshape(ctx, B, L, n_kv_heads, -1).Permute(ctx, 0, 2, 1, 3)
+	values = values.Reshape(ctx, B, L, n_kv_heads, -1).Permute(ctx, 0, 2, 1, 3)
 
-	// TODO - begin ROPE impl, this should be abstracted out someplace...
-	// Reference: https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/rope_utils.py#L9
-	dims := opts.ropeDim
-	base := opts.ropeBase // aka rope_scale
-	if base == 0 {
-		base = 10000.0
-	}
-	low_freq_factor := opts.ropeScale // ???
-	low_freq_factorA, _ := ctx.FromFloatSlice([]float32{low_freq_factor}, 1)
-	high_freq_factor := float32(4.0) // TODO should attempt to get from metadata
-	factor := float32(8.0)           // metadata?
-	factorA, _ := ctx.FromFloatSlice([]float32{factor}, 1)
-	old_context_len := float32(8192) // metadata?  (aka original_max_position_embeddings)
-	old_context_lenA, _ := ctx.FromFloatSlice([]float32{old_context_len}, 1)
-
-	// Calcs...
-	low_freq_wavelen := float32(old_context_len) / low_freq_factor
-	low_freq_wavelenA, _ := ctx.FromFloatSlice([]float32{low_freq_wavelen}, 1)
-	high_freq_wavelen := float32(old_context_len) / high_freq_factor
-	high_freq_wavelenA, _ := ctx.FromFloatSlice([]float32{high_freq_wavelen}, 1)
-
-	// freqs = base ** (mx.arange(0, dims, 2) / dims)
-	tmp := ctx.Arange(0, float64(dims), 2, ml.DTypeI32)
-	dimsA, _ := ctx.FromFloatSlice([]float32{float32(dims)}, 1)
-	tmp = tmp.Divide(ctx, dimsA)
-	baseA, _ := ctx.FromFloatSlice([]float32{float32(base)}, 1)
-	freqs := baseA.Power(ctx, ctx.Arange(0, float64(dims), 2, ml.DTypeF32).Divide(ctx, dimsA))
-	two_pi, _ := ctx.FromFloatSlice([]float32{2 * math.Pi}, 1)
-	wavelens := freqs.Mul(ctx, two_pi)
-	freqs = ctx.Where(wavelens.Greater(ctx, low_freq_wavelenA), freqs.Mul(ctx, factorA), freqs)
-	is_medium_freq := wavelens.Greater(ctx, high_freq_wavelenA).BitwiseAnd(ctx, wavelens.Less(ctx, low_freq_wavelenA))
-	// smooth_factors = (old_context_len / wavelens - low_freq_factor) / (high_freq_factor - low_freq_factor)
-	high_minus_low, _ := ctx.FromFloatSlice([]float32{high_freq_factor - low_freq_factor}, 1)
-	smooth_factors := old_context_lenA.Divide(ctx, wavelens).Subtract(ctx, low_freq_factorA).Divide(ctx, high_minus_low)
-	// smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
-	oneA, _ := ctx.FromFloatSlice([]float32{1}, 1)
-	smooth_freqs := freqs.Divide(ctx, oneA.Subtract(ctx, smooth_factors).Divide(ctx, factorA).Add(ctx, smooth_factors))
-	_freqs := ctx.Where(is_medium_freq, smooth_freqs, freqs)
-
-	xq = xq.Rope(
-		ctx,
-		offset,
-		_freqs,
-		dims,
-		0,   // base unused
-		1.0, // scale
-	)
-	xk = xk.Rope(
-		ctx,
-		offset,
-		_freqs,
-		dims,
-		0,   // base unused
-		1.0, // scale
-	)
+	queries = sa.Rope(ctx, queries, offset, opts)
+	keys = sa.Rope(ctx, keys, offset, opts)
 
 	// TODO - when this comes back, the input should be truncated to just the latest token
-	// keys, values = cache.Put(ctx, xk, xv, cache.Options)
-	keys := xk
-	values := xv
+	// keys, values = cache.Put(ctx, keys, values, cache.Options)
 
-	// // Begin scaled dot product attention
-	// // Note: this impl is close, but not quite working as an alternative to FastScaledDotProductAttention (incorrect shapes someplace)
-	// keys = keys.Repeat(ctx, n_rep, 2).Contiguous(ctx)
-	// values = values.Repeat(ctx, n_rep, 2).Contiguous(ctx)
+	// TODO - some sort of discovery mechanism to know if the backend supports the fast routine
+	var output ml.Tensor
+	if false {
+		// Begin scaled dot product attention
+		// Ref: https://github.com/meta-llama/llama-models/blob/main/models/llama3/reference_impl/model.py#L196
+		n_rep := int(n_heads / n_kv_heads)
+		keys = keys.Permute(ctx, 0, 2, 1, 3)
+		values = values.Permute(ctx, 0, 2, 1, 3)
+		queries = queries.Permute(ctx, 0, 2, 1, 3)
+		// repeat k/v heads if n_kv_heads < n_heads
+		// equiv to torch.repeat_interleave(x, dim=2, repeats=n_rep)
+		keys = keys.Repeat(ctx, n_rep, 2).Contiguous(ctx)
+		values = values.Repeat(ctx, n_rep, 2).Contiguous(ctx)
 
-	// xq = xq.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)         // (bs, n_local_heads, seqlen, head_dim)
-	// keys = keys.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)     // (bs, n_local_heads, cache_len + seqlen, head_dim)
-	// values = values.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx) // (bs, n_local_heads, cache_len + seqlen, head_dim)
+		queries = queries.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx) // (bs, n_heads, L, head_dim)
+		keys = keys.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)       // (bs, n_heads, cache_len + L, head_dim)
+		values = values.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)   // (bs, n_heads, cache_len + L, head_dim)
 
-	// kp := keys.Permute(ctx, 0, 1, 3, 2)
-	// scores := kp.Mulmat(ctx, xq).Scale(ctx, 1.0/math.Sqrt(float64(head_dim)))
-	// // TODO mask here
-	// scores = scores.Softmax(ctx) // Without axis=-1 this starts to drift
-	// output := values.Mulmat(ctx, scores)
-	// // End scaled dot product attention
+		kp := keys.Permute(ctx, 0, 1, 3, 2)
+		scores := kp.Mulmat(ctx, queries).Scale(ctx, 1.0/math.Sqrt(float64(head_dim)))
+		// TODO mask here
 
-	output := ctx.FastScaledDotProductAttention(xq, keys, values, float32(scale), nil)
-	// slog.Info("XXX output from scaled dot product attention", "output", output)
+		scores = scores.Softmax(ctx) // Without axis=-1 this starts to drift
+		output = values.Mulmat(ctx, scores)
+	} else {
+		output = ctx.FastScaledDotProductAttention(queries, keys, values, float32(scale), nil)
+	}
 
 	output = output.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	output = output.Reshape(ctx, bsz, seqlen, -1)
+	output = output.Reshape(ctx, B, L, -1)
 	output = sa.Output.Forward(ctx, output)
 	return output
+}
+
+func (sa *SelfAttention) Rope(ctx ml.Context, x ml.Tensor, offset int32, opts *Options) ml.Tensor {
+	var once sync.Once
+	var _freqs ml.Tensor
+	dims := opts.ropeDim
+	onceBody := func() {
+		// Reference: https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/rope_utils.py#L9
+
+		base := opts.ropeBase // aka rope_scale
+		if base == 0 {
+			base = 10000.0
+		}
+		low_freq_factor := opts.ropeScale // ???
+		low_freq_factorA, _ := ctx.FromFloatSlice([]float32{low_freq_factor}, 1)
+		high_freq_factor := float32(4.0) // TODO should attempt to get from metadata
+		factor := float32(8.0)           // metadata?
+		factorA, _ := ctx.FromFloatSlice([]float32{factor}, 1)
+		old_context_len := float32(8192) // metadata?  (aka original_max_position_embeddings)
+		old_context_lenA, _ := ctx.FromFloatSlice([]float32{old_context_len}, 1)
+
+		// Calcs...
+		low_freq_wavelen := float32(old_context_len) / low_freq_factor
+		low_freq_wavelenA, _ := ctx.FromFloatSlice([]float32{low_freq_wavelen}, 1)
+		high_freq_wavelen := float32(old_context_len) / high_freq_factor
+		high_freq_wavelenA, _ := ctx.FromFloatSlice([]float32{high_freq_wavelen}, 1)
+
+		// freqs = base ** (mx.arange(0, dims, 2) / dims)
+		tmp := ctx.Arange(0, float64(dims), 2, ml.DTypeI32)
+		dimsA, _ := ctx.FromFloatSlice([]float32{float32(dims)}, 1)
+		tmp = tmp.Divide(ctx, dimsA)
+		baseA, _ := ctx.FromFloatSlice([]float32{float32(base)}, 1)
+		freqs := baseA.Power(ctx, ctx.Arange(0, float64(dims), 2, ml.DTypeF32).Divide(ctx, dimsA))
+		two_pi, _ := ctx.FromFloatSlice([]float32{2 * math.Pi}, 1)
+		wavelens := freqs.Mul(ctx, two_pi)
+		freqs = ctx.Where(wavelens.Greater(ctx, low_freq_wavelenA), freqs.Mul(ctx, factorA), freqs)
+		is_medium_freq := wavelens.Greater(ctx, high_freq_wavelenA).BitwiseAnd(ctx, wavelens.Less(ctx, low_freq_wavelenA))
+		// smooth_factors = (old_context_len / wavelens - low_freq_factor) / (high_freq_factor - low_freq_factor)
+		high_minus_low, _ := ctx.FromFloatSlice([]float32{high_freq_factor - low_freq_factor}, 1)
+		smooth_factors := old_context_lenA.Divide(ctx, wavelens).Subtract(ctx, low_freq_factorA).Divide(ctx, high_minus_low)
+		// smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
+		oneA, _ := ctx.FromFloatSlice([]float32{1}, 1)
+		smooth_freqs := freqs.Divide(ctx, oneA.Subtract(ctx, smooth_factors).Divide(ctx, factorA).Add(ctx, smooth_factors))
+		_freqs = ctx.Where(is_medium_freq, smooth_freqs, freqs)
+	}
+	once.Do(onceBody)
+
+	return x.Rope(
+		ctx,
+		offset,
+		_freqs,
+		dims,
+		0,   // base unused
+		1.0, // scale
+	)
 }
 
 type MLP struct {
@@ -182,6 +189,7 @@ type Layer struct {
 
 func (l *Layer) Forward(ctx ml.Context, hiddenState ml.Tensor, offset int32, cache model.Cache, opts *Options) ml.Tensor {
 	residual := hiddenState
+	// slog.Info("XXX Before AttentionNorm")
 	hiddenState = l.AttentionNorm.Forward(ctx, hiddenState, opts.eps)
 	hiddenState = l.SelfAttention.Forward(ctx, hiddenState, offset, cache, opts)
 	hiddenState = hiddenState.Add(ctx, residual)

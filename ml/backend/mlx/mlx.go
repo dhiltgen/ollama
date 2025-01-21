@@ -97,6 +97,9 @@ func New(r *os.File) (ml.Backend, error) {
 			)
 
 			// Q/K are are mutated and we need to reverse that mutation
+			// TODO - this is only for llama based models and shouldn't be applied universally
+			// but only applies to some backends at the moment...  maybe?
+			// Need to get the model running on GGML to see if we can have a consistent model definition for both.
 			if strings.HasSuffix(t.Name, "attn_q.weight") || strings.HasSuffix(t.Name, "attn_q.bias") || strings.HasSuffix(t.Name, "attn_k.weight") || strings.HasSuffix(t.Name, "attn_k.bias") {
 
 				// TODO - is this code memory access safe, or does the delayed processing cause potential memory access after Go frees the stack?

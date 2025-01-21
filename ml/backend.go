@@ -36,6 +36,7 @@ func RegisterBackend(name string, f func(*os.File) (Backend, error)) {
 
 func NewBackend(f *os.File) (Backend, error) {
 	if backend, ok := backends["mlx"]; ok {
+		// if backend, ok := backends["ggml"]; ok {
 		return backend(f)
 	}
 
@@ -74,7 +75,7 @@ type Tensor interface {
 	Mul(ctx Context, t2 Tensor) Tensor
 	Mulmat(ctx Context, t2 Tensor) Tensor
 
-	Softmax(ctx Context) Tensor
+	Softmax(ctx Context) Tensor // TODO axis parameter?
 	LayerNorm(ctx Context, weight, bias Tensor, eps float32) Tensor
 	RMSNorm(ctx Context, weight, bias Tensor, eps float32) Tensor
 	Scale(ctx Context, s float64) Tensor
