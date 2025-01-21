@@ -293,15 +293,15 @@ type Array struct {
 
 func (a *Array) LogValue() slog.Value {
 	// TODO this forces eval on every log message - find a pattern to make this configurable to aid in debugging
-	// str := C.mlx_string_new()
-	// C.mlx_array_tostring(&str, a.a)
-	// s := C.mlx_string_data(str)
-	// defer C.mlx_string_free(str)
+	str := C.mlx_string_new()
+	C.mlx_array_tostring(&str, a.a)
+	s := C.mlx_string_data(str)
+	defer C.mlx_string_free(str)
 
 	return slog.GroupValue(
 		slog.String("name", a.name),
 		slog.Any("shape", a.Shape()),
-		// slog.String("values", C.GoString(s)),
+		slog.String("values", C.GoString(s)),
 	)
 }
 
@@ -443,6 +443,7 @@ func (a *Array) Permute(ctx ml.Context, shape ...int) ml.Tensor {
 // RMSNorm implements ml.Tensor.
 func (a *Array) RMSNorm(ctx ml.Context, w, b ml.Tensor, eps float32) ml.Tensor {
 	var r C.mlx_array
+	// slog.Info("MLX RMSNorm", "a", a, "w", w, "b", b)
 	C.mlx_fast_rms_norm(
 		&r,
 		a.a,
@@ -651,66 +652,6 @@ func (a *Array) Repeat(ctx ml.Context, repeats, axis int) ml.Tensor {
 		(C.int)(repeats),
 		(C.int)(axis),
 		ctx.(*Context).stream)
-	return &Array{a: r}
-}
-
-func (ctx *Context) Arange(start float64, stop float64, step float64, dtype ml.DType) ml.Tensor {
-	var dt C.mlx_dtype
-	switch dtype {
-	case ml.DTypeF32:
-		dt = C.MLX_FLOAT32
-	case ml.DTypeI32:
-		dt = C.MLX_INT32
-	default:
-		panic("type not yet supported")
-	}
-	var r C.mlx_array
-	C.mlx_arange(&r, (C.double)(start), (C.double)(stop), (C.double)(step), dt, ctx.stream)
-	return &Array{a: r}
-}
-
-func (a *Array) Greater(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_greater(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
-	return &Array{a: r}
-}
-
-func (a *Array) Less(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_less(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
-	return &Array{a: r}
-}
-
-func (ctx *Context) Where(condition ml.Tensor, x ml.Tensor, y ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_where(&r, condition.(*Array).a, x.(*Array).a, y.(*Array).a, ctx.stream)
-	return &Array{a: r}
-}
-
-func (a *Array) BitwiseAnd(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_bitwise_and(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
-	return &Array{a: r}
-}
-func (a *Array) BitwiseOr(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_bitwise_or(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
-	return &Array{a: r}
-}
-
-func (a *Array) Divide(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_divide(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
-	return &Array{a: r}
-}
-func (a *Array) Subtract(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_subtract(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
-	return &Array{a: r}
-}
-func (a *Array) Power(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	var r C.mlx_array
-	C.mlx_power(&r, a.a, b.(*Array).a, ctx.(*Context).stream)
 	return &Array{a: r}
 }
 

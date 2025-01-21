@@ -412,15 +412,41 @@ func (t *Tensor) Contiguous(ctx ml.Context) ml.Tensor {
 }
 
 func (t *Tensor) Mul(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return &Tensor{
-		t: C.ggml_mul(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
+	var t3 ml.Tensor = t
+	tshape := t.Shape()
+	t2shape := t2.Shape()
+	switch len(tshape) {
+	case 1:
+		t3 = t
+	case 2:
+		if t2shape[len(t2shape)-1] != tshape[0] {
+			t3 = t.Permute(ctx, 1, 0, 2, 3)
+		}
+	case 3:
+		if t2shape[len(t2shape)-1] != tshape[1] {
+			t3 = t.Permute(ctx, 2, 1, 0, 3)
+		}
+	case 4:
+		if t2shape[len(t2shape)-1] != tshape[2] {
+			t3 = t.Permute(ctx, 3, 2, 1, 0)
+		}
 	}
+	slog.Info("XXX Mul", "a", t3, "b", t2)
+	r := &Tensor{
+		t: C.ggml_mul(ctx.(*Context).ctx, t3.(*Tensor).t, t2.(*Tensor).t),
+	}
+	return r.Reshape(ctx, tshape...)
 }
 
 func (t *Tensor) Mulmat(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return &Tensor{
-		t: C.ggml_mul_mat(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
-	}
+	slog.Info("GGML Mulmat", "a", t, "b", t2)
+	t3 := t2.Permute(ctx, 2, 1, 0, 3)
+	r := (ml.Tensor)(&Tensor{
+		t: C.ggml_mul_mat(ctx.(*Context).ctx, t.t, t3.(*Tensor).t),
+	})
+	r = r.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
+	slog.Info("XXX result", "r", r)
+	return r
 }
 
 func (t *Tensor) LayerNorm(ctx ml.Context, w, b ml.Tensor, eps float32) ml.Tensor {
@@ -436,6 +462,8 @@ func (t *Tensor) LayerNorm(ctx ml.Context, w, b ml.Tensor, eps float32) ml.Tenso
 }
 
 func (t *Tensor) RMSNorm(ctx ml.Context, w, b ml.Tensor, eps float32) ml.Tensor {
+	slog.Info("GGML RMSNorm", "a", t, "w", w, "b", b)
+
 	r := (&Tensor{
 		t: C.ggml_rms_norm(ctx.(*Context).ctx, t.t, C.float(eps)),
 	}).Mul(ctx, w)
@@ -443,6 +471,7 @@ func (t *Tensor) RMSNorm(ctx ml.Context, w, b ml.Tensor, eps float32) ml.Tensor 
 	if b != nil {
 		r = r.Add(ctx, b)
 	}
+	slog.Info("GGML RMSNorm done")
 
 	return r
 }
@@ -462,9 +491,11 @@ func (t *Tensor) Permute(ctx ml.Context, shape ...int) ml.Tensor {
 		panic("expected 4 dimensions")
 	}
 
-	return &Tensor{
+	r := &Tensor{
 		t: C.ggml_permute(ctx.(*Context).ctx, t.t, C.int(shape[0]), C.int(shape[1]), C.int(shape[2]), C.int(shape[3])),
 	}
+	slog.Info("GGML Permute", "req", shape, "before", t, "after", r)
+	return r
 }
 
 func (t *Tensor) Rows(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
@@ -480,6 +511,30 @@ func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
 }
 
 func (t *Tensor) Reshape(ctx ml.Context, shape ...int64) ml.Tensor {
+	// GGML does not handle -1 natively
+	// slog.Info("XXX initial", "shape", shape)
+	for i, sh := range shape {
+		if sh == -1 {
+			totalElems := int64(1)
+			for d := range C.ggml_n_dims(t.t) {
+				totalElems *= int64(t.t.ne[d])
+			}
+			otherElems := int64(1)
+			for _, osh := range shape {
+				if osh != -1 {
+					otherElems *= int64(osh)
+				}
+			}
+			if otherElems > totalElems {
+				slog.Info("XXX Invalid request", "req", shape, "actual", t.Shape(), "totalElems", totalElems, "otherElems", otherElems)
+
+				panic("impossible -1 shape request")
+			}
+			shape[i] = int64(float64(totalElems) / float64(otherElems))
+			slog.Info("XXX Adjusted shape", "negIndex", i, "totalElems", totalElems, "otherElems", otherElems, "shape", shape)
+			break
+		}
+	}
 	switch len(shape) {
 	case 1:
 		return &Tensor{
@@ -606,43 +661,6 @@ func (t *Tensor) Conv2D(ctx ml.Context, t2 ml.Tensor, s0, s1, p0, p1, d0, d1 int
 }
 
 func (t *Tensor) Repeat(ctx ml.Context, repeats, axis int) ml.Tensor {
-	panic("not yet implemented")
-}
-
-func (ctx *Context) Arange(start float64, stop float64, step float64, dtype ml.DType) ml.Tensor {
-	// TODO handle dtype
-	return &Tensor{
-		t: C.ggml_arange(ctx.ctx, C.float(start), C.float(stop), C.float(step)),
-	}
-}
-
-func (t *Tensor) Greater(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (t *Tensor) Less(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (c *Context) Where(condition ml.Tensor, x ml.Tensor, y ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (t *Tensor) BitwiseAnd(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-func (t *Tensor) BitwiseOr(ctx ml.Context, b ml.Tensor) ml.Tensor {
-	panic("not yet implemented")
-}
-
-func (t *Tensor) Divide(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return &Tensor{
-		t: C.ggml_div(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
-	}
-}
-func (t *Tensor) Subtract(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return &Tensor{
-		t: C.ggml_sub(ctx.(*Context).ctx, t.t, t2.(*Tensor).t),
-	}
-}
-func (t *Tensor) Power(ctx ml.Context, b ml.Tensor) ml.Tensor {
 	panic("not yet implemented")
 }
 
