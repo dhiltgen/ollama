@@ -75,6 +75,7 @@ func temp() error {
 	if err != nil {
 		return err
 	}
+	// inputIDs = []int32{128000, 128006, 882, 128007, 271, 12840, 374, 279, 2107, 27094, 315, 9822, 30, 128009, 128006, 78191, 128007, 271}
 
 	var opts []model.OptionsFunc
 	if args.cache {

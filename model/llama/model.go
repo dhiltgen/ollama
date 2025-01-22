@@ -82,7 +82,7 @@ func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState ml.Tensor, offset i
 
 	// TODO - some sort of discovery mechanism to know if the backend supports the fast routine
 	var output ml.Tensor
-	if false {
+	if true {
 		// Begin scaled dot product attention
 		// Ref: https://github.com/meta-llama/llama-models/blob/main/models/llama3/reference_impl/model.py#L196
 		n_rep := int(n_heads / n_kv_heads)
@@ -98,7 +98,7 @@ func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState ml.Tensor, offset i
 		keys = keys.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)       // (bs, n_heads, cache_len + L, head_dim)
 		values = values.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)   // (bs, n_heads, cache_len + L, head_dim)
 
-		kp := keys.Permute(ctx, 0, 1, 3, 2)
+		kp := keys.Permute(ctx, 0, 1, 3, 2).Contiguous(ctx)
 		scores := kp.Mulmat(ctx, queries).Scale(ctx, 1.0/math.Sqrt(float64(head_dim)))
 		// TODO mask here
 

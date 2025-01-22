@@ -652,6 +652,8 @@ func (a *Array) Repeat(ctx ml.Context, repeats, axis int) ml.Tensor {
 		(C.int)(repeats),
 		(C.int)(axis),
 		ctx.(*Context).stream)
+	slog.Info("MLX Repeat", "a", a, "repeats", repeats, "axis", axis, "result", &Array{a: r})
+	panic("XXX")
 	return &Array{a: r}
 }
 

@@ -438,13 +438,64 @@ func (t *Tensor) Mul(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
 	return r.Reshape(ctx, tshape...)
 }
 
+func dims(t ml.Tensor) int {
+	dims := 0
+	for i := range 4 {
+		if t.Dim(i) > 1 {
+			dims = i + 1
+		}
+	}
+	return dims
+}
+
+func flip(ctx ml.Context, t ml.Tensor, dims int) ml.Tensor {
+	switch dims {
+	case 2:
+		return t.Permute(ctx, 1, 0, 2, 3)
+	case 3:
+		return t.Permute(ctx, 2, 1, 0, 3)
+	case 4:
+		return t.Permute(ctx, 3, 2, 1, 0)
+	default:
+		return t
+	}
+}
+
 func (t *Tensor) Mulmat(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
+	tDims := dims(t)
+	tShape := t.Shape()
+	t2Dims := dims(t2)
+	mDims := max(tDims, t2Dims)
+	// tx := flip(ctx, t, tDims)
+	var tx ml.Tensor
+	tx = t
+	t2x := flip(ctx, t2, t2Dims)
+	for i := range tDims {
+		if tShape[i] == t2x.Dim(0) {
+			slog.Info("XXX Matching dimension", "i", i, "dim", tShape[i])
+		}
+	}
+	slog.Info("XXX", "a_dims", dims(t), "b_dims", dims(t2))
 	slog.Info("GGML Mulmat", "a", t, "b", t2)
-	t3 := t2.Permute(ctx, 2, 1, 0, 3)
+	slog.Info("GGML Mulmat", "ax", tx, "bx", t2x)
+	// if t.t.ne[0] != t2.(*Tensor).t.ne[0] {
+	// 	panic("XXX Mulmat: incompatible shapes [0]")
+	// }
+	// if t.t.ne[2]%t2.(*Tensor).t.ne[2] != 0 {
+	// 	panic("XXX Mulmat: incompatible shapes [2]")
+	// }
+	// if t.t.ne[3]%t2.(*Tensor).t.ne[3] != 0 {
+	// 	panic("XXX Mulmat: incompatible shapes [3]")
+	// }
+
+	// t3 := t2.Permute(ctx, 2, 1, 0, 3)
+	// slog.Info("GGML Mulmat", "a", t, "b", t2, "b_permuted", t3)
+	// tensor->nb[0] > tensor->nb[1];
+	slog.Info("XXX transposed info", "0", tx.(*Tensor).t.nb[0], "1", tx.(*Tensor).t.nb[1])
 	r := (ml.Tensor)(&Tensor{
-		t: C.ggml_mul_mat(ctx.(*Context).ctx, t.t, t3.(*Tensor).t),
+		t: C.ggml_mul_mat(ctx.(*Context).ctx, tx.(*Tensor).t, t2x.(*Tensor).t),
 	})
-	r = r.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
+	r = flip(ctx, r, mDims).Contiguous(ctx)
 	slog.Info("XXX result", "r", r)
 	return r
 }
@@ -622,13 +673,27 @@ const (
 )
 
 func (t *Tensor) Rope(ctx ml.Context, offset int32, ropeFactors ml.Tensor, ropeDim uint32, ropeBase, ropeScale float32) ml.Tensor {
-	positionIDs, err := ctx.FromIntSlice([]int32{0}, 1) // TODO - actual impl
+	tp := t.Permute(ctx, 3, 1, 2, 0)
+	var p int
+	for i := range tp.(*Tensor).t.ne {
+		if tp.(*Tensor).t.ne[i] > 1 {
+			p = int(tp.(*Tensor).t.ne[i])
+		}
+	}
+	slog.Info("XXX last dim", "p", p, "t", t, "tp", tp)
+	positions := make([]int32, p)
+	for i := range positions {
+		positions[i] = int32(i)
+	}
+
+	positionIDs, err := ctx.FromIntSlice(positions, len(positions))
 	if err != nil {
 		panic(err.Error())
 	}
-	return &Tensor{
+	slog.Info("GGML Rope", "t", tp, "ropeFactors", ropeFactors, "positionIDs", positionIDs, "ropeDim", ropeDim)
+	r := (ml.Tensor)(&Tensor{
 		t: C.ggml_rope_ext(
-			ctx.(*Context).ctx, t.t, positionIDs.(*Tensor).t, ropeFactors.(*Tensor).t,
+			ctx.(*Context).ctx, tp.(*Tensor).t, positionIDs.(*Tensor).t, ropeFactors.(*Tensor).t,
 			C.int(ropeDim),
 			131072,       // YaRN n_ctx_train
 			ropeTypeNorm, // ROPE_TYPE_NORM
@@ -639,7 +704,10 @@ func (t *Tensor) Rope(ctx ml.Context, offset int32, ropeFactors ml.Tensor, ropeD
 			32., // YaRN beta_fast
 			1.,  // YaRN beta_slow
 		),
-	}
+	})
+	r = r.Permute(ctx, 3, 1, 2, 0)
+	slog.Info("GGML Rope", "result", r)
+	return r
 }
 
 func (t *Tensor) GELU(ctx ml.Context) ml.Tensor {
@@ -661,7 +729,14 @@ func (t *Tensor) Conv2D(ctx ml.Context, t2 ml.Tensor, s0, s1, p0, p1, d0, d1 int
 }
 
 func (t *Tensor) Repeat(ctx ml.Context, repeats, axis int) ml.Tensor {
-	panic("not yet implemented")
+	shape := t.Shape()
+	shape[axis] *= int64(repeats)
+	tt := C.ggml_new_tensor(ctx.(*Context).ctx, t.t._type, C.int(len(shape)), (*C.int64_t)(unsafe.Pointer(&shape[0])))
+	r := &Tensor{
+		t: C.ggml_repeat(ctx.(*Context).ctx, t.t, tt),
+	}
+	slog.Info("MLX Repeat", "a", t, "repeats", repeats, "axis", axis, "result", r)
+	return r
 }
 
 func (ctx *Context) FastScaledDotProductAttention(queries, keys, values ml.Tensor, scale float32, mask ml.Tensor) ml.Tensor {
