@@ -1,6 +1,7 @@
 package llama
 
 import (
+	"log/slog"
 	"math"
 	"sync"
 
@@ -74,31 +75,39 @@ func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState ml.Tensor, offset i
 
 	queries = sa.Rope(ctx, queries, offset, opts)
 	keys = sa.Rope(ctx, keys, offset, opts)
+	slog.Info("XXX keys after rope", "keys", keys)
 
 	// TODO - when this comes back, the input should be truncated to just the latest token
 	// keys, values = cache.Put(ctx, keys, values, cache.Options)
 
 	// TODO - some sort of discovery mechanism to know if the backend supports the fast routine
 	var output ml.Tensor
-	if false {
+	if true {
 		// Begin scaled dot product attention
 		// Ref: https://github.com/meta-llama/llama-models/blob/main/models/llama3/reference_impl/model.py#L196
 		n_rep := int(n_heads / n_kv_heads)
 		keys = keys.Permute(ctx, 0, 2, 1, 3)
+		slog.Info("XXX keys after permute", "keys", keys)
 		values = values.Permute(ctx, 0, 2, 1, 3)
 		queries = queries.Permute(ctx, 0, 2, 1, 3)
 		// repeat k/v heads if n_kv_heads < n_heads
 		// equiv to torch.repeat_interleave(x, dim=2, repeats=n_rep)
 		keys = keys.Repeat(ctx, n_rep, 2).Contiguous(ctx)
+		slog.Info("XXX keys after repeat", "keys", keys)
+
 		values = values.Repeat(ctx, n_rep, 2).Contiguous(ctx)
 
 		queries = queries.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx) // (bs, n_heads, L, head_dim)
 		keys = keys.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)       // (bs, n_heads, cache_len + L, head_dim)
-		values = values.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)   // (bs, n_heads, cache_len + L, head_dim)
+		slog.Info("XXX keys after last permute", "keys", keys)
+
+		values = values.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx) // (bs, n_heads, cache_len + L, head_dim)
 
 		kp := keys.Permute(ctx, 0, 1, 3, 2)
+		slog.Info("XXX before dot product Mulmat", "kp", kp, "queries", queries)
 		scores := kp.Mulmat(ctx, queries).Scale(ctx, 1.0/math.Sqrt(float64(head_dim)))
 		// TODO mask here
+		panic("XXX")
 
 		scores = scores.Softmax(ctx) // Without axis=-1 this starts to drift
 		output = values.Mulmat(ctx, scores)

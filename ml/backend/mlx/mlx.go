@@ -293,15 +293,15 @@ type Array struct {
 
 func (a *Array) LogValue() slog.Value {
 	// TODO this forces eval on every log message - find a pattern to make this configurable to aid in debugging
-	str := C.mlx_string_new()
-	C.mlx_array_tostring(&str, a.a)
-	s := C.mlx_string_data(str)
-	defer C.mlx_string_free(str)
+	// str := C.mlx_string_new()
+	// C.mlx_array_tostring(&str, a.a)
+	// s := C.mlx_string_data(str)
+	// defer C.mlx_string_free(str)
 
 	return slog.GroupValue(
 		slog.String("name", a.name),
 		slog.Any("shape", a.Shape()),
-		slog.String("values", C.GoString(s)),
+		// slog.String("values", C.GoString(s)),
 	)
 }
 
@@ -396,6 +396,7 @@ func (a *Array) Mul(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
 // Mulmat implements ml.Tensor.
 func (a *Array) Mulmat(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
 	var r C.mlx_array
+	slog.Info("MLX Mulmat", "a", a, "b", a2)
 	C.mlx_matmul(&r,
 		a2.(*Array).a,
 		a.a,
@@ -437,6 +438,7 @@ func (a *Array) Permute(ctx ml.Context, shape ...int) ml.Tensor {
 		ndim,
 		ctx.(*Context).stream,
 	)
+	slog.Info("XXX Permute", "request", shape, "before", a.Shape(), "after", (&Array{a: r}).Shape())
 	return &Array{a: r}
 }
 

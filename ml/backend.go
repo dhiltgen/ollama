@@ -35,8 +35,8 @@ func RegisterBackend(name string, f func(*os.File) (Backend, error)) {
 }
 
 func NewBackend(f *os.File) (Backend, error) {
-	if backend, ok := backends["mlx"]; ok {
-		// if backend, ok := backends["ggml"]; ok {
+	// if backend, ok := backends["mlx"]; ok {
+	if backend, ok := backends["ggml"]; ok {
 		return backend(f)
 	}
 
