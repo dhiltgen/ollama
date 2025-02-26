@@ -556,11 +556,67 @@ func (t *Tensor) Permute(ctx ml.Context, shape ...int) ml.Tensor {
 	if len(shape) != 4 {
 		panic("expected 4 dimensions")
 	}
+	rshape := []C.int{0, 1, 2, 3}
+	switch t.nDims {
+	case 2:
+		// TODO make sure this isn't wonky...
+		rshape[0] = rev[2:][shape[1]]
+		rshape[1] = rev[2:][shape[0]]
+	case 3:
+		// TODO has to be a better way...
+		rshape[0] = C.int(shape[0])
+		rshape[1] = C.int(shape[1])
+		rshape[2] = C.int(shape[2])
+		switch shape[0]*100 + shape[1]*10 + shape[2] {
+		case 21:
+			rshape[0], rshape[1], rshape[2] = 1, 0, 2
+		case 102:
+			rshape[0], rshape[1], rshape[2] = 0, 2, 1
+		}
+	case 4:
+		// TODO has to be a better way...
+		rshape[0] = C.int(shape[0])
+		rshape[1] = C.int(shape[1])
+		rshape[2] = C.int(shape[2])
+		rshape[3] = C.int(shape[3])
+		switch shape[0]*1000 + shape[1]*100 + shape[2]*10 + shape[3] {
+		case 132:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 1, 0, 2, 3
+		case 231:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 1, 2, 0, 3
+		case 312:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 2, 0, 1, 3
+		case 321:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 2, 1, 0, 3
+		case 1023:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 0, 1, 3, 2
+		case 1203:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 0, 2, 3, 1
+		case 1302:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 2, 0, 3, 1
+		case 1320:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 2, 1, 3, 0
+		case 2013:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 0, 3, 1, 2
+		case 2031:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 1, 3, 0, 2
+		case 2103:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 0, 3, 2, 1
+		case 2130:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 1, 3, 2, 0
+		case 3021:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 3, 1, 0, 2
+		case 3102:
+			rshape[0], rshape[1], rshape[2], rshape[3] = 3, 0, 2, 1
+		}
+	}
 
-	return &Tensor{
-		t:     C.ggml_permute(ctx.(*Context).ctx, t.t, C.int(shape[0]), C.int(shape[1]), C.int(shape[2]), C.int(shape[3])),
+	slog.Info("GGML Permute", "input", shape, "translated", rshape)
+	r := &Tensor{
+		t:     C.ggml_permute(ctx.(*Context).ctx, t.t, rshape[0], rshape[1], rshape[2], rshape[3]),
 		nDims: t.nDims,
 	}
+	return r
 }
 
 func (t *Tensor) Rows(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
@@ -852,4 +908,62 @@ func (c *Context) Abort(t ml.Tensor) {
 	}
 
 	os.Exit(1)
+}
+
+func newTestBackend(size int) *Backend {
+	var cpus []Context
+
+	for _, d := range devices() {
+		switch C.ggml_backend_dev_type(d.d) {
+		case C.GGML_BACKEND_DEVICE_TYPE_CPU,
+			C.GGML_BACKEND_DEVICE_TYPE_ACCEL:
+			slog.Info("cpu", "device", d)
+			cpus = append(cpus, Context{
+				ctx: C.ggml_init(C.struct_ggml_init_params{
+					mem_size: C.size_t(int(C.ggml_tensor_overhead()) * size),
+					no_alloc: true,
+				}),
+				backend: C.ggml_backend_dev_init(d.d, nil),
+			})
+		}
+	}
+	backends := make([]*C.struct_ggml_backend, len(cpus))
+	bufts := make([]*C.struct_ggml_backend_buffer_type, len(cpus))
+	for i, c := range cpus {
+		backends[i] = c.backend
+		bufts[i] = C.ggml_backend_get_default_buffer_type(c.backend)
+	}
+
+	return &Backend{
+		meta: nil,
+		cpus: cpus,
+		sched: C.ggml_backend_sched_new(
+			(*C.ggml_backend_t)(unsafe.Pointer(&backends[0])),
+			(*C.ggml_backend_buffer_type_t)(unsafe.Pointer(&bufts[0])),
+			C.int(len(backends)),
+			C.size_t(max(8192, size)),
+			true,
+		),
+	}
+}
+
+func newTestContext(b *Backend, size int) *Context {
+	nodes := max(8192, size)
+	c := C.ggml_init(C.struct_ggml_init_params{
+		mem_buffer: nil,
+		mem_size:   C.size_t(nodes)*C.ggml_tensor_overhead() + C.ggml_graph_overhead_custom(C.size_t(nodes), false),
+		no_alloc:   true,
+	})
+
+	backends := make([]*C.struct_ggml_backend, len(b.gpus)+len(b.cpus))
+	for i, c := range append(b.gpus, b.cpus...) {
+		backends[i] = c.backend
+	}
+
+	return &Context{
+		b:       b,
+		ctx:     c,
+		backend: backends[0],
+		nodes:   nodes,
+	}
 }
