@@ -176,7 +176,7 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 	// sr := io.NewSectionReader(r, int64(meta.Tensors().Offset), n-int64(meta.Tensors().Offset))
 
 	slog.Info("initializing MLX GPU backend")
-	stream := C.mlx_default_gpu_stream_new()
+	// stream := C.mlx_default_gpu_stream_new()
 
 	var g errgroup.Group
 	var mu sync.Mutex
@@ -229,9 +229,7 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 				return fmt.Errorf("expected %d bytes, got %d", t.Size(), n)
 			}
 
-			cbytes := C.CBytes(b.Bytes())
-			defer C.free(cbytes)
-
+			data := b.Bytes()
 			shape := make([]C.int, len(layer.Shape))
 			for i := range layer.Shape {
 				shape[i] = C.int(layer.Shape[i])
@@ -240,14 +238,39 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 			// // TODO Quantization types
 			// // ref: https://github.com/ml-explore/mlx/blob/main/mlx/io/gguf_quants.cpp
 			var dtype C.mlx_dtype
+			var dsize int
 			switch layer.Dtype {
 			case "BF16":
 				dtype = C.MLX_BFLOAT16
+				dsize = 2
 			// case 1:
 			// 	dtype = C.MLX_FLOAT16
 			default:
 				return fmt.Errorf("unsupported dtype %s", layer.Dtype)
 			}
+			if len(layer.Shape) == 2 && !strings.HasPrefix(layer.Name, "model.embed_tokens.") {
+				tdata := make([]byte, len(data))
+				t := 0
+				for j := range layer.Shape[1] {
+					for i := range layer.Shape[0] {
+						offset := i*dsize*layer.Shape[1] + j*dsize
+						tdata[t] = data[offset]
+						t++
+						tdata[t] = data[offset+1]
+						t++
+					}
+				}
+				data = tdata
+				rshape := make([]C.int, len(shape))
+				i := 0
+				for r := len(shape) - 1; r >= 0; r-- {
+					rshape[r] = shape[i]
+					i++
+				}
+				shape = rshape
+			}
+			cbytes := C.CBytes(data)
+			defer C.free(cbytes)
 
 			a := C.mlx_array_new_data(
 				cbytes,
@@ -255,18 +278,6 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 				C.int(len(shape)),
 				dtype,
 			)
-
-			if len(layer.Shape) > 1 && !strings.HasPrefix(layer.Name, "model.embed_tokens.") {
-				// slog.Info("XXX Transposing")
-				var r C.mlx_array
-				C.mlx_transpose_all(
-					&r,
-					a,
-					stream,
-				)
-				defer C.mlx_array_free(a)
-				a = r
-			}
 			tmp := &Array{a: a, name: t.Name}
 			// tmp.name = layer.Name // safetensor naming
 			tmp.name = t.Name // GGUF naming
