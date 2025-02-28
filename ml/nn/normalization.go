@@ -18,5 +18,8 @@ type RMSNorm struct {
 }
 
 func (m *RMSNorm) Forward(ctx ml.Context, t ml.Tensor, eps float32) ml.Tensor {
+	// slog.Info("RMSNorm", "t", t)
+	// slog.Info("RMSNorm", "m", m.Weight)
+	// panic("XXX")
 	return t.RMSNorm(ctx, m.Weight, eps)
 }

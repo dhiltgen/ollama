@@ -26,18 +26,23 @@ import "C"
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
+	"mime"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"unsafe"
 
+	"github.com/ollama/ollama/envconfig"
 	fs "github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/ml"
 	"golang.org/x/sync/errgroup"
@@ -53,17 +58,122 @@ func goStackTrace() {
 	debug.PrintStack()
 }
 
+// HACK - defined in the server package but can't import for cycles...
+type Manifest struct {
+	SchemaVersion int     `json:"schemaVersion"`
+	MediaType     string  `json:"mediaType"`
+	Config        Layer   `json:"config"`
+	Layers        []Layer `json:"layers"`
+
+	filepath string
+	fi       os.FileInfo
+	digest   string
+}
+type Layer struct {
+	MediaType string `json:"mediaType"`
+	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
+	From      string `json:"from,omitempty"`
+	status    string
+
+	// Extracted from the media type for easy access
+	Dtype string
+	Shape []int
+	Name  string
+}
+
+func (l Layer) ParseMediaType() (string, map[string]string, error) {
+	return mime.ParseMediaType(l.MediaType)
+}
+
+func GetBlobsPath(digest string) (string, error) {
+	// only accept actual sha256 digests
+	pattern := "^sha256[:-][0-9a-fA-F]{64}$"
+	re := regexp.MustCompile(pattern)
+
+	if digest != "" && !re.MatchString(digest) {
+		return "", errors.New("invalid digest format")
+	}
+
+	digest = strings.ReplaceAll(digest, ":", "-")
+	path := filepath.Join(envconfig.Models(), "blobs", digest)
+	dirPath := filepath.Dir(path)
+	if digest == "" {
+		dirPath = path
+	}
+
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		return "", err
+	}
+
+	return path, nil
+}
+
+func adjustTensorName(ggufName string) string {
+	r := strings.ReplaceAll(ggufName, "blk.", "model.layers.")
+	r = strings.ReplaceAll(r, ".attn_k.", ".self_attn.k_proj.")
+	r = strings.ReplaceAll(r, ".attn_q.", ".self_attn.q_proj.")
+	r = strings.ReplaceAll(r, ".attn_v.", ".self_attn.v_proj.")
+	r = strings.ReplaceAll(r, ".attn_output.", ".self_attn.o_proj.")
+	r = strings.ReplaceAll(r, ".ffn_gate.", ".mlp.gate_proj.")
+	r = strings.ReplaceAll(r, ".ffn_up.", ".mlp.up_proj.")
+	r = strings.ReplaceAll(r, ".ffn_down.", ".mlp.down_proj.")
+	r = strings.ReplaceAll(r, ".ffn_norm.", ".post_attention_layernorm.")
+	r = strings.ReplaceAll(r, ".attn_norm.", ".input_layernorm.")
+	if strings.HasPrefix(r, "output_norm.") {
+		r = strings.ReplaceAll(r, "output_norm.", "model.norm.")
+	}
+	if strings.HasPrefix(r, "token_embd.") {
+		r = strings.ReplaceAll(r, "token_embd.", "model.embed_tokens.")
+	}
+	if strings.HasPrefix(r, "output.") {
+		r = strings.ReplaceAll(r, "output.", "lm_head.")
+	}
+	return r
+}
+
 func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
-	meta, n, err := fs.Decode(r, -1)
+	// TODO - temporary hacks to try to load unmodified row-order tensor data
+	sha256sum := sha256.New()
+	var manifest Manifest
+	if err := json.NewDecoder(io.TeeReader(r, sha256sum)).Decode(&manifest); err != nil {
+		return nil, err
+	}
+	var ggufPath string
+
+	for _, layer := range manifest.Layers {
+		filename, err := GetBlobsPath(layer.Digest)
+		if err != nil {
+			return nil, err
+		}
+		switch layer.MediaType {
+		case "application/vnd.ollama.image.model":
+			ggufPath = filename
+		}
+	}
+
+	gr, err := os.Open(ggufPath)
 	if err != nil {
 		return nil, err
 	}
+
+	meta, _, err := fs.Decode(gr, -1)
+	if err != nil {
+		return nil, err
+	}
+	// slog.Info("XXX Parsed meta", "meta", meta)
+	// slog.Info("XXX Parsed meta", "kv", meta.KV())
+	// for i, t := range meta.Tensors().Items() {
+	// 	slog.Info("XXX tensor", "i", i, "t", t)
+
+	// }
+	// slog.Info("XXX Parsed meta", "tensors", meta.Tensors())
 
 	// TODO all this loading logic will be replaced by the new model loading abstraction, including any necessary transformations
 	// As currently structured, this likely causes a significant performance impact
 
 	tensors := make(map[string]*Array, len(meta.Tensors().Items()))
-	sr := io.NewSectionReader(r, int64(meta.Tensors().Offset), n-int64(meta.Tensors().Offset))
+	// sr := io.NewSectionReader(r, int64(meta.Tensors().Offset), n-int64(meta.Tensors().Offset))
 
 	slog.Info("initializing MLX GPU backend")
 	stream := C.mlx_default_gpu_stream_new()
@@ -74,111 +184,95 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 	defer C.mlx_vector_array_free(vec)
 	for _, t := range meta.Tensors().Items() {
 		g.Go(func() error {
-			var b bytes.Buffer
-			n, err := io.Copy(&b, io.NewSectionReader(sr, int64(t.Offset), int64(t.Size())))
+			if t.Name == "rope_freqs.weight" {
+				slog.Info("Skipping rope_freqs.weight")
+				return nil
+			}
+			// Optimize this...
+			var layer *Layer
+			for _, l := range manifest.Layers {
+				_, params, err := l.ParseMediaType()
+				if err != nil {
+					slog.Error("failed to parse layer", "error", err)
+				}
+				if params["name"] == adjustTensorName(t.Name) {
+					l.Name = params["name"]
+					err = json.Unmarshal([]byte(params["shape"]), &l.Shape)
+					if err != nil {
+						return err
+					}
+					l.Dtype = params["dtype"]
+					layer = &l
+					break
+				}
+			}
+			if layer == nil {
+				slog.Info("Unable to find tensor", "name", t.Name, "adjusted", adjustTensorName(t.Name))
+				panic("missing tensor name mapping!")
+			}
+			layerFilename, err := GetBlobsPath(layer.Digest)
 			if err != nil {
 				return err
 			}
 
-			if n != int64(t.Size()) {
+			lfp, err := os.Open(layerFilename)
+			if err != nil {
+				return err
+			}
+
+			var b bytes.Buffer
+			n, err := io.Copy(&b, lfp)
+			if err != nil {
+				return err
+			}
+			if n != int64(layer.Size) {
 				return fmt.Errorf("expected %d bytes, got %d", t.Size(), n)
 			}
 
 			cbytes := C.CBytes(b.Bytes())
 			defer C.free(cbytes)
 
-			// Inverted
-			shape := make([]C.int, len(t.Shape))
-			i := len(t.Shape) - 1
-			for _, dim := range t.Shape {
-				shape[i] = C.int(dim)
-				i--
+			shape := make([]C.int, len(layer.Shape))
+			for i := range layer.Shape {
+				shape[i] = C.int(layer.Shape[i])
 			}
 
-			// TODO Quantization types
-			// ref: https://github.com/ml-explore/mlx/blob/main/mlx/io/gguf_quants.cpp
+			// // TODO Quantization types
+			// // ref: https://github.com/ml-explore/mlx/blob/main/mlx/io/gguf_quants.cpp
 			var dtype C.mlx_dtype
-			switch t.Kind {
-			case 0:
-				dtype = C.MLX_FLOAT32
-			case 1:
-				dtype = C.MLX_FLOAT16
+			switch layer.Dtype {
+			case "BF16":
+				dtype = C.MLX_BFLOAT16
+			// case 1:
+			// 	dtype = C.MLX_FLOAT16
 			default:
-				return fmt.Errorf("unsupported dtype %d", t.Kind)
+				return fmt.Errorf("unsupported dtype %s", layer.Dtype)
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
-
-			var a C.mlx_array
-			r := C.mlx_array_new_data(
+			a := C.mlx_array_new_data(
 				cbytes,
 				(*C.int)(&shape[0]),
 				C.int(len(shape)),
 				dtype,
 			)
 
-			// Q/K are are mutated and we need to reverse that mutation
-			// TODO - this is only for llama based models and shouldn't be applied universally
-			// but only applies to some backends at the moment...  maybe?
-			if strings.HasSuffix(t.Name, "attn_q.weight") || strings.HasSuffix(t.Name, "attn_q.bias") || strings.HasSuffix(t.Name, "attn_k.weight") || strings.HasSuffix(t.Name, "attn_k.bias") {
-
-				// TODO - is this code memory access safe, or does the delayed processing cause potential memory access after Go frees the stack?
-
-				// TODO performance: Since these operations are ~static yet cause a lot of additional nodes in the graph
-				// Ideally these should be applied "on the fly" at load time, so the tensor has the data ready to go.
-				defer C.mlx_array_free(r)
-
-				var n_head uint64
-				if strings.Contains(t.Name, "attn_q") {
-					n_head = meta.KV().HeadCount() // Q
-				} else {
-					n_head = meta.KV().HeadCountKV() // K
-				}
-				tmpShape := []C.int{C.int(n_head), C.int(math.Floor(math.Floor(float64(shape[0]) / float64(n_head) / float64(2)))), 2, shape[1]}
-				var shaped C.mlx_array
-				C.mlx_reshape(&shaped, r, (*C.int)(&tmpShape[0]), C.size_t(len(tmpShape)), stream)
-				defer C.mlx_array_free(shaped)
-				var swapped C.mlx_array
-				C.mlx_swapaxes(
-					&swapped,
-					shaped,
-					1,
-					2,
-					stream,
-				)
-				defer C.mlx_array_free(swapped)
-
-				var reshaped C.mlx_array
-				C.mlx_reshape(
-					&reshaped,
-					swapped,
-					(*C.int)(&shape[0]),
-					C.size_t(len(shape)),
-					stream,
-				)
-				defer C.mlx_array_free(reshaped)
+			if len(layer.Shape) > 1 && !strings.HasPrefix(layer.Name, "model.embed_tokens.") {
+				// slog.Info("XXX Transposing")
+				var r C.mlx_array
 				C.mlx_transpose_all(
-					&a,
-					reshaped,
+					&r,
+					a,
 					stream,
 				)
-			} else if strings.Contains(t.Name, "token_embd.weight") {
-				// TODO bug in model code?  Why is this one special compared to all the rest?
+				defer C.mlx_array_free(a)
 				a = r
-			} else {
-				// TODO performance: this should be done to the data as it's loaded, not add additional operations in the graph
-				C.mlx_transpose_all(
-					&a,
-					r,
-					stream,
-				)
-				defer C.mlx_array_free(r)
 			}
-			C.mlx_vector_array_append_value(vec, a)
-
 			tmp := &Array{a: a, name: t.Name}
-			tmp.name = t.Name
+			// tmp.name = layer.Name // safetensor naming
+			tmp.name = t.Name // GGUF naming
+			slog.Info("MLX Loaded", "tensor", tmp)
+			mu.Lock()
+			defer mu.Unlock()
 			tensors[t.Name] = tmp
 			return nil
 		})
@@ -187,7 +281,8 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	C.mlx_async_eval(vec)
+	// panic("Got to end of load")
+	// C.mlx_async_eval(vec)
 
 	return &Backend{
 		meta:    meta,
@@ -375,11 +470,11 @@ func newArray(ctx *Context, a C.mlx_array) *Array {
 
 func (a *Array) LogValue() slog.Value {
 	// TODO this forces eval on every log message - find a pattern to make this configurable to aid in debugging
-	str := C.mlx_string_new()
-	C.mlx_array_tostring(&str, a.a)
-	s := C.mlx_string_data(str)
-	defer C.mlx_string_free(str)
-	fmt.Println(C.GoString(s))
+	// str := C.mlx_string_new()
+	// C.mlx_array_tostring(&str, a.a)
+	// s := C.mlx_string_data(str)
+	// defer C.mlx_string_free(str)
+	// fmt.Println(C.GoString(s))
 	dims := int(C.mlx_array_ndim(a.a))
 	strides := make([]int, dims)
 	for i := range strides {

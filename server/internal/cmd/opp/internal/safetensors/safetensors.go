@@ -95,7 +95,8 @@ func (m *Model) readTensors(fname string) ([]*Tensor, error) {
 
 	tt := make([]*Tensor, 0, len(raws))
 	for name, raw := range raws {
-		if !strings.HasPrefix(name, "model.layer") {
+		// Include everything
+		if strings.HasPrefix(name, "__metadata__") {
 			continue
 		}
 		var v struct {
@@ -112,7 +113,7 @@ func (m *Model) readTensors(fname string) ([]*Tensor, error) {
 
 		// TODO(bmizerany): after collecting, validate all offests make
 		// tensors contiguous?
-		begin, end := v.Offsets[0], v.Offsets[1]
+		begin, end := v.Offsets[0]+headerSize+8, v.Offsets[1]+headerSize+8
 		if err := checkBeginEnd(finfo.Size(), begin, end); err != nil {
 			return nil, err
 		}

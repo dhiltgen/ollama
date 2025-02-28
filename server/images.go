@@ -69,6 +69,10 @@ type Model struct {
 	Messages       []api.Message
 
 	Template *template.Template
+
+	// TODO - Temporary hack
+	ManifestPath    string
+	ManifestVersion int
 }
 
 // CheckCapabilities checks if the model has the specified capabilities returning an error describing
@@ -223,6 +227,7 @@ func GetManifest(mp ModelPath) (*Manifest, string, error) {
 	if err := json.NewDecoder(io.TeeReader(f, sha256sum)).Decode(&manifest); err != nil {
 		return nil, "", err
 	}
+	manifest.filepath = fp
 
 	return &manifest, hex.EncodeToString(sha256sum.Sum(nil)), nil
 }
@@ -233,12 +238,16 @@ func GetModel(name string) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	// slog.Debug("Manifest", "manifestpath", manifest.filepath, "ver", manifest.SchemaVersion, "type", manifest.MediaType, "config", manifest.Config, "layers", len(manifest.Layers))
+	// panic("XXX")
 	model := &Model{
 		Name:      mp.GetFullTagname(),
 		ShortName: mp.GetShortTagname(),
 		Digest:    digest,
 		Template:  template.DefaultTemplate,
+
+		ManifestPath:    manifest.filepath,
+		ManifestVersion: manifest.SchemaVersion,
 	}
 
 	if manifest.Config.Digest != "" {

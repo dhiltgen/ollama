@@ -71,6 +71,7 @@ func Register(name string, f func(ml.Config) (Model, error)) {
 
 // New initializes a new model instance with the provided configuration based on the metadata in the model file
 func New(modelPath string, params ml.BackendParams) (Model, error) {
+	slog.Info("XXX", "modelPath", modelPath)
 	r, err := os.Open(modelPath)
 	if err != nil {
 		return nil, err
@@ -146,7 +147,7 @@ func populateFields(base Base, v reflect.Value, tags ...Tag) reflect.Value {
 				names := fn(tagsCopy)
 				for _, name := range names {
 					if tensor := base.Backend().Get(strings.Join(name, ".")); tensor != nil {
-						slog.Debug("found tensor", "", tensor)
+						// slog.Debug("found tensor", "", tensor)
 						vv.Set(reflect.ValueOf(tensor))
 						break
 					}

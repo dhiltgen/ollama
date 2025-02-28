@@ -54,6 +54,7 @@ type llmServer struct {
 	options     api.Options
 	numParallel int
 	modelPath   string
+	ggufPath    string
 	modelLock   sync.Mutex   // Temporary until we switch fully to Go server
 	model       *llama.Model // If non-nil, the runner is a new Go server
 
@@ -89,7 +90,7 @@ func LoadModel(model string, maxArraySize int) (*ggml.GGML, error) {
 
 // NewLlamaServer will run a server for the given GPUs
 // The gpu list must be a single family.
-func NewLlamaServer(gpus discover.GpuInfoList, model string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
+func NewLlamaServer(gpus discover.GpuInfoList, model, ggufPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
 	systemInfo := discover.GetSystemInfo()
 	systemTotalMemory := systemInfo.System.TotalMemory
 	systemFreeMemory := systemInfo.System.FreeMemory
@@ -331,6 +332,7 @@ func NewLlamaServer(gpus discover.GpuInfoList, model string, f *ggml.GGML, adapt
 			status:      NewStatusWriter(os.Stderr),
 			options:     opts,
 			modelPath:   model,
+			ggufPath:    ggufPath,
 			estimate:    estimate,
 			numParallel: numParallel,
 			sem:         semaphore.NewWeighted(int64(numParallel)),
@@ -966,7 +968,7 @@ func (s *llmServer) Tokenize(ctx context.Context, content string) ([]int, error)
 	if resp.StatusCode == http.StatusNotFound {
 		if s.model == nil {
 			slog.Debug("new runner detected, loading model for cgo tokenization")
-			m, err := llama.LoadModelFromFile(s.modelPath, llama.ModelParams{VocabOnly: true})
+			m, err := llama.LoadModelFromFile(s.ggufPath, llama.ModelParams{VocabOnly: true})
 			if err != nil {
 				return nil, err
 			}
@@ -1038,7 +1040,7 @@ func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error
 	if resp.StatusCode == http.StatusNotFound {
 		if s.model == nil {
 			slog.Debug("new runner detected, loading model for cgo tokenization")
-			m, err := llama.LoadModelFromFile(s.modelPath, llama.ModelParams{VocabOnly: true})
+			m, err := llama.LoadModelFromFile(s.ggufPath, llama.ModelParams{VocabOnly: true})
 			if err != nil {
 				return "", err
 			}
