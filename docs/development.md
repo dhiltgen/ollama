@@ -25,7 +25,7 @@ Then, configure and build the project:
 
 ```shell
 cmake -B build
-cmake --build build
+cmake --build build --config Release
 ```
 
 Lastly, run Ollama:
@@ -89,7 +89,7 @@ Then, configure and build the project:
 
 ```shell
 cmake -B build
-cmake --build build
+cmake --build build --config Release
 ```
 
 Lastly, run Ollama:

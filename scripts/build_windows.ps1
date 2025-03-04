@@ -87,7 +87,7 @@ function buildOllama() {
 
         & cmake --fresh --preset CPU --install-prefix $script:DIST_DIR
         if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
-        & cmake --build --preset CPU  --config Release --parallel $script:JOBS
+        & cmake --build --preset CPU  --config Release --config Release --parallel $script:JOBS
         if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
         & cmake --install build --component CPU --strip
         if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
@@ -102,7 +102,7 @@ function buildOllama() {
             # to avoid 2022 (or newer) from being used as the default
             & cmake --fresh --preset "CUDA 11" -G "Visual Studio 16 2019" --install-prefix $script:DIST_DIR
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
-            & cmake --build --preset "CUDA 11"  --config Release --parallel $script:JOBS
+            & cmake --build --preset "CUDA 11"  --config Release --config Release --parallel $script:JOBS
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
             & cmake --install build --component "CUDA" --strip
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
@@ -113,7 +113,7 @@ function buildOllama() {
             write-host "Building CUDA v12 backend libraries"
             & cmake --fresh --preset "CUDA 12" --install-prefix $script:DIST_DIR
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
-            & cmake --build --preset "CUDA 12"  --config Release --parallel $script:JOBS
+            & cmake --build --preset "CUDA 12"  --config Release --config Release --parallel $script:JOBS
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
             & cmake --install build --component "CUDA" --strip
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
@@ -132,9 +132,18 @@ function buildOllama() {
             $env:HIPCXX=""
             $env:HIP_PLATFORM=""
             $env:CMAKE_PREFIX_PATH=""
-            & cmake --build --preset "ROCm"  --config Release --parallel $script:JOBS
+            & cmake --build --preset "ROCm"  --config Release --config Release --parallel $script:JOBS
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
             & cmake --install build --component "HIP" --strip
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        }
+        if ($env:VULKAN_SDK) {
+            write-host "Building Vulkan backend libraries"
+            & cmake --fresh --preset "VULKAN" --install-prefix $script:DIST_DIR
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --build --preset "VULKAN" --config Release --parallel $script:JOBS
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --install build --component "VULKAN" --strip
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
         }
     }
