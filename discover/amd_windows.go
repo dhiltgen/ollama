@@ -43,6 +43,7 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
 	}
 
 	// Note: the HIP library automatically handles subsetting to any *_VISIBLE_DEVICES the user specified
+	// TODO this will be problematic for the vulkan scenario - the IDs will be incorrect for vulkanGetVisibleDevicesEnv without additional mapping
 	count := hl.HipGetDeviceCount()
 	if count == 0 {
 		err := fmt.Errorf("no compatible amdgpu devices detected")
@@ -52,27 +53,22 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
 
 	libDir, err := AMDValidateLibDir()
 	if err != nil {
-		err = fmt.Errorf("unable to verify rocm library: %w", err)
-		slog.Warn(err.Error())
-		return nil, err
+		slog.Warn("all AMD GPUs will use vulkan - unable to verify rocm library: %w", err)
 	}
 
 	var supported []string
 	gfxOverride := envconfig.HsaOverrideGfxVersion()
-	if gfxOverride == "" {
+	if gfxOverride == "" && libDir != "" {
 		supported, err = GetSupportedGFX(libDir)
 		if err != nil {
-			err = fmt.Errorf("failed to lookup supported GFX types: %w", err)
-			slog.Warn(err.Error())
-			return nil, err
+			slog.Warn("all AMD GPUs will use vulkan - failed to lookup supported GFX types: %w", err)
 		}
-	} else {
-		slog.Info("skipping rocm gfx compatibility check", "HSA_OVERRIDE_GFX_VERSION", gfxOverride)
 	}
 
-	slog.Debug("detected hip devices", "count", count)
+	slog.Debug("detected AMD devices", "count", count)
 	// TODO how to determine the underlying device ID when visible devices is causing this to subset?
 	for i := range count {
+		useVulkan := libDir == ""
 		err = hl.HipSetDevice(i)
 		if err != nil {
 			slog.Warn("set device", "id", i, "error", err)
@@ -84,6 +80,10 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
 			slog.Warn("get properties", "id", i, "error", err)
 			continue
 		}
+		// TODO GUID/LUID doesn't appear set properly here...
+		// fmt.Printf("Props unused1: %s\n", hex.EncodeToString(props.unused1[:]))
+		// fmt.Printf("Props unused2: %s\n", hex.EncodeToString(props.unused2[:]))
+
 		n := bytes.IndexByte(props.Name[:], 0)
 		name := string(props.Name[:n])
 		// TODO is UUID actually populated on windows?
@@ -110,19 +110,24 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
 				// Free memory reporting on Windows is not reliable until we bump to ROCm v6.2
 				UnreliableFreeMemory: true,
 
-				ID:             strconv.Itoa(i), // TODO this is probably wrong if we specify visible devices
-				DependencyPath: []string{libDir},
-				MinimumMemory:  rocmMinimumMemory,
-				Name:           name,
-				Compute:        gfx,
-				DriverMajor:    driverMajor,
-				DriverMinor:    driverMinor,
+				ID:            strconv.Itoa(i), // TODO this is probably wrong if we specify visible devices
+				MinimumMemory: rocmMinimumMemory,
+				Name:          name,
+				Compute:       gfx,
+				DriverMajor:   driverMajor,
+				DriverMinor:   driverMinor,
 			},
 			index: i,
+		}
+		if libDir != "" {
+			gpuInfo.DependencyPath = []string{libDir}
 		}
 
 		// iGPU detection, remove this check once we can support an iGPU variant of the rocm library
 		if strings.EqualFold(name, iGPUName) || totalMemory < IGPUMemLimit {
+			// TODO figure out how to get these working with Vulkan...
+			// In particular, memory predictions so we load the right number of layers.
+			// And keep our memory accounting accurate with overall system memory
 			reason := "unsupported Radeon iGPU detected skipping"
 			slog.Info(reason, "id", gpuInfo.ID, "total", format.HumanBytes2(totalMemory))
 			unsupportedGPUs = append(unsupportedGPUs, UnsupportedGPUInfo{
@@ -134,21 +139,20 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
 
 		// Strip off Target Features when comparing
 		if !slices.Contains[[]string, string](supported, strings.Split(gfx, ":")[0]) {
-			reason := fmt.Sprintf("amdgpu is not supported (supported types:%s)", supported)
-			slog.Warn(reason, "gpu_type", gfx, "gpu", gpuInfo.ID, "library", libDir)
-			unsupportedGPUs = append(unsupportedGPUs, UnsupportedGPUInfo{
-				GpuInfo: gpuInfo.GpuInfo,
-				Reason:  reason,
-			})
-			// HSA_OVERRIDE_GFX_VERSION not supported on windows
-			continue
+			slog.Debug("amdgpu is not supported by rocm, usinf vulkan", "gpu", i, "gpu_type", gfx, "supported", supported)
+			useVulkan = true
 		} else {
-			slog.Debug("amdgpu is supported", "gpu", i, "gpu_type", gfx)
+			slog.Debug("amdgpu is supported by rocm", "gpu", i, "gpu_type", gfx)
 		}
 
 		slog.Debug("amdgpu memory", "gpu", i, "total", format.HumanBytes2(totalMemory))
 		slog.Debug("amdgpu memory", "gpu", i, "available", format.HumanBytes2(freeMemory))
 
+		if useVulkan {
+			gpuInfo.Library = "vulkan"
+			// TODO - gpuinfo.index needs to be updated to reflect the vulkan device order, not HIP
+			// On a mixed vendor system, this is going to be wrong as is.
+		}
 		resp = append(resp, gpuInfo)
 	}
 

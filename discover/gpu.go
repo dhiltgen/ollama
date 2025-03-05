@@ -689,6 +689,8 @@ func (l GpuInfoList) GetVisibleDevicesEnv() (string, string) {
 		return cudaGetVisibleDevicesEnv(l)
 	case "rocm":
 		return rocmGetVisibleDevicesEnv(l)
+	case "vulkan":
+		return vulkanGetVisibleDevicesEnv(l)
 	case "oneapi":
 		return oneapiGetVisibleDevicesEnv(l)
 	default:

@@ -16,7 +16,9 @@ const (
 )
 
 type hipDevicePropMinimal struct {
-	Name        [256]byte
+	Name [256]byte
+	// 16 bytes UUID, not set on my test systems...?
+	// 8 bytes LUID, not set on my test systems...?
 	unused1     [140]byte
 	GcnArchName [256]byte // gfx####
 	iGPU        int       // Doesn't seem to actually report correctly
@@ -34,10 +36,16 @@ type HipLib struct {
 }
 
 func NewHipLib() (*HipLib, error) {
+	// TODO - with Vulkan in the equation, maybe we can soften this and use "amdhip64.dll" (v5 of the APIs)
+	// If you let Windows install the default AMD driver as of Feb '25 you get an older driver with "amdhip64.dll"
+
 	// At runtime we depend on v6, so discover GPUs with the same library for a consistent set of GPUs
 	h, err := windows.LoadLibrary("amdhip64_6.dll")
 	if err != nil {
-		return nil, fmt.Errorf("unable to load amdhip64_6.dll, please make sure to upgrade to the latest amd driver: %w", err)
+		h, err = windows.LoadLibrary("amdhip64.dll")
+		if err != nil {
+			return nil, fmt.Errorf("unable to load amdhip64.dll or amdhip64_6, please make sure to upgrade to the latest amd driver: %w", err)
+		}
 	}
 	hl := &HipLib{}
 	hl.dll = h

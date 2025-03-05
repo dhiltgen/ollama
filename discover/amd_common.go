@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -80,4 +81,24 @@ func commonAMDValidateLibDir() (string, error) {
 	}
 
 	return "", errors.New("no suitable rocm found, falling back to CPU")
+}
+
+func vulkanGetVisibleDevicesEnv(gpuInfo []GpuInfo) (string, string) {
+	ids := []string{}
+	for _, info := range gpuInfo {
+		if info.Library != "vulkan" {
+			// TODO shouldn't happen if things are wired correctly...
+			slog.Debug("vulkanGetVisibleDevicesEnv skipping over non-rocm device", "library", info.Library)
+			continue
+		}
+		for _, r := range rocmGPUs {
+			if info.ID == r.ID {
+				ids = append(ids, strconv.Itoa(r.index))
+				break
+			}
+		}
+	}
+	// Note: this requires the IDs to be vulkan IDs, which can include GPUs from multiple vendors
+	// Alternatively, ggml_vk_instance_init can be patched to only look at AMD GPUs and assume the indexes are just for those
+	return "GGML_VK_VISIBLE_DEVICES", strings.Join(ids, ",")
 }

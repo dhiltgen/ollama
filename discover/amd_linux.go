@@ -287,7 +287,7 @@ func AMDGetGPUInfo() ([]RocmGPUInfo, error) {
 				DriverMinor:   driverMinor,
 			},
 			usedFilepath: usedFile,
-			index:        gpuID,
+			index:        gpuID, // TODO - need to verify if this is always accurate for vulkan IDs
 		}
 
 		// iGPU detection, remove this check once we can support an iGPU variant of the rocm library
