@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unicode"
 	"unsafe"
@@ -47,6 +48,12 @@ type Backend struct {
 
 	// input is the backend used for inputs
 	input *C.struct_ggml_backend_buffer_type
+
+	// Pre-allocated buffer for dynamic input tensors created via newTensor
+	bufMu   sync.Mutex
+	buf     C.ggml_backend_buffer_t
+	bufSize uint64
+	bufBase uintptr // Location of next allocation
 
 	// layers is the backend used for repeating layers
 	layers map[int]*C.struct_ggml_backend_buffer_type
@@ -111,6 +118,13 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 			d:   d,
 			bts: append([]*C.struct_ggml_backend_buffer_type{bt}, cpuDeviceBufferType.bts...),
 		})
+		buft := C.ggml_backend_dev_host_buffer_type(d)
+		if buft != nil {
+			slog.Info("XXX Adding GPU Host buffer type")
+			// TODO the semantics of the array are unclear...  investigate how this is supposed to work
+			// cpuDeviceBufferType.bts = append(cpuDeviceBufferType.bts, buft)
+			cpuDeviceBufferType.bts = []*C.struct_ggml_backend_buffer_type{buft}
+		}
 	}
 
 	useDefaultSplit := true
@@ -238,14 +252,18 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 	for _, t := range meta.Tensors().Items() {
 		switch {
 		case contains(t.Name, "position_embd", "token_embd", "token_norm_embd", "token_types"):
+			slog.Info("Creating tensor on input", "name", t.Name, "size", format.HumanBytes2(t.Size()))
 			createTensor(tensor{source: t}, input.bts)
 			if _, ok := meta.Tensors().GroupLayers()["output"]; !ok && t.Name == "token_embd.weight" {
+				slog.Info("Creating tensor on output", "name", "output.weight", "size", format.HumanBytes2(t.Size()))
 				createTensor(tensor{source: t, target: "output.weight"}, output.bts)
 			}
 		case contains(t.Name, "cls", "output", "output_norm"):
+			slog.Info("Creating tensor on output", "name", t.Name, "size", format.HumanBytes2(t.Size()))
 			createTensor(tensor{source: t}, output.bts)
 		case strings.HasPrefix(t.Name, "v.") || strings.HasPrefix(t.Name, "mm."):
 			// TODO: assign vision tensors to the gpu if possible
+			slog.Info("Creating tensor on output", "name", t.Name, "size", format.HumanBytes2(t.Size()))
 			createTensor(tensor{source: t}, output.bts)
 		case contains(t.Name, "rope_freqs", "rope_factors_long", "rope_factors_short"):
 			// these tensors should be repeated per layer
@@ -267,6 +285,7 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 				createTensor(tensor{source: t}, layers[layerIndex].bts)
 			} else {
 				// load all other tensors on the cpu
+				slog.Info("Creating tensor on input", "name", t.Name, "size", format.HumanBytes2(t.Size()))
 				createTensor(tensor{source: t}, input.bts)
 			}
 		}
@@ -385,6 +404,12 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 		}
 	}
 
+	// Allocate input buffer for dynamic tensors
+	bufSize := meta.KV().ContextLength() * uint64(params.BatchSize+3) * (uint64)(C.ggml_type_size(C.GGML_TYPE_F32)) // Inputs, outputs, positions, kvcache
+	slog.Info("Allocating input buffer", "size", format.HumanBytes2(bufSize))
+	buf := C.ggml_backend_buft_alloc_buffer(input.bts[len(input.bts)-1], (C.size_t)(bufSize))
+	bufBase := C.ggml_backend_buffer_get_base(buf)
+
 	maxGraphNodes := max(8192, len(meta.Tensors().Items())*5)
 	return &Backend{
 		flashAttention: params.FlashAttention,
@@ -406,6 +431,9 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 			return m
 		}(),
 		maxGraphNodes: maxGraphNodes,
+		bufSize:       bufSize,
+		buf:           buf,
+		bufBase:       uintptr(bufBase),
 	}, nil
 }
 
@@ -575,8 +603,18 @@ func (c Context) newTensor(dtype ml.DType, shape []int) ml.Tensor {
 
 	t := C.ggml_new_tensor(c.ctx, cdtype, C.int(len(shape)), shapeToGGML(shape))
 	size := pad(C.ggml_backend_buft_get_alloc_size(c.buft, t), C.ggml_backend_buft_get_alignment(c.buft))
-	b := C.ggml_backend_buft_alloc_buffer(c.buft, size)
-	C.ggml_backend_tensor_alloc(b, t, C.ggml_backend_buffer_get_base(b))
+	if c.buft == c.b.input {
+		c.b.bufMu.Lock()
+		defer c.b.bufMu.Unlock()
+		if c.b.bufBase+uintptr(size)-uintptr(C.ggml_backend_buffer_get_base(c.b.buf)) > uintptr(c.b.bufSize) {
+			panic("input buffer out of capacity")
+		}
+		C.ggml_backend_tensor_alloc(c.b.buf, t, unsafe.Pointer(c.b.bufBase))
+		c.b.bufBase += uintptr(size)
+	} else {
+		b := C.ggml_backend_buft_alloc_buffer(c.buft, size)
+		C.ggml_backend_tensor_alloc(b, t, C.ggml_backend_buffer_get_base(b))
+	}
 	return &Tensor{b: c.b, t: t}
 }
 
@@ -637,6 +675,12 @@ func (c Context) FromIntSlice(s []int32, shape ...int) (ml.Tensor, error) {
 func (c *Context) Close() {
 	if c != nil {
 		C.ggml_free(c.ctx)
+
+		// TODO is this safe or do we need tighter tracking on allocated tensors in the input buffer?
+		// TODO only on input context?
+		c.b.bufMu.Lock()
+		defer c.b.bufMu.Unlock()
+		c.b.bufBase = uintptr(C.ggml_backend_buffer_get_base(c.b.buf)) // reset to the base
 	}
 }
 

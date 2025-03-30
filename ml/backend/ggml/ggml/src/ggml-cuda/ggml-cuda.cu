@@ -1064,6 +1064,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
     }
 
     void * ptr = nullptr;
+    fprintf(stderr, "XXX Allocating cudaMallocHost %.2f MiB\n", size /  1024.0 / 1024.0);
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (err != cudaSuccess) {
         // clear the error

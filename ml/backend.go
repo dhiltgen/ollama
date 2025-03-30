@@ -79,6 +79,9 @@ type BackendParams struct {
 
 	// FlashAttention indicates that we should use a fused flash attention kernel
 	FlashAttention bool
+
+	// BatchSize is the maximum size of a request batch
+	BatchSize int
 }
 
 var backends = make(map[string]func(context.Context, *os.File, BackendParams) (Backend, error))

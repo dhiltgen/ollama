@@ -792,6 +792,7 @@ func Execute(args []string) error {
 		MainGPU:        *mainGPU,
 		TensorSplit:    tensorSplitFloats,
 		FlashAttention: *flashAttention,
+		BatchSize:      *batchSize,
 	}
 
 	server.ready.Add(1)
