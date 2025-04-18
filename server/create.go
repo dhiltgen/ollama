@@ -22,8 +22,7 @@ import (
 	"github.com/ollama/ollama/convert"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
-	"github.com/ollama/ollama/fs/ggml"
-	"github.com/ollama/ollama/llama"
+	fsggml "github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
@@ -128,7 +127,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 			baseLayers = append(baseLayers, adapterLayers...)
 		}
 
-		if err := createModel(r, name, baseLayers, fn); err != nil {
+		if err := createModel(c.Request.Context(), r, name, baseLayers, fn); err != nil {
 			if errors.Is(err, errBadTemplate) {
 				ch <- gin.H{"error": err.Error(), "status": http.StatusBadRequest}
 				return
@@ -214,7 +213,7 @@ func detectModelTypeFromFiles(files map[string]string) string {
 				return ""
 			}
 
-			ct := ggml.DetectContentType(buf)
+			ct := fsggml.DetectContentType(buf)
 			if ct == "gguf" {
 				return "gguf"
 			}
@@ -295,7 +294,7 @@ func convertFromSafetensors(files map[string]string, baseLayers []*layerGGML, is
 	}
 	defer bin.Close()
 
-	f, _, err := ggml.Decode(bin, 0)
+	f, _, err := fsggml.Decode(bin, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -307,16 +306,16 @@ func convertFromSafetensors(files map[string]string, baseLayers []*layerGGML, is
 	return layers, nil
 }
 
-func kvFromLayers(baseLayers []*layerGGML) (ggml.KV, error) {
+func kvFromLayers(baseLayers []*layerGGML) (fsggml.KV, error) {
 	for _, l := range baseLayers {
 		if l.GGML != nil {
 			return l.KV(), nil
 		}
 	}
-	return ggml.KV{}, fmt.Errorf("no base model was found")
+	return fsggml.KV{}, fmt.Errorf("no base model was found")
 }
 
-func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, fn func(resp api.ProgressResponse)) (err error) {
+func createModel(ctx context.Context, r api.CreateRequest, name model.Name, baseLayers []*layerGGML, fn func(resp api.ProgressResponse)) (err error) {
 	config := ConfigV2{
 		OS:           "linux",
 		Architecture: "amd64",
@@ -330,7 +329,7 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 		if layer.GGML != nil {
 			quantType := strings.ToUpper(cmp.Or(r.Quantize, r.Quantization))
 			if quantType != "" && layer.GGML.Name() == "gguf" && layer.MediaType == "application/vnd.ollama.image.model" {
-				want, err := ggml.ParseFileType(quantType)
+				want, err := fsggml.ParseFileType(quantType)
 				if err != nil {
 					return err
 				}
@@ -339,7 +338,7 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 				if !slices.Contains([]string{"F16", "F32"}, ft.String()) {
 					return errors.New("quantization is only supported for F16 and F32 models")
 				} else if ft != want {
-					layer, err = quantizeLayer(layer, quantType, fn)
+					layer, err = quantizeLayer(ctx, layer, quantType, fn)
 					if err != nil {
 						return err
 					}
@@ -423,16 +422,17 @@ func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, 
 	return nil
 }
 
-func quantizeLayer(layer *layerGGML, quantizeType string, fn func(resp api.ProgressResponse)) (*layerGGML, error) {
+func quantizeLayer(ctx context.Context, layer *layerGGML, quantizeType string, fn func(resp api.ProgressResponse)) (*layerGGML, error) {
 	ft := layer.GGML.KV().FileType()
-	fn(api.ProgressResponse{Status: fmt.Sprintf("quantizing %s model to %s", ft, quantizeType)})
-
-	want, err := ggml.ParseFileType(quantizeType)
-	if err != nil {
-		return nil, err
+	fnWrap := func(progress float32) {
+		fn(api.ProgressResponse{Status: fmt.Sprintf("quantizing %s model to %s", ft, quantizeType), Digest: layer.Digest, Total: layer.Size, Completed: int64(progress * float32(layer.Size))})
 	}
 
 	blob, err := GetBlobsPath(layer.Digest)
+	if err != nil {
+		return nil, err
+	}
+	fp, err := os.Open(blob)
 	if err != nil {
 		return nil, err
 	}
@@ -444,25 +444,22 @@ func quantizeLayer(layer *layerGGML, quantizeType string, fn func(resp api.Progr
 	defer temp.Close()
 	defer os.Remove(temp.Name())
 
-	if err := llama.Quantize(blob, temp.Name(), uint32(want)); err != nil {
+	if err := quantizeModel(ctx, fp, quantizeType, temp.Name(), fnWrap); err != nil {
 		return nil, err
 	}
-
+	fn(api.ProgressResponse{Status: "verifying conversion"})
 	newLayer, err := NewLayer(temp, layer.MediaType)
 	if err != nil {
 		return nil, err
 	}
-
 	if _, err := temp.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-
-	f, _, err := ggml.Decode(temp, 0)
+	f, _, err := fsggml.Decode(temp, 0)
 	if err != nil {
 		slog.Error(fmt.Sprintf("error decoding ggml: %s\n", err))
 		return nil, err
 	}
-
 	return &layerGGML{newLayer, f}, nil
 }
 
@@ -499,7 +496,7 @@ func ggufLayers(digest string, fn func(resp api.ProgressResponse)) ([]*layerGGML
 
 	var offset int64
 	for offset < stat.Size() {
-		f, n, err := ggml.Decode(blob, 0)
+		f, n, err := fsggml.Decode(blob, 0)
 		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {

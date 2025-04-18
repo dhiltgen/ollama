@@ -135,7 +135,7 @@ func TestRoutes(t *testing.T) {
 			t.Fatalf("failed to create model: %v", err)
 		}
 
-		if err := createModel(r, modelName, baseLayers, fn); err != nil {
+		if err := createModel(context.Background(), r, modelName, baseLayers, fn); err != nil {
 			t.Fatal(err)
 		}
 	}

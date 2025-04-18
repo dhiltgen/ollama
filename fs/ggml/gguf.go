@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -229,7 +230,7 @@ func (llm *gguf) Decode(rs io.ReadSeeker) error {
 		}
 
 		llm.tensors = append(llm.tensors, &tensor)
-		llm.parameters += tensor.parameters()
+		llm.parameters += tensor.Elements()
 	}
 
 	// patch KV with parameter count
@@ -498,7 +499,22 @@ func writeGGUFArray[S ~[]E, E any](w io.Writer, t uint32, s S) error {
 	if err := binary.Write(w, binary.LittleEndian, uint64(len(s))); err != nil {
 		return err
 	}
-
+	if t == ggufTypeString {
+		for _, s := range s {
+			str, ok := any(s).(string)
+			if !ok {
+				return fmt.Errorf("array of strings contained non-string element")
+			}
+			if err := binary.Write(w, binary.LittleEndian, uint64(len(str))); err != nil {
+				return err
+			}
+			_, err := io.Copy(w, strings.NewReader(str))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return binary.Write(w, binary.LittleEndian, s)
 }
 
@@ -570,8 +586,10 @@ func ggufWriteKV(ws io.WriteSeeker, k string, v any) error {
 
 	var err error
 	switch v := v.(type) {
-	case uint32:
+	case uint32, FileType:
 		err = writeGGUF(ws, ggufTypeUint32, v)
+	case uint64:
+		err = writeGGUF(ws, ggufTypeUint64, v)
 	case float32:
 		err = writeGGUF(ws, ggufTypeFloat32, v)
 	case bool:
@@ -585,26 +603,44 @@ func ggufWriteKV(ws io.WriteSeeker, k string, v any) error {
 	case []float32:
 		err = writeGGUFArray(ws, ggufTypeFloat32, v)
 	case []string:
-		if err := binary.Write(ws, binary.LittleEndian, ggufTypeArray); err != nil {
-			return err
-		}
-
-		if err := binary.Write(ws, binary.LittleEndian, ggufTypeString); err != nil {
-			return err
-		}
-
-		if err := binary.Write(ws, binary.LittleEndian, uint64(len(v))); err != nil {
-			return err
-		}
-
-		for _, e := range v {
-			if err := binary.Write(ws, binary.LittleEndian, uint64(len(e))); err != nil {
-				return err
+		err = writeGGUFArray(ws, ggufTypeString, v)
+	case *array:
+		// []any can't be written by binary.Write as each item could be different sizes
+		// but we know they're always the same type, so we copy
+		anyVals := v.values
+		switch anyVals[0].(type) {
+		case int32:
+			values := make([]int32, len(anyVals))
+			for i := range values {
+				values[i] = anyVals[i].(int32)
 			}
-
-			if err := binary.Write(ws, binary.LittleEndian, []byte(e)); err != nil {
-				return err
+			err = writeGGUFArray(ws, ggufTypeInt32, values)
+		case uint32:
+			values := make([]uint32, len(anyVals))
+			for i := range values {
+				values[i] = anyVals[i].(uint32)
 			}
+			err = writeGGUFArray(ws, ggufTypeUint32, values)
+		case float32:
+			values := make([]float32, len(anyVals))
+			for i := range values {
+				values[i] = anyVals[i].(float32)
+			}
+			err = writeGGUFArray(ws, ggufTypeFloat32, values)
+		case bool:
+			values := make([]bool, len(anyVals))
+			for i := range values {
+				values[i] = anyVals[i].(bool)
+			}
+			err = writeGGUFArray(ws, ggufTypeBool, values)
+		case string:
+			values := make([]string, len(anyVals))
+			for i := range values {
+				values[i] = anyVals[i].(string)
+			}
+			err = writeGGUFArray(ws, ggufTypeString, values)
+		default:
+			return fmt.Errorf("improper type for array '%s'", k)
 		}
 	default:
 		return fmt.Errorf("improper type for '%s'", k)
@@ -628,7 +664,7 @@ func ggufWriteTensorInfo(ws io.WriteSeeker, t Tensor) error {
 	}
 
 	for i := range len(t.Shape) {
-		if err := binary.Write(ws, binary.LittleEndian, t.Shape[len(t.Shape)-i-1]); err != nil {
+		if err := binary.Write(ws, binary.LittleEndian, t.Shape[i]); err != nil {
 			return err
 		}
 	}
@@ -650,10 +686,94 @@ func ggufWriteTensor(ws io.WriteSeeker, t Tensor, alignment int64) error {
 		return err
 	}
 
-	_, err = t.WriteTo(ws)
-	return err
+	if t.WriterTo != nil {
+		_, err = t.WriteTo(ws)
+		return err
+	} else {
+		// io.Copy trips over the nil WriteTo
+		buf := make([]byte, 32*1024)
+		var written int64
+		for {
+			nr, er := t.Read(buf)
+			if nr > 0 {
+				nw, ew := ws.Write(buf[0:nr])
+				if nw < 0 || nr < nw {
+					nw = 0
+					if ew == nil {
+						ew = errors.New("invalid write")
+					}
+				}
+				written += int64(nw)
+				if ew != nil {
+					err = ew
+					break
+				}
+				if nr != nw {
+					err = io.ErrShortWrite
+					break
+				}
+			}
+			if er != nil {
+				if er != io.EOF {
+					err = er
+				}
+				break
+			}
+		}
+		return err
+	}
 }
 
 func ggufPadding(offset, align int64) int64 {
 	return (align - offset%align) % align
 }
+
+// func WriteGGUFStream(ctx context.Context, ws io.WriteSeeker, kv KV, ts []Tensor, fp func(progress float32)) error {
+// 	alignment := kv.Uint("general.alignment", 32)
+// 	if err := binary.Write(ws, binary.LittleEndian, []byte("GGUF")); err != nil {
+// 		return err
+// 	}
+// 	if err := binary.Write(ws, binary.LittleEndian, uint32(3)); err != nil {
+// 		return err
+// 	}
+// 	if err := binary.Write(ws, binary.LittleEndian, uint64(len(ts))); err != nil {
+// 		return err
+// 	}
+// 	if err := binary.Write(ws, binary.LittleEndian, uint64(len(kv))); err != nil {
+// 		return err
+// 	}
+// 	keys := slices.Collect(maps.Keys(kv))
+// 	slices.Sort(keys)
+// 	for _, key := range keys {
+// 		if err := ggufWriteKV(ws, key, kv[key]); err != nil {
+// 			return err
+// 		}
+// 	}
+
+// 	slices.SortStableFunc(ts, func(a, b Tensor) int {
+// 		if i, j := a.block(), b.block(); i < 0 && j > 0 {
+// 			return 1
+// 		} else if i > 0 && j < 0 {
+// 			return -1
+// 		} else {
+// 			return cmp.Compare(i, j)
+// 		}
+// 	})
+
+// 	var s uint64
+// 	for i := range ts {
+// 		ts[i].Offset = s + uint64(ggufPadding(int64(s), int64(alignment)))
+// 		if err := ggufWriteTensorInfo(ws, ts[i]); err != nil {
+// 			return err
+// 		}
+// 		s += ts[i].Size()
+// 	}
+// 	for _, t := range ts {
+// 		if err := ggufWriteTensor(ctx, ws, t, int64(alignment)); err != nil {
+// 			return err
+// 		}
+// 		fp(float32(t.Offset+t.Size()) / float32(s))
+// 	}
+
+// 	return nil
+// }
