@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
-	"slices"
+	"os"
 	"strings"
 
 	"github.com/ollama/ollama/fs/ggml"
@@ -85,6 +84,14 @@ func (ModelParameters) specialTokenTypes() []string {
 	}
 }
 
+func (ModelParameters) writeFile(f *os.File, kv ggml.KV, ts []ggml.Tensor) error {
+	return ggml.WriteGGUF(f, kv, ts)
+}
+
+func (AdapterParameters) writeFile(f *os.File, kv ggml.KV, ts []ggml.Tensor) error {
+	return ggml.WriteGGUF(f, kv, ts)
+}
+
 type ModelConverter interface {
 	// KV maps parameters to LLM key-values
 	KV(*Tokenizer) ggml.KV
@@ -96,6 +103,8 @@ type ModelConverter interface {
 
 	// specialTokenTypes returns any special token types the model uses
 	specialTokenTypes() []string
+	// writeFile writes the model to the provided io.WriteSeeker
+	writeFile(*os.File, ggml.KV, []ggml.Tensor) error
 }
 
 type moreParser interface {
@@ -110,9 +119,11 @@ type AdapterConverter interface {
 	// Replacements returns a list of string pairs to replace in tensor names.
 	// See [strings.Replacer](https://pkg.go.dev/strings#Replacer) for details
 	Replacements() []string
+
+	writeFile(*os.File, ggml.KV, []ggml.Tensor) error
 }
 
-func ConvertAdapter(fsys fs.FS, ws io.WriteSeeker, baseKV ggml.KV) error {
+func ConvertAdapter(fsys fs.FS, f *os.File, baseKV ggml.KV) error {
 	bts, err := fs.ReadFile(fsys, "adapter_config.json")
 	if err != nil {
 		return err
@@ -147,14 +158,14 @@ func ConvertAdapter(fsys fs.FS, ws io.WriteSeeker, baseKV ggml.KV) error {
 		return err
 	}
 
-	return writeFile(ws, conv.KV(baseKV), conv.Tensors(ts))
+	return conv.writeFile(f, conv.KV(baseKV), conv.Tensors(ts))
 }
 
 // Convert writes an Ollama compatible model to the provided io.WriteSeeker based on configurations
 // and files it finds in the input path.
 // Supported input model formats include safetensors.
 // Supported input tokenizers files include tokenizer.json (preferred) and tokenizer.model.
-func ConvertModel(fsys fs.FS, ws io.WriteSeeker) error {
+func ConvertModel(fsys fs.FS, f *os.File) error {
 	bts, err := fs.ReadFile(fsys, "config.json")
 	if err != nil {
 		return err
@@ -239,13 +250,5 @@ func ConvertModel(fsys fs.FS, ws io.WriteSeeker) error {
 		return err
 	}
 
-	return writeFile(ws, conv.KV(t), conv.Tensors(ts))
-}
-
-func writeFile(ws io.WriteSeeker, kv ggml.KV, ts []ggml.Tensor) error {
-	for i := range ts {
-		ts[i].Shape = slices.Clone(ts[i].Shape)
-		slices.Reverse(ts[i].Shape)
-	}
-	return ggml.WriteGGUF(ws, kv, ts)
+	return conv.writeFile(f, conv.KV(t), conv.Tensors(ts))
 }
