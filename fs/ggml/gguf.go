@@ -548,11 +548,14 @@ func WriteGGUF(f *os.File, kv KV, ts []Tensor) error {
 
 	var s uint64
 	for i := range ts {
-		ts[i].Offset = s + uint64(ggufPadding(int64(s), int64(alignment)))
+		ts[i].Offset = s
 		if err := ggufWriteTensorInfo(f, ts[i]); err != nil {
 			return err
 		}
+		slog.Info("XXX gguf metadata", "tensor", ts[i].Name, "offset", ts[i].Offset)
+
 		s += ts[i].Size()
+		s += uint64(ggufPadding(int64(s), int64(alignment)))
 	}
 
 	offset, err := f.Seek(0, io.SeekCurrent)
@@ -568,6 +571,7 @@ func WriteGGUF(f *os.File, kv KV, ts []Tensor) error {
 	for _, t := range ts {
 		t := t
 		w := io.NewOffsetWriter(f, offset+int64(t.Offset))
+		slog.Info("XXX gguf payload", "tensor", t.Name, "offset", offset+int64(t.Offset))
 		g.Go(func() error {
 			_, err = t.WriteTo(w)
 			return err

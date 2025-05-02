@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -64,6 +65,7 @@ func (q quantizer) WriteTo(w io.Writer) (int64, error) {
 		slog.Warn("file read error", "tensor", q.Name, "file", q.Name(), "error", err)
 		return 0, fmt.Errorf("unable to read tensor %s from %s: %s", q.from.Name, q.Name(), err)
 	}
+	fmt.Fprintf(os.Stderr, "%s first few bytes of input tensor: offset=%d %s\n", q.from.Name, q.offset, hex.EncodeToString(data[:16]))
 	if quantize {
 		var f32s []float32
 		newType := fsggml.TensorType(q.to.Kind)
@@ -75,7 +77,8 @@ func (q quantizer) WriteTo(w io.Writer) (int64, error) {
 		data = ggml.Quantize(newType, f32s, q.from.Shape)
 	}
 
-	slog.Debug("quantized tensor", "name", q.Name, "type", fsggml.TensorType(q.to.Kind).String(), "shape", q.to.Shape, "old_size", format.HumanBytes2(q.from.Size()), "newSize", format.HumanBytes2(q.to.Size()))
+	slog.Info("XXX quantized tensor", "name", q.from.Name, "type", fsggml.TensorType(q.to.Kind).String(), "shape", q.to.Shape, "old_size", format.HumanBytes2(q.from.Size()), "newSize", format.HumanBytes2(q.to.Size()))
+	fmt.Fprintf(os.Stderr, "%s first few bytes of quantized tensor: %s\n", q.from.Name, hex.EncodeToString(data[:16]))
 	n, err := w.Write(data)
 	q.progressFn(q.from.Size())
 	return int64(n), err
@@ -216,10 +219,39 @@ func getTensorNewType(kv fsggml.KV, qs *quantizeState, newType fsggml.TensorType
 }
 
 func quantize(in, out *os.File, orig *fsggml.GGML, newFileType fsggml.FileType, progressFn func(n uint64)) error {
+	keys := make([]string, 0, len(orig.KV()))
+	for k := range orig.KV() {
+		keys = append(keys, k)
+	}
+	slog.Info("KV Input", "keys", keys)
+	slog.Info("Orig Offset for Header", "offset", orig.Tensors().Offset)
+
 	kv := maps.Clone(orig.KV())
+	keys = make([]string, 0, len(kv))
+	for k := range kv {
+		keys = append(keys, k)
+	}
+	slog.Info("KV Clone", "keys", keys)
 	kv["general.file_type"] = newFileType
-	kv["general.quantization_version"] = ggml.QuantizationVersion()
+	// kv["general.quantization_version"] = ggml.QuantizationVersion()
 	qs := &quantizeState{}
+	// Build up the quantize state so newType can adjust types
+	layerCount := 0
+	for k, l := range orig.Tensors().GroupLayers() {
+		if strings.HasPrefix(k, "blk.") {
+			layerCount++
+		}
+		for _, tensor := range l {
+			if strings.Contains(tensor.Name, "attn_v.weight") ||
+				strings.Contains(tensor.Name, "attn_qkv.weight") ||
+				strings.Contains(tensor.Name, "attn_kv_b.weight") {
+				qs.nAttnV++
+			} else if tensor.Name == "output.weight" {
+				qs.hasOutput = true
+			}
+		}
+	}
+	qs.nFfnDown = layerCount
 
 	origTensors := orig.Tensors().Items()
 	tensors := make([]fsggml.Tensor, len(origTensors))
@@ -229,7 +261,7 @@ func quantize(in, out *os.File, orig *fsggml.GGML, newFileType fsggml.FileType, 
 		tensors[i] = fsggml.Tensor{Name: t.Name, Kind: uint32(newTensorType), Shape: t.Shape}
 		tensors[i].WriterTo = quantizer{
 			File:       in,
-			offset:     orig.Tensors().Offset,
+			offset:     orig.Tensors().Offset + t.Offset,
 			from:       t,
 			to:         &tensors[i],
 			progressFn: progressFn,
