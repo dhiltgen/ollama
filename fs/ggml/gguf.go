@@ -571,7 +571,7 @@ func WriteGGUF(f *os.File, kv KV, ts []Tensor) error {
 	for _, t := range ts {
 		t := t
 		w := io.NewOffsetWriter(f, offset+int64(t.Offset))
-		slog.Info("XXX gguf payload", "tensor", t.Name, "offset", offset+int64(t.Offset))
+		slog.Info("OFFSETS: "+fmt.Sprintf("tensor payload %s with internal offset %d", t.Name, t.Offset), "offset", offset+int64(t.Offset))
 		g.Go(func() error {
 			_, err = t.WriteTo(w)
 			return err
@@ -627,6 +627,7 @@ func ggufWriteKV(ws io.WriteSeeker, k string, v any) error {
 }
 
 func ggufWriteTensorInfo(ws io.WriteSeeker, t Tensor) error {
+	dumpInfo(ws, fmt.Sprintf("tensor metadata %s with internal offset %d", t.Name, t.Offset))
 	slog.Debug(t.Name, "kind", t.Kind, "shape", t.Shape, "offset", t.Offset)
 	if err := binary.Write(ws, binary.LittleEndian, uint64(len(t.Name))); err != nil {
 		return err
@@ -655,4 +656,13 @@ func ggufWriteTensorInfo(ws io.WriteSeeker, t Tensor) error {
 
 func ggufPadding(offset, align int64) int64 {
 	return (align - offset%align) % align
+}
+
+func dumpInfo(ws io.WriteSeeker, msg string) {
+	offset, err := ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		slog.Error("failed to find current offset", "error", err)
+		return
+	}
+	slog.Info("OFFSETS: "+msg, "offset", offset)
 }
