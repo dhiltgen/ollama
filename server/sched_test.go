@@ -512,6 +512,7 @@ func TestUnloadReloadRace(t *testing.T) {
 	a := newScenarioRequest(t, ctx1, "ollama-model-1a", 10, nil)
 	a.req.opts.NumCtx = 4096
 	first := true
+	getGPUCount := 0
 	a.srv.waitResp = func() error {
 		slog.Debug("test waiting for server")
 		if first {
@@ -521,7 +522,16 @@ func TestUnloadReloadRace(t *testing.T) {
 			return fmt.Errorf("context canceled")
 		}
 		slog.Debug("test not first time, returning after a while")
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}
+
+	// TODO - this may not be needed/helpful
+	a.srv.closeResp = func() error {
+		// Add some delay to trigger the race
+		slog.Debug("test shutting down server")
 		time.Sleep(10 * time.Millisecond)
+		slog.Debug("test finished shutting down server")
 		return nil
 	}
 	b := newScenarioRequest(t, ctx, "ollama-model-1a", 10, nil)
@@ -532,8 +542,15 @@ func TestUnloadReloadRace(t *testing.T) {
 
 	s := InitScheduler(ctx)
 	s.getGpuFn = func() discover.GpuInfoList {
-		slog.Info("pausing getGpuFn")
-		time.Sleep(20 * time.Millisecond)
+		getGPUCount++
+		slog.Debug("test getGpuFn called", "count", getGPUCount)
+		switch getGPUCount {
+		case 1:
+			// No pause on first call by the scheduler
+		case 3:
+			slog.Info("pausing getGpuFn")
+			time.Sleep(10 * time.Millisecond)
+		}
 		g := discover.GpuInfo{Library: "metal"}
 		g.TotalMemory = 24 * format.GigaByte
 		g.FreeMemory = 12 * format.GigaByte
@@ -838,7 +855,7 @@ type mockLlm struct {
 	tokenizeRespErr    error
 	detokenizeResp     string
 	detonekizeRespErr  error
-	closeResp          error
+	closeResp          func() error
 	closeCalled        bool
 	estimatedVRAM      uint64
 	estimatedTotal     uint64
@@ -870,7 +887,10 @@ func (s *mockLlm) Detokenize(ctx context.Context, tokens []int) (string, error) 
 
 func (s *mockLlm) Close() error {
 	s.closeCalled = true
-	return s.closeResp
+	if s.closeResp != nil {
+		return s.closeResp()
+	}
+	return nil
 }
 func (s *mockLlm) EstimatedVRAM() uint64                  { return s.estimatedVRAM }
 func (s *mockLlm) EstimatedTotal() uint64                 { return s.estimatedTotal }
