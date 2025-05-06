@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -78,7 +79,7 @@ func TestLoad(t *testing.T) {
 	}
 
 	req.model.ModelPath = "dummy_model_path"
-	server.waitResp = errors.New("wait failure")
+	server.waitResp = func() error { return errors.New("wait failure") }
 	s.load(req, f, gpus, 0)
 	select {
 	case err := <-req.errCh:
@@ -501,6 +502,83 @@ func TestPrematureExpired(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 }
 
+func TestUnloadReloadRace(t *testing.T) {
+	ctx, done := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer done()
+
+	ctx1, cancel1 := context.WithCancel(ctx)
+
+	// Same model, different context sizes requiring a reload
+	a := newScenarioRequest(t, ctx1, "ollama-model-1a", 10, nil)
+	a.req.opts.NumCtx = 4096
+	first := true
+	a.srv.waitResp = func() error {
+		slog.Debug("test waiting for server")
+		if first {
+			first = false
+			<-ctx1.Done()
+			slog.Debug("test context finished, done waiting for server")
+			return fmt.Errorf("context canceled")
+		}
+		slog.Debug("test not first time, returning after a while")
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}
+	b := newScenarioRequest(t, ctx, "ollama-model-1a", 10, nil)
+	tmpModel := *a.req.model
+	b.req.model = &tmpModel
+	b.f = a.f
+	b.req.opts.NumCtx = 8192
+
+	s := InitScheduler(ctx)
+	s.getGpuFn = func() discover.GpuInfoList {
+		slog.Info("pausing getGpuFn")
+		time.Sleep(20 * time.Millisecond)
+		g := discover.GpuInfo{Library: "metal"}
+		g.TotalMemory = 24 * format.GigaByte
+		g.FreeMemory = 12 * format.GigaByte
+		slog.Debug("returning getGpuFn")
+		return []discover.GpuInfo{g}
+	}
+	s.newServerFn = a.newServer
+	s.Run(ctx)
+	successCh1a, errCh1a := s.GetRunner(a.ctx, a.req.model, a.req.opts, a.req.sessionDuration)
+	time.Sleep(10 * time.Millisecond)
+	slog.Debug("canceling context on first request")
+	successCh2a, errCh2a := s.GetRunner(b.ctx, b.req.model, b.req.opts, b.req.sessionDuration)
+	cancel1() // Cancel first request before it finishes loading
+	time.Sleep(10 * time.Millisecond)
+
+	select {
+	case err := <-errCh1a:
+		slog.Debug("Frist request got error as expected", "error", err)
+	case resp := <-successCh1a:
+		slog.Debug("First request got success on first request after canceling", "resp", resp)
+		t.Fatalf("unexpected success on initial request after canceling: %v", resp)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+
+	// Now make sure reload works
+	slog.Debug("test waiting for second request to trigger reload")
+	select {
+	case resp := <-successCh2a:
+		slog.Debug("Second request got success as expected", "resp", resp)
+
+	case err := <-errCh2a:
+		t.Fatalf("second request unexpected error on second request after canceling: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+
+	// Make sure the model is in fact loaded
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	if len(s.loaded) != 1 {
+		t.Fatalf("expected 1 model to be loaded: %v", s.loaded)
+	}
+}
+
 func TestUseLoadedRunner(t *testing.T) {
 	ctx, done := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	req := &LlmRequest{
@@ -752,7 +830,7 @@ func TestHomogeneousGPUs(t *testing.T) {
 
 type mockLlm struct {
 	pingResp           error
-	waitResp           error
+	waitResp           func() error
 	completionResp     error
 	embeddingResp      []float32
 	embeddingRespErr   error
@@ -767,8 +845,13 @@ type mockLlm struct {
 	estimatedVRAMByGPU map[string]uint64
 }
 
-func (s *mockLlm) Ping(ctx context.Context) error             { return s.pingResp }
-func (s *mockLlm) WaitUntilRunning(ctx context.Context) error { return s.waitResp }
+func (s *mockLlm) Ping(ctx context.Context) error { return s.pingResp }
+func (s *mockLlm) WaitUntilRunning(ctx context.Context) error {
+	if s.waitResp != nil {
+		return s.waitResp()
+	}
+	return nil
+}
 func (s *mockLlm) Completion(ctx context.Context, req llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
 	return s.completionResp
 }
