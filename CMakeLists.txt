@@ -92,6 +92,11 @@ set(WINDOWS_AMDGPU_TARGETS_EXCLUDE_REGEX "^gfx(906|908|90a|1200|1201):xnack[+-]$
     "Regular expression describing AMDGPU_TARGETS not supported on Windows. Override to force building these targets. Default \"^gfx(906|908|90a|1200|1201):xnack[+-]$\"."
 )
 
+if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+    message(STATUS "Setting up ADLX")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/discover/ADLX)
+endif()
+
 check_language(HIP)
 if(CMAKE_HIP_COMPILER)
     set(HIP_PLATFORM "amd")
