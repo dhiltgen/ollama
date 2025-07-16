@@ -250,3 +250,44 @@ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, fl
     }
     return sum = (ggml_float)logf(sum);
 }
+
+#define MXFP4 32
+typedef struct {
+    uint8_t d;              // scale E8M0 float 
+    uint8_t qs[MXFP4 / 2];  // (32) 4 bit elements E2M1 float
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + MXFP4/2, "wrong mxfp4 block size/padding");
+#define MXFP4_VALS {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0}
+
+void ggml_vec_dot_mxfp4(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(bs);
+
+    const int nb = n / MXFP4;
+    assert(n % MXFP4 == 0);
+
+    int yi = 0;
+
+    const block_mxfp4 * GGML_RESTRICT xx = (const block_mxfp4 *) vx;
+
+    ggml_float sumf = 0.0;
+    ggml_float mxfp4_table[] = MXFP4_VALS;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const block_mxfp4 * GGML_RESTRICT x = &xx[ib + 0];
+        union {
+            uint32_t as_bits;
+            float as_value;
+        } scale;
+        scale.as_bits = (((uint32_t)x->d) << 23);
+        for (int i = 0; i < MXFP4/2; ++i) {
+            sumf += mxfp4_table[(x->qs[i] & 0xf)] * (ggml_float)(scale.as_value) * (ggml_float)(y[ib*MXFP4 + i*2]);
+            sumf += mxfp4_table[(x->qs[i] & 0xf0) >> 4] * (ggml_float)(scale.as_value) * (ggml_float)(y[ib*MXFP4 + i*2+1]);
+        }
+    }
+
+    *s = sumf;
+}
