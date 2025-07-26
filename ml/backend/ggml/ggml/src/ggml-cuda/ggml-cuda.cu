@@ -21,6 +21,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmv.cuh"
+#include "ggml-cuda/mmvmxfp4.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1928,6 +1929,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src0->type != GGML_TYPE_MXFP4;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    bool use_mul_mat_vec_mxfp4 = src0->type == GGML_TYPE_MXFP4
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src0->ne[0] % 2 == 0 && src1->ne[1] == 1;
 
     bool any_gpus_with_slow_fp16   = false;
     bool any_gpus_without_fp16_mma = false;
@@ -1979,6 +1983,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
+    } else if (use_mul_mat_vec_mxfp4) {
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_mxfp4, nullptr);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
@@ -2006,40 +2012,45 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
             return;
         }
+        if (src0->type == GGML_TYPE_MXFP4) {
+            GGML_LOG_DEBUG("%s calling ggml_cuda_mul_mat_vec_mxfp4\n", __func__);
+            ggml_cuda_mul_mat_vec_mxfp4(ctx, src0, src1, ids, dst);
+            return;
+        }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
-        if (ne2 == 1 && src0->type == GGML_TYPE_MXFP4) {
-            // Derived from ggml_cuda_op_mul_mat -> ggml_cuda_op_mul_mat_cublas
-            // GGML_LOG_DEBUG("%s XXX converting MXFP4 -> FP32\n", __func__);
-            GGML_ASSERT(ggml_is_contiguous(src0) && "MXFP4 tensor must be contiguous");
-            GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "MXFP4 tensor must not be split");
-            ggml_backend_cuda_buffer_context * src0_ctx = (ggml_backend_cuda_buffer_context *) src0->buffer->context;
-            int id = src0_ctx->device;
-            cudaStream_t stream = ctx.stream(id, 0);
-            ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
-            src0_ddq_as_f32.alloc(ggml_nelements(src0));
-            char * src0_dd = (char *) src0->data;
-            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
-            GGML_ASSERT(to_fp32_cuda != nullptr);
-            // GGML_LOG_DEBUG("%s XXX calling convert\n", __func__);
-            to_fp32_cuda(src0_dd, src0_ddq_as_f32.get(), ggml_nelements(src0), stream);
-            // TODO is there a better way to do this?
-            // GGML_LOG_DEBUG("%s XXX setting up tmp tensor\n", __func__);
-            ggml_tensor src0fp32;
-            memcpy(&src0fp32, src0, sizeof(src0fp32));
-            src0fp32.type = GGML_TYPE_F32;
-            src0fp32.nb[0] = ggml_type_size(GGML_TYPE_F32);
-            src0fp32.nb[1] =  src0fp32.nb[0]   * (src0fp32.ne[0] / ggml_blck_size(GGML_TYPE_F32)) /* + padding*/;
-            src0fp32.nb[2] = src0fp32.nb[1] * src0fp32.ne[1];
-            src0fp32.nb[3] = src0fp32.nb[2] * src0fp32.ne[2];
-            src0fp32.data = src0_ddq_as_f32.get();
-            // GGML_LOG_DEBUG("%s XXX calling ggml_cuda_mul_mat_vec\n", __func__);
-            ggml_cuda_mul_mat_vec(ctx, &src0fp32, src1, ids, dst);
-            return;
-        }
+        // if (ne2 == 1 && src0->type == GGML_TYPE_MXFP4) {
+        //     // Derived from ggml_cuda_op_mul_mat -> ggml_cuda_op_mul_mat_cublas
+        //     // GGML_LOG_DEBUG("%s XXX converting MXFP4 -> FP32\n", __func__);
+        //     GGML_ASSERT(ggml_is_contiguous(src0) && "MXFP4 tensor must be contiguous");
+        //     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "MXFP4 tensor must not be split");
+        //     ggml_backend_cuda_buffer_context * src0_ctx = (ggml_backend_cuda_buffer_context *) src0->buffer->context;
+        //     int id = src0_ctx->device;
+        //     cudaStream_t stream = ctx.stream(id, 0);
+        //     ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
+        //     src0_ddq_as_f32.alloc(ggml_nelements(src0));
+        //     char * src0_dd = (char *) src0->data;
+        //     const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
+        //     GGML_ASSERT(to_fp32_cuda != nullptr);
+        //     // GGML_LOG_DEBUG("%s XXX calling convert\n", __func__);
+        //     to_fp32_cuda(src0_dd, src0_ddq_as_f32.get(), ggml_nelements(src0), stream);
+        //     // TODO is there a better way to do this?
+        //     // GGML_LOG_DEBUG("%s XXX setting up tmp tensor\n", __func__);
+        //     ggml_tensor src0fp32;
+        //     memcpy(&src0fp32, src0, sizeof(src0fp32));
+        //     src0fp32.type = GGML_TYPE_F32;
+        //     src0fp32.nb[0] = ggml_type_size(GGML_TYPE_F32);
+        //     src0fp32.nb[1] =  src0fp32.nb[0]   * (src0fp32.ne[0] / ggml_blck_size(GGML_TYPE_F32)) /* + padding*/;
+        //     src0fp32.nb[2] = src0fp32.nb[1] * src0fp32.ne[1];
+        //     src0fp32.nb[3] = src0fp32.nb[2] * src0fp32.ne[2];
+        //     src0fp32.data = src0_ddq_as_f32.get();
+        //     // GGML_LOG_DEBUG("%s XXX calling ggml_cuda_mul_mat_vec\n", __func__);
+        //     ggml_cuda_mul_mat_vec(ctx, &src0fp32, src1, ids, dst);
+        //     return;
+        // }
     }
 
     cudaStream_t stream = ctx.stream();
