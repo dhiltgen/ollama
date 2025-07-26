@@ -18,10 +18,30 @@ static __global__ void mul_mat_vec(
     const int     tid         = threadIdx.x;
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
+    // TODO something in this math has to be adjusted for block size so x jumps by blocks
+    // but y jumps by 32*<thing> to keep things aligned
+    //
+    // Clone this file, then start hacking at it to reduce down to just mxfp4 src0 type
+    // but try to retain src1 and dst type templates along with the performance logic
+    //
+    // stride_row winds up being src0->ne[0] // Seems like the most likely place to adjust
+    // stride_channel = src0->nb[2] / ggml_type_size(src0->type)
+    // stride_sample_x = src0->nb[3] / ts_src0
+    // Straw-man
+    //  - each of the stride values become block based (32 items)
+    //  - each of the multiples in front of the block are *32
+    if (tid == 0) {
+        printf("%s [%u:%u:%u] [%d] x+=%lld y+=%lld sample_x:%lld stride_sample_x:%lld channel_x:%lld stride_channel_x:%lld row:%lld stride_row:%lld warp_size:%d block_size:%d ncols2:%lld\n", __func__,
+            blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+            sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row,
+            sample_y  *stride_sample_y   + channel_y  *stride_channel_y,
+            sample_x  ,stride_sample_x  , channel_x  ,stride_channel_x   , row, stride_row,
+            warp_size, block_size, ncols2);
+    }
     x   += sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
     y   += sample_y  *stride_sample_y   + channel_y  *stride_channel_y;
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
-
+    
     const float2 * y2 = (const float2 *) y;
 
     extern __shared__ char data_mmv[];
@@ -44,6 +64,15 @@ static __global__ void mul_mat_vec(
             const float2 tmpy = y2[col2];
             sumf += tmpx.x*tmpy.x;
             sumf += tmpx.y*tmpy.y;
+            // Spot check debug
+            // if (tid == 0 || tid == 31) {
+            //
+            // Why does row=0 channel_dst=2 have src1 dup'd as src0
+            // if (blockIdx.y == 2 && blockIdx.x == 0) {
+            // if (tid == 0 || tid == 31) {
+                printf("%s [%u:%u:%u] [%d] x0:%f x1:%f y0:%f y1:%f\n", __func__, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, tmpx.x, tmpx.y, tmpy.x, tmpy.y);
+            // }
+
         }
     } else if constexpr (std::is_same<T, half>::value) {
         const half2 * x2 = (const half2 *) x;
@@ -136,6 +165,12 @@ static void launch_mul_mat_vec_cuda(
     const int smem = warp_size*sizeof(float);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_dst);
     const dim3 block_dims(block_size_best, 1, 1);
+    printf("%s launching [%u:%u:%u] [%d] ncols2:%lld nchannels_y:%lld stride_row:%lld channel_ratio:%lld stride_channel_x:%lld stride_channel_y:%lld stride_channel_dst:%lld sample_ratio:%lld stride_sample_x:%lld stride_sample_y:%lld stride_sample_dst:%lld\n", __func__,
+        block_nums.x, block_nums.y, block_nums.z, block_dims.x,
+        ncols/2, nchannels_y, stride_row, channel_ratio, stride_channel_x, stride_channel_y,
+        stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst
+    );
+
     switch (block_size_best) {
         case   32: {
             mul_mat_vec<T, type_acc,  32><<<block_nums, block_dims, smem, stream>>>
@@ -210,17 +245,21 @@ void ggml_cuda_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
-    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src0 = ggml_type_size(src0->type); // TODO adjust for block sizing logic
     const size_t ts_src1 = ggml_type_size(src1->type);
     const size_t ts_dst  = ggml_type_size(dst->type);
+
+    // printf("%s XXX called ts_src0:%lld nb00:%lld s01:%lld s02:%lld s03:%lld\n", __func__, ts_src0, nb00, src0->nb[1] / ts_src0, src0->nb[2] / ts_src0, src0->nb[3] / ts_src0);
 
     GGML_ASSERT(!ids || ne12 == 1); // Implementation is only correct for  batch size 1.
     GGML_ASSERT(ne13 == ne3);
 
-    GGML_ASSERT(        nb00       == ts_src0);
+    GGML_ASSERT(        nb00       == ts_src0); // TODO adjust for block sizing logic
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
+
+    printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
@@ -229,13 +268,13 @@ void ggml_cuda_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s01 = src0->nb[1] / ts_src0; // TODO adjust for block sizing logic -- this drives stride_rows
     const int64_t s11 = src1->nb[1] / ts_src1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s02 = src0->nb[2] / ts_src0; // TODO adjust for block sizing logic
     const int64_t s12 = src1->nb[2] / ts_src1;
     const int64_t s2  =  dst->nb[2] / ts_dst;
-    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s03 = src0->nb[3] / ts_src0; // TODO adjust for block sizing logic
     const int64_t s13 = src1->nb[3] / ts_src1;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
@@ -291,7 +330,7 @@ void ggml_cuda_op_mul_mat_vec(
 
 
     // ggml_cuda_op provides single, contiguous matrices
-    const int64_t stride_row         = ne00;
+    const int64_t stride_row         = ne00; 
     const int64_t nchannels_x        = 1;
     const int64_t nchannels_y        = 1;
     const int64_t nchannels_dst      = 1;
