@@ -30,14 +30,14 @@ static __global__ void mul_mat_vec(
     // Straw-man
     //  - each of the stride values become block based (32 items)
     //  - each of the multiples in front of the block are *32
-    if (tid == 0) {
-        printf("%s [%u:%u:%u] [%d] x+=%lld y+=%lld sample_x:%lld stride_sample_x:%lld channel_x:%lld stride_channel_x:%lld row:%lld stride_row:%lld warp_size:%d block_size:%d ncols2:%lld\n", __func__,
-            blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
-            sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row,
-            sample_y  *stride_sample_y   + channel_y  *stride_channel_y,
-            sample_x  ,stride_sample_x  , channel_x  ,stride_channel_x   , row, stride_row,
-            warp_size, block_size, ncols2);
-    }
+    // if (tid == 0) {
+    //     printf("%s [%u:%u:%u] [%d] x+=%lld y+=%lld sample_x:%lld stride_sample_x:%lld channel_x:%lld stride_channel_x:%lld row:%lld stride_row:%lld warp_size:%d block_size:%d ncols2:%lld\n", __func__,
+    //         blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+    //         sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row,
+    //         sample_y  *stride_sample_y   + channel_y  *stride_channel_y,
+    //         sample_x  ,stride_sample_x  , channel_x  ,stride_channel_x   , row, stride_row,
+    //         warp_size, block_size, ncols2);
+    // }
     x   += sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
     y   += sample_y  *stride_sample_y   + channel_y  *stride_channel_y;
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
@@ -70,7 +70,7 @@ static __global__ void mul_mat_vec(
             // Why does row=0 channel_dst=2 have src1 dup'd as src0
             // if (blockIdx.y == 2 && blockIdx.x == 0) {
             // if (tid == 0 || tid == 31) {
-                printf("%s [%u:%u:%u] [%d] x0:%f x1:%f y0:%f y1:%f\n", __func__, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, tmpx.x, tmpx.y, tmpy.x, tmpy.y);
+                // printf("%s [%u:%u:%u] [%d] x0:%f x1:%f y0:%f y1:%f\n", __func__, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, tmpx.x, tmpx.y, tmpy.x, tmpy.y);
             // }
 
         }
@@ -165,11 +165,11 @@ static void launch_mul_mat_vec_cuda(
     const int smem = warp_size*sizeof(float);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_dst);
     const dim3 block_dims(block_size_best, 1, 1);
-    printf("%s launching [%u:%u:%u] [%d] ncols2:%lld nchannels_y:%lld stride_row:%lld channel_ratio:%lld stride_channel_x:%lld stride_channel_y:%lld stride_channel_dst:%lld sample_ratio:%lld stride_sample_x:%lld stride_sample_y:%lld stride_sample_dst:%lld\n", __func__,
-        block_nums.x, block_nums.y, block_nums.z, block_dims.x,
-        ncols/2, nchannels_y, stride_row, channel_ratio, stride_channel_x, stride_channel_y,
-        stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst
-    );
+    // printf("%s launching [%u:%u:%u] [%d] ncols2:%lld nchannels_y:%lld stride_row:%lld channel_ratio:%lld stride_channel_x:%lld stride_channel_y:%lld stride_channel_dst:%lld sample_ratio:%lld stride_sample_x:%lld stride_sample_y:%lld stride_sample_dst:%lld\n", __func__,
+    //     block_nums.x, block_nums.y, block_nums.z, block_dims.x,
+    //     ncols/2, nchannels_y, stride_row, channel_ratio, stride_channel_x, stride_channel_y,
+    //     stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst
+    // );
 
     switch (block_size_best) {
         case   32: {
@@ -259,7 +259,7 @@ void ggml_cuda_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
 
-    printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
+    // printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
