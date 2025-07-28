@@ -85,29 +85,47 @@ func TestMXFP4Ops(t *testing.T) {
 			r := rand.New(rand.NewSource(0))
 			ctx := b.NewContext().Input()
 			defer ctx.Close()
+			const s0 = 32
+			const s1 = 2
+			const s2 = 2
 
-			data := [64 * 4 * 8]float32{}
+			data := [s0 * s1 * s2]float32{}
 			for i := range data {
 				data[i] = mxfp4_vals[r.Int()%len(mxfp4_vals)]
 			}
 			mxData := Quantize(fsggml.TensorTypeMXFP4, data[:], []uint64{uint64(len(data))})
 			dtype := ml.DTypeMXFP4
-			t1 := ctx.(*Context).FromBytes(dtype, mxData, 64, 4, 8)
-			t1f := ctx.(*Context).FromFloatSlice(data[:], 64, 4, 8)
-
-			// arange equiv
-			d2 := [64 * 1 * 8]float32{}
-			for i := range d2 {
-				d2[i] = float32(i)
+			t1 := ctx.(*Context).FromBytes(dtype, mxData, s0, s1, s2)
+			t1f := ctx.(*Context).FromFloatSlice(data[:], s0, s1, s2)
+			for i := range len(data) / 32 {
+				vals := [32]string{}
+				for j := range vals {
+					vals[j] = fmt.Sprintf("%0.2f", data[i*32+j])
+				}
+				t.Logf("  t1[%s]\n", strings.Join(vals[:], ", "))
 			}
-			t2 := ctx.(*Context).FromFloatSlice(d2[:], 64, 1, 8)
+
+			// random 0-1 float
+			d2 := [s0]float32{}
+			for i := range d2 {
+				d2[i] = float32(r.Float32())
+			}
+			for i := range len(d2) / s0 {
+				vals := [s0]string{}
+				for j := range vals {
+					vals[j] = fmt.Sprintf("%0.2f", d2[i*s0+j])
+				}
+				t.Logf("  t2[%s]\n", strings.Join(vals[:], ", "))
+			}
+
+			t2 := ctx.(*Context).FromFloatSlice(d2[:], s0)
 
 			// arange equiv
-			d3 := [1 * 8]int32{}
+			d3 := [4]int32{}
 			for i := range d3 {
 				d3[i] = int32(i)
 			}
-			t3 := ctx.(*Context).FromIntSlice(d3[:], 1, 8)
+			t3 := ctx.(*Context).FromIntSlice(d3[:], 4)
 
 			// t.Log("calling MulmatID")
 			t4 := t1.MulmatID(ctx, t2, t3)
@@ -124,9 +142,10 @@ func TestMXFP4Ops(t *testing.T) {
 			r := rand.New(rand.NewSource(0))
 			ctx := b.NewContext().Input()
 			defer ctx.Close()
-			const s0 = 32
+			const s0 = 64
 			const s1 = 2
-			const s2 = 4
+			const s2 = 2
+			const idlen = 4
 			data := [s0 * s1 * s2]float32{}
 			inTotal := float32(0)
 			for i := range data {
@@ -162,11 +181,11 @@ func TestMXFP4Ops(t *testing.T) {
 			t2 := ctx.(*Context).FromFloatSlice(d2[:], s0)
 
 			// arange equiv
-			d3 := [4]int32{}
+			d3 := [idlen]int32{}
 			for i := range d3 {
 				d3[i] = int32(i)
 			}
-			t3 := ctx.(*Context).FromIntSlice(d3[:], 4)
+			t3 := ctx.(*Context).FromIntSlice(d3[:], idlen)
 
 			// t.Log("calling Mulmat")
 			// t3 := t1.Mulmat(ctx, t2)
@@ -286,12 +305,14 @@ func TestMXFP4Ops(t *testing.T) {
 			// t.Logf("Mulmat results matched:\n%s", d4)
 		})
 
-		t.Run("exact/2d", func(t *testing.T) {
+		t.Run("exact/2x2", func(t *testing.T) {
 			r := rand.New(rand.NewSource(0))
 			ctx := b.NewContext().Input()
 			defer ctx.Close()
+			const s0 = 32
+			const s1 = 4
 
-			data := [32 * 4]float32{}
+			data := [s0 * s1]float32{}
 			for i := range data {
 				data[i] = mxfp4_vals[r.Int()%len(mxfp4_vals)]
 			}
@@ -311,19 +332,71 @@ func TestMXFP4Ops(t *testing.T) {
 			// 	t.Logf("  %s\n", strings.Join(vals[:], ", "))
 			// }
 			dtype := ml.DTypeMXFP4
-			t1 := ctx.(*Context).FromBytes(dtype, mxData, 32, 4)
-			t1f := ctx.(*Context).FromFloatSlice(data[:], 32, 4)
+			t1 := ctx.(*Context).FromBytes(dtype, mxData, s0, s1)
+			t1f := ctx.(*Context).FromFloatSlice(data[:], s0, s1)
 
-			d2 := [32 * 4]float32{}
+			d2 := [s0 * s1]float32{}
 			for i := range d2 {
-				d2[i] = 2.0
+				d2[i] = float32(r.Float32())
 			}
-			t2 := ctx.(*Context).FromFloatSlice(d2[:], 32, 4)
+			t2 := ctx.(*Context).FromFloatSlice(d2[:], s0, s1)
 
 			t3f := t1f.Mulmat(ctx, t2)
 			t3 := t1.Mulmat(ctx, t2)
 			d3 := ml.Dump(ctx, t3)
 			d3f := ml.Dump(ctx, t3f)
+			if d3 != d3f {
+				t.Fatalf("expected (f32): \n%s\n\n but got (mxfp4): \n%s", d3f, d3)
+			}
+		})
+		t.Run("exact/2x1", func(t *testing.T) {
+			r := rand.New(rand.NewSource(0))
+			ctx := b.NewContext().Input()
+			defer ctx.Close()
+			const s0 = 64
+			const s1 = 4
+
+			data := [s0 * s1]float32{}
+			for i := range data {
+				data[i] = mxfp4_vals[r.Int()%len(mxfp4_vals)]
+			}
+			for i := range len(data) / 32 {
+				vals := [32]string{}
+				for j := range vals {
+					vals[j] = fmt.Sprintf("%0.2f", data[i*32+j])
+				}
+				t.Logf("  t1[%s]\n", strings.Join(vals[:], ", "))
+			}
+			mxData := Quantize(fsggml.TensorTypeMXFP4, data[:], []uint64{uint64(len(data))})
+			// for i := range len(mxData) / 17 {
+			// 	vals := [17]string{}
+			// 	for j := range vals {
+			// 		vals[j] = fmt.Sprintf("%0.2x", mxData[i*17+j])
+			// 	}
+			// 	t.Logf("  %s\n", strings.Join(vals[:], ", "))
+			// }
+			dtype := ml.DTypeMXFP4
+			t1 := ctx.(*Context).FromBytes(dtype, mxData, s0, s1)
+			t1f := ctx.(*Context).FromFloatSlice(data[:], s0, s1)
+
+			d2 := [s0]float32{}
+			for i := range d2 {
+				d2[i] = float32(r.Float32())
+			}
+			for i := range len(d2) / 32 {
+				vals := [32]string{}
+				for j := range vals {
+					vals[j] = fmt.Sprintf("%0.2f", d2[i*32+j])
+				}
+				t.Logf("  t2[%s]\n", strings.Join(vals[:], ", "))
+			}
+
+			t2 := ctx.(*Context).FromFloatSlice(d2[:], s0)
+
+			t3f := t1f.Mulmat(ctx, t2)
+			t3 := t1.Mulmat(ctx, t2)
+			d3 := ml.Dump(ctx, t3, ml.DumpWithPrecision(3))
+			d3f := ml.Dump(ctx, t3f, ml.DumpWithPrecision(3))
 			if d3 != d3f {
 				t.Fatalf("expected (f32): \n%s\n\n but got (mxfp4): \n%s", d3f, d3)
 			}
