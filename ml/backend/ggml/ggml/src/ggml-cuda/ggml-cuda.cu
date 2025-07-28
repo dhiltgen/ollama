@@ -2005,6 +2005,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ne2 == 1 && src0->type != GGML_TYPE_MXFP4) {
+            // GGML_LOG_DEBUG("%s ne2 == 1 case\n", __func__);
             if (ggml_is_quantized(src0->type)) {
                 ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
             } else {
@@ -2012,8 +2013,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
             return;
         }
-        if (src0->type == GGML_TYPE_MXFP4) {
-            GGML_LOG_DEBUG("%s calling ggml_cuda_mul_mat_vec_mxfp4\n", __func__);
+        // TODO what about ne2 != 1 case?
+        if (ne2 == 1 && src0->type == GGML_TYPE_MXFP4) {
+            // GGML_LOG_DEBUG("%s calling ggml_cuda_mul_mat_vec_mxfp4\n", __func__);
             ggml_cuda_mul_mat_vec_mxfp4(ctx, src0, src1, ids, dst);
             return;
         }

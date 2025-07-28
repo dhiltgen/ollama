@@ -52,15 +52,15 @@ static __global__ void mul_mat_vec_mxfp4(
     //
     //
     // block_size ranges from 32 - 256
-    if (tid == 0) {
-        printf("%s [%u:%u:%u] [%d] x+=%lld y+=%lld == sample_x:%lld stride_sample_x:%lld channel_x:%lld stride_channel_x:%lld row:%lld stride_row:%lld ncols2:%lld\n", __func__,
-            blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
-            sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row,
-            sample_y  *stride_sample_y   + channel_y  *stride_channel_y,
-            sample_x  ,stride_sample_x  , channel_x  ,stride_channel_x   , row, stride_row,
-            ncols2
-        );
-    }
+    // if (tid == 0) {
+    //     printf("%s [%u:%u:%u] [%d] x+=%lld y+=%lld == sample_x:%lld stride_sample_x:%lld channel_x:%lld stride_channel_x:%lld row:%lld stride_row:%lld ncols2:%lld\n", __func__,
+    //         blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
+    //         sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row,
+    //         sample_y  *stride_sample_y   + channel_y  *stride_channel_y,
+    //         sample_x  ,stride_sample_x  , channel_x  ,stride_channel_x   , row, stride_row,
+    //         ncols2
+    //     );
+    // }
 
     x   += sample_x  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
     y   += sample_y  *stride_sample_y   + channel_y  *stride_channel_y;
@@ -141,7 +141,7 @@ static __global__ void mul_mat_vec_mxfp4(
 
         // Spot check debug
         // if (tid == 0 || tid == 31) {
-            printf("%s [%u:%u:%u] [%d] x0:%f x1:%f y0:%f y1:%f\n", __func__, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, scale*tmpx.x, scale*tmpx.y, tmpy.x, tmpy.y);
+            // printf("%s [%u:%u:%u] [%d] x0:%f x1:%f y0:%f y1:%f\n", __func__, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, scale*tmpx.x, scale*tmpx.y, tmpy.x, tmpy.y);
         // }
     }
 
@@ -237,11 +237,11 @@ static void launch_mul_mat_vec_cuda_mxfp4(
     const int smem = warp_size*sizeof(float);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_dst);
     const dim3 block_dims(block_size_best, 1, 1);
-    printf("%s launching [%u:%u:%u] [%d] ncols2:%lld nchannels_y:%lld stride_row:%lld channel_ratio:%lld stride_channel_x:%lld stride_channel_y:%lld stride_channel_dst:%lld sample_ratio:%lld stride_sample_x:%lld stride_sample_y:%lld stride_sample_dst:%lld\n", __func__,
-        block_nums.x, block_nums.y, block_nums.z, block_dims.x,
-        ncols/2, nchannels_y, stride_row, channel_ratio, stride_channel_x, stride_channel_y,
-        stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst
-    );
+    // printf("%s launching [%u:%u:%u] [%d] ncols2:%lld nchannels_y:%lld stride_row:%lld channel_ratio:%lld stride_channel_x:%lld stride_channel_y:%lld stride_channel_dst:%lld sample_ratio:%lld stride_sample_x:%lld stride_sample_y:%lld stride_sample_dst:%lld\n", __func__,
+    //     block_nums.x, block_nums.y, block_nums.z, block_dims.x,
+    //     ncols/2, nchannels_y, stride_row, channel_ratio, stride_channel_x, stride_channel_y,
+    //     stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst
+    // );
 
     switch (block_size_best) {
         case   32: {
@@ -331,7 +331,7 @@ void ggml_cuda_mul_mat_vec_mxfp4(ggml_backend_cuda_context & ctx, const ggml_ten
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
-    printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
+    // printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
     const int64_t stride_row = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -376,7 +376,7 @@ void ggml_cuda_op_mul_mat_vec_mxfp4(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
-    printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
+    // printf("%s src0 ne[%lld %lld %lld %lld] nb[%lld %lld %lld %lld] ts=%lld bs=%lld\n", __func__, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], ggml_type_size(src0->type), ggml_blck_size(src0->type));
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
