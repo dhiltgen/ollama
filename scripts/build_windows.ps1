@@ -181,18 +181,60 @@ function buildROCm() {
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
             Remove-Item -Path $script:DIST_DIR\lib\ollama\rocm\rocblas\library\*gfx906* -ErrorAction SilentlyContinue
         }
+    } else {
+        Remove-Item -ea 0 -recurse -force -path "${script:SRC_DIR}\dist\windows-${script:ARCH}"
+        New-Item "${script:SRC_DIR}\dist\windows-${script:ARCH}\lib\ollama\" -ItemType Directory -ea 0
+
+        & cmake --fresh --preset CPU -G Ninja `
+                -DCMAKE_C_COMPILER=clang `
+                -DCMAKE_CXX_COMPILER=clang++ `
+                --install-prefix $script:DIST_DIR
+        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        & cmake --build --preset CPU  --config Release --parallel $script:JOBS
+        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        & cmake --install build --component CPU --strip
+        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+
+        if ($env:VULKAN_SDK) {
+            write-host "Building Vulkan backend libraries"     
+            & cmake --fresh --preset Vulkan -G Ninja `
+                -DCMAKE_C_COMPILER=clang `
+                -DCMAKE_CXX_COMPILER=clang++ `
+                --install-prefix $script:DIST_DIR
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --build --preset Vulkan  --config Release --parallel $script:JOBS
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --install build --component Vulkan --strip
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        }
     }
 }
 
 function buildVulkan(){
-    if ($env:VULKAN_SDK) {
-        write-host "Building Vulkan backend libraries"
-        & cmake --fresh --preset Vulkan --install-prefix $script:DIST_DIR -DOLLAMA_RUNNER_DIR="vulkan"
-        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
-        & cmake --build --preset Vulkan  --config Release --parallel $script:JOBS
-        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
-        & cmake --install build --component Vulkan --strip
-        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+    if ($script:ARCH -ne "arm64") {
+        if ($env:VULKAN_SDK) {
+            write-host "Building Vulkan backend libraries"
+            & cmake --fresh --preset Vulkan --install-prefix $script:DIST_DIR -DOLLAMA_RUNNER_DIR="vulkan"
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --build --preset Vulkan  --config Release --parallel $script:JOBS
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --install build --component Vulkan --strip
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        }
+    } else {
+        if ($env:VULKAN_SDK) {
+            write-host "Building Vulkan backend libraries"     
+            & cmake --fresh --preset Vulkan -G Ninja `
+                -DCMAKE_C_COMPILER=clang `
+                -DCMAKE_CXX_COMPILER=clang++ `
+                --install-prefix $script:DIST_DIR
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --build --preset Vulkan  --config Release --parallel $script:JOBS
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --install build --component Vulkan --strip
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        }
+
     }
 }
 
