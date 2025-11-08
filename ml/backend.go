@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"math"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -88,7 +90,13 @@ func RegisterBackend(name string, f func(string, BackendParams) (Backend, error)
 }
 
 func NewBackend(modelPath string, params BackendParams) (Backend, error) {
-	if backend, ok := backends["ggml"]; ok {
+	be := os.Getenv("OLLAMA_BACKEND")
+	if be == "" {
+		be = "mlx"
+		slog.Info("Defaulting to " + be + ". Set OLLAMA_BACKEND to override")
+	}
+	slog.Info("Loading new engine", "backend", be)
+	if backend, ok := backends[be]; ok {
 		return backend(modelPath, params)
 	}
 

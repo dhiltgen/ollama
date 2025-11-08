@@ -392,7 +392,7 @@ func (c *Causal) buildMask(ctx ml.Context) ml.Tensor {
 		mask[i] = float32(math.Inf(-1))
 	}
 
-	maskTensor := ctx.Input().FromFloats(mask, length, batchSize)
+	maskTensor := ctx.Input().FromFloats(mask, batchSize, length)
 
 	if c.config.MaskDType != ml.DTypeF32 {
 		maskTensor = maskTensor.Cast(ctx, c.config.MaskDType)
@@ -425,45 +425,58 @@ func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
 	key := c.keys[c.curLayer]
 	value := c.values[c.curLayer]
 
-	kHeadDim := key.Dim(0)
+	kHeadDim := key.Dim(2)
 	numKVHeads := key.Dim(1)
-	rowSize := key.Stride(2)
-	cachedSize := c.curMask.Dim(0)
+	rowSize := key.Stride(0)
+	cachedSize := c.curMask.Dim(1)
 
 	key = key.View(ctx, rowSize*c.curCellRange.min,
-		kHeadDim, key.Stride(1),
-		numKVHeads, key.Stride(2),
 		cachedSize,
+		numKVHeads,
+		kHeadDim,
+		key.Stride(0),
+		key.Stride(1),
 	)
 
 	if c.config.PermutedV {
 		vHeadDim := value.Dim(1)
-		elemSize := value.Stride(0)
+		elemSize := value.Stride(2)
 
 		value = value.View(ctx, elemSize*c.curCellRange.min,
-			cachedSize, value.Stride(1),
-			vHeadDim, value.Stride(2),
 			numKVHeads,
+			vHeadDim,
+			cachedSize,
+			value.Stride(0),
+			value.Stride(1),
 		)
 	} else {
 		vHeadDim := value.Dim(0)
 		rowSize := value.Stride(2)
 
 		value = value.View(ctx, rowSize*c.curCellRange.min,
-			vHeadDim, value.Stride(1),
-			numKVHeads, value.Stride(2),
 			cachedSize,
+			numKVHeads,
+			vHeadDim,
+			value.Stride(0),
+			value.Stride(1),
 		)
+	}
+
+	// TODO The mask changes from X,X to 1,X, and with the Row-order change
+	// the 1 becomes trailing and messes up later operations
+	// This isn't the right solution, but works around it...
+	if c.curMask.Dim(1) == 1 {
+		return key, value, c.curMask.Permute(ctx, 1, 0, 2, 3)
 	}
 
 	return key, value, c.curMask
 }
 
 func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
-	kHeadDim := key.Dim(0)
-	vHeadDim := value.Dim(0)
+	kHeadDim := key.Dim(2)
+	vHeadDim := value.Dim(2)
 	numKVHeads := key.Dim(1)
-	batchSize := key.Dim(2)
+	batchSize := key.Dim(0)
 
 	if c.curBatchSize != batchSize {
 		panic(fmt.Errorf("inconsistent batch sizes (layer: %v, batch size: %v layer batch size: %v)", c.curLayer, c.curBatchSize, batchSize))
@@ -474,14 +487,14 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 	}
 
 	if _, ok := c.keys[c.curLayer]; !ok {
-		c.keys[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, kHeadDim, numKVHeads, len(c.cells))
+		c.keys[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, len(c.cells), numKVHeads, kHeadDim)
 	}
 
 	if _, ok := c.values[c.curLayer]; !ok {
 		if c.config.PermutedV {
-			c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, len(c.cells), vHeadDim, numKVHeads)
+			c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, numKVHeads, vHeadDim, len(c.cells))
 		} else {
-			c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, vHeadDim, numKVHeads, len(c.cells))
+			c.values[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, len(c.cells), numKVHeads, vHeadDim)
 		}
 	}
 
@@ -599,14 +612,16 @@ func (c *Causal) shift(seq int, beginIndex, offset int32) error {
 				continue
 			}
 
-			kHeadDim := key.Dim(0)
+			kHeadDim := key.Dim(2)
 			numKVHeads := key.Dim(1)
-			rowSize := key.Stride(2)
+			rowSize := key.Stride(0)
 
 			key = key.View(ctx, rowSize*(start+batchFirst),
-				kHeadDim, key.Stride(1),
-				numKVHeads, key.Stride(2),
 				len(offsets),
+				numKVHeads,
+				kHeadDim,
+				key.Stride(0),
+				key.Stride(1),
 			)
 
 			roped, err := c.shiftFn(ctx, i, key, kShift)

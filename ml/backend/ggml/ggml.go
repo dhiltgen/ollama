@@ -121,6 +121,7 @@ type Backend struct {
 var once sync.Once
 
 func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
+	panic("Why was ggml.go New called?")
 	r, err := os.Open(modelPath)
 	if err != nil {
 		return nil, err

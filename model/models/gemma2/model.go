@@ -84,10 +84,10 @@ type SelfAttention struct {
 }
 
 func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState, positionIDs ml.Tensor, cache kvcache.Cache, opts *Options) ml.Tensor {
-	batchSize := hiddenState.Dim(1)
+	batchSize := hiddenState.Dim(0)
 
 	q := sa.Query.Forward(ctx, hiddenState)
-	q = q.Reshape(ctx, opts.attnKeyLen, opts.numHeads, batchSize)
+	q = q.Reshape(ctx, batchSize, opts.numHeads, opts.attnKeyLen)
 	q = fast.RoPE(ctx, q, positionIDs, opts.attnKeyLen, opts.ropeBase, 1./opts.ropeScale, rope.WithTypeNeoX())
 
 	if opts.largeModelScaling {
@@ -97,17 +97,17 @@ func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState, positionIDs ml.Ten
 	}
 
 	k := sa.Key.Forward(ctx, hiddenState)
-	k = k.Reshape(ctx, opts.attnKeyLen, opts.numKVHeads, batchSize)
+	k = k.Reshape(ctx, batchSize, opts.numKVHeads, opts.attnKeyLen)
 	k = fast.RoPE(ctx, k, positionIDs, opts.attnKeyLen, opts.ropeBase, 1./opts.ropeScale, rope.WithTypeNeoX())
 
 	v := sa.Value.Forward(ctx, hiddenState)
-	v = v.Reshape(ctx, opts.attnValLen, opts.numKVHeads, batchSize)
+	v = v.Reshape(ctx, batchSize, opts.numKVHeads, opts.attnValLen)
 
 	cache.Put(ctx, k, v)
 	k, v, mask := cache.Get(ctx)
 
-	q = q.Permute(ctx, 0, 2, 1, 3)
-	k = k.Permute(ctx, 0, 2, 1, 3)
+	q = q.Permute(ctx, 1, 0, 2, 3)
+	k = k.Permute(ctx, 1, 0, 2, 3)
 	v = v.Permute(ctx, 1, 2, 0, 3).Contiguous(ctx)
 
 	kq := k.Mulmat(ctx, q)
@@ -121,8 +121,8 @@ func (sa *SelfAttention) Forward(ctx ml.Context, hiddenState, positionIDs ml.Ten
 	kq = kq.Softmax(ctx)
 
 	kqv := v.Mulmat(ctx, kq)
-	kqv = kqv.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
-	kqv = kqv.Reshape(ctx, opts.attnValLen*opts.numHeads, batchSize)
+	kqv = kqv.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
+	kqv = kqv.Reshape(ctx, batchSize, opts.attnValLen*opts.numHeads)
 
 	return sa.Output.Forward(ctx, kqv)
 }
