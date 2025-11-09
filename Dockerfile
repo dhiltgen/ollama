@@ -3,49 +3,52 @@
 ARG FLAVOR=${TARGETARCH}
 ARG PARALLEL=8
 
-ARG ROCMVERSION=6.3.3
 ARG JETPACK5VERSION=r35.4.1
 ARG JETPACK6VERSION=r36.4.0
 ARG CMAKEVERSION=3.31.2
 ARG VULKANVERSION=1.4.321.1
 
+FROM --platform=linux/amd64 almalinux:8 AS therock
+RUN DATE=a20251106 ;\
+    VERSION=7.10.0; \
+    GPUS="gfx90X-dcgpu gfx94X-dcgpu gfx950-dcgpu gfx101X-dgpu gfx103X-dgpu gfx110X-dgpu gfx120X-all gfx1150 gfx1151" ; \
+    mkdir /opt/rocm && \
+    set -o pipefail ; \
+    for gpu in ${GPUS}; do \
+        echo "Downloading therock-dist-linux-${gpu}-${VERSION}${DATE}.tar.gz" ; \
+        curl -fsSL https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${gpu}-${VERSION}${DATE}.tar.gz | tar zxf - -C /opt/rocm || exit 1 ; \
+    done
+
 # We require gcc v10 minimum.  v10.3 has regressions, so the rockylinux 8.5 AppStream has the latest compatible version
-FROM --platform=linux/amd64 rocm/dev-almalinux-8:${ROCMVERSION}-complete AS base-amd64
+FROM --platform=linux/amd64 almalinux:8 AS base-amd64
 RUN yum install -y yum-utils \
     && yum-config-manager --add-repo https://dl.rockylinux.org/vault/rocky/8.5/AppStream/\$basearch/os/ \
     && rpm --import https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-8 \
-    && dnf install -y yum-utils ccache gcc-toolset-10-gcc-10.2.1-8.2.el8 gcc-toolset-10-gcc-c++-10.2.1-8.2.el8 gcc-toolset-10-binutils-2.35-11.el8 \
-    && dnf install -y ccache \
+    && dnf install -y yum-utils gcc-toolset-10-gcc-10.2.1-8.2.el8 gcc-toolset-10-gcc-c++-10.2.1-8.2.el8 gcc-toolset-10-binutils-2.35-11.el8 \
     && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
 ENV PATH=/opt/rh/gcc-toolset-10/root/usr/bin:$PATH
-ARG VULKANVERSION
-RUN wget https://sdk.lunarg.com/sdk/download/${VULKANVERSION}/linux/vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz -O /tmp/vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz \
-    && tar xvf /tmp/vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz \
-    && dnf -y install ninja-build \
-    && ln -s /usr/bin/python3 /usr/bin/python \  
-    && /${VULKANVERSION}/vulkansdk -j 8 vulkan-headers \
-    && /${VULKANVERSION}/vulkansdk -j 8 shaderc
-RUN cp -r /${VULKANVERSION}/x86_64/include/* /usr/local/include/ \
-    && cp -r /${VULKANVERSION}/x86_64/lib/* /usr/local/lib
-ENV PATH=/${VULKANVERSION}/x86_64/bin:$PATH
+RUN dnf config-manager --set-enabled powertools \
+    && dnf -y install ninja-build git python3 epel-release \
+    && dnf install -y ccache \
+    && ln -s /usr/bin/python3 /usr/bin/python
 
 FROM --platform=linux/arm64 almalinux:8 AS base-arm64
 # install epel-release for ccache
 RUN yum install -y yum-utils epel-release \
-    && dnf install -y clang ccache \
+    && dnf install -y clang ccache git \
     && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/sbsa/cuda-rhel8.repo
 ENV CC=clang CXX=clang++
 
 FROM base-${TARGETARCH} AS base
 ARG CMAKEVERSION
 RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKEVERSION}/cmake-${CMAKEVERSION}-linux-$(uname -m).tar.gz | tar xz -C /usr/local --strip-components 1
-COPY CMakeLists.txt CMakePresets.json .
-COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ENV LDFLAGS=-s
 
 FROM base AS cpu
 RUN dnf install -y gcc-toolset-11-gcc gcc-toolset-11-gcc-c++
 ENV PATH=/opt/rh/gcc-toolset-11/root/usr/bin:$PATH
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ARG PARALLEL
 RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'CPU' \
@@ -56,6 +59,8 @@ FROM base AS cuda-11
 ARG CUDA11VERSION=11.8
 RUN dnf install -y cuda-toolkit-${CUDA11VERSION//./-}
 ENV PATH=/usr/local/cuda-11/bin:$PATH
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ARG PARALLEL
 RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'CUDA 11' \
@@ -66,6 +71,8 @@ FROM base AS cuda-12
 ARG CUDA12VERSION=12.8
 RUN dnf install -y cuda-toolkit-${CUDA12VERSION//./-}
 ENV PATH=/usr/local/cuda-12/bin:$PATH
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ARG PARALLEL
 RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'CUDA 12' \
@@ -77,6 +84,8 @@ FROM base AS cuda-13
 ARG CUDA13VERSION=13.0
 RUN dnf install -y cuda-toolkit-${CUDA13VERSION//./-}
 ENV PATH=/usr/local/cuda-13/bin:$PATH
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ARG PARALLEL
 RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'CUDA 13' \
@@ -84,14 +93,16 @@ RUN --mount=type=cache,target=/root/.ccache \
         && cmake --install build --component CUDA --strip --parallel ${PARALLEL}
 
 
-FROM base AS rocm-6
-ENV PATH=/opt/rocm/hcc/bin:/opt/rocm/hip/bin:/opt/rocm/bin:/opt/rocm/hcc/bin:$PATH
+FROM base AS rocm-build
+COPY --from=therock /opt/rocm /opt/rocm
+ENV PATH=/opt/rocm/lib/llvm/bin/:/opt/rocm/bin:$PATH
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 ARG PARALLEL
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake --preset 'ROCm 6' \
-        && cmake --build --parallel ${PARALLEL} --preset 'ROCm 6' \
+    cmake --preset 'ROCm 7' \
+        && cmake --build --parallel ${PARALLEL} --preset 'ROCm 7' \
         && cmake --install build --component HIP --strip --parallel ${PARALLEL}
-RUN rm -f dist/lib/ollama/rocm/rocblas/library/*gfx90[06]*
 
 FROM --platform=linux/arm64 nvcr.io/nvidia/l4t-jetpack:${JETPACK5VERSION} AS jetpack-5
 ARG CMAKEVERSION
@@ -118,6 +129,15 @@ RUN --mount=type=cache,target=/root/.ccache \
         && cmake --install build --component CUDA --strip --parallel ${PARALLEL}
 
 FROM base AS vulkan
+ARG VULKANVERSION
+RUN curl -fsSL https://sdk.lunarg.com/sdk/download/${VULKANVERSION}/linux/vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz | tar Jxf - \
+    && /${VULKANVERSION}/vulkansdk -j 8 vulkan-headers \
+    && /${VULKANVERSION}/vulkansdk -j 8 shaderc
+RUN cp -r /${VULKANVERSION}/x86_64/include/* /usr/local/include/ \
+    && cp -r /${VULKANVERSION}/x86_64/lib/* /usr/local/lib
+ENV PATH=/${VULKANVERSION}/x86_64/bin:$PATH
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'Vulkan' \
         && cmake --build --parallel --preset 'Vulkan' \
@@ -152,7 +172,7 @@ COPY --from=jetpack-5 dist/lib/ollama/ /lib/ollama/
 COPY --from=jetpack-6 dist/lib/ollama/ /lib/ollama/
 
 FROM scratch AS rocm
-COPY --from=rocm-6 dist/lib/ollama /lib/ollama
+COPY --from=rocm-build dist/lib/ollama /lib/ollama
 
 FROM ${FLAVOR} AS archive
 ARG VULKANVERSION

@@ -78,6 +78,18 @@
       }
     },
     {
+      "name": "ROCm 7",
+      "inherits": [ "ROCm" ],
+      "cacheVariables": {
+        "CMAKE_HIP_FLAGS": "-parallel-jobs=4",
+        "AMDGPU_TARGETS": "gfx906;gfx908:xnack-;gfx90a:xnack+;gfx90a:xnack-;gfx942;gfx950;gfx1010;gfx1011;gfx1012;gfx1030;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201",
+        "OLLAMA_RUNNER_DIR": "rocm",
+        "GGML_OPENMP": "OFF",
+        "GGML_CUDA_FORCE_CUBLAS": "OFF",
+        "GGML_HIP_ROCWMMA_FATTN": "ON"
+      }
+    },    
+    {
       "name": "Vulkan",
       "inherits": [ "Default" ],
       "cacheVariables": {
@@ -135,6 +147,11 @@
       "name": "ROCm 6",
       "inherits": [ "ROCm" ],
       "configurePreset": "ROCm 6"
+    },
+    {
+      "name": "ROCm 7",
+      "inherits": [ "ROCm" ],
+      "configurePreset": "ROCm 7"
     },
     {
       "name": "Vulkan",
