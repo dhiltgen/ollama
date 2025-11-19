@@ -3483,6 +3483,7 @@ struct ggml_backend_cuda_device_context {
     std::string description;
     std::string pci_bus_id;
     std::string id;
+    std::string luid;
     int major;
     int minor;
     int driver_major;
@@ -3510,6 +3511,17 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     ggml_cuda_set_device(ctx->device);
 
 #if defined(GGML_USE_HIP)
+    // Check VRAM reporting for Windows IGPU/DGPU using DXGI + PDH (vendor agnostic)
+    if (ggml_dxgi_pdh_init() == 0) {
+        GGML_LOG_DEBUG("DXGI + PDH Initialized. Getting GPU free memory info\n");
+        int status = ggml_dxgi_pdh_get_device_memory(ctx->luid.c_str(), free, total, ctx->integrated);
+        if (status == 0) {
+            GGML_LOG_DEBUG("%s utilizing DXGI + PDH memory reporting free: %zu total: %zu\n", __func__, *free, *total);
+            ggml_dxgi_pdh_release();
+            return;
+        }
+        ggml_dxgi_pdh_release();
+    }
     if (ggml_hip_mgmt_init() == 0) {
         int status = ggml_hip_get_device_memory(ctx->pci_bus_id.c_str(), free, total);
         if (status == 0) {
@@ -4158,6 +4170,13 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 dev_ctx->driver_major = driverVersion / 1000;
                 dev_ctx->driver_minor = (driverVersion - (dev_ctx->driver_major * 1000)) / 10;
                 dev_ctx->integrated = prop.integrated;
+                char luid_str[32]; // "0x" + 16 hex digits + null terminator = 19 chars
+                snprintf(luid_str, sizeof(luid_str), // high part + low part
+                    "0x%02x%02x%02x%02x%02x%02x%02x%02x",
+                    prop.luid[7], prop.luid[6], prop.luid[5], prop.luid[4],
+                    prop.luid[3], prop.luid[2], prop.luid[1], prop.luid[0]
+                );
+                dev_ctx->luid = std::string(luid_str);
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_cuda_device_interface,
                     /* .reg     = */ &reg,
