@@ -2,6 +2,7 @@ package nn
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
@@ -59,14 +60,26 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 
 	// Only use the fast SDPA implementation if we have a cache, since that's what
 	// will do any expected backend-specific transformations for us
-	if sdpa, ok := query.(ml.ScaledDotProductAttention); ok && cache != nil {
-		return sdpa.ScaledDotProductAttention(ctx, key, value, mask, sinks, vmla, scale)
-	} else {
-		query = query.Permute(ctx, 0, 2, 1, 3)
-		key = key.Permute(ctx, 0, 2, 1, 3)
-		value = value.Permute(ctx, 1, 2, 0, 3).Contiguous(ctx)
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "q", query)
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "k", key)
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "v", value)
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask) // WRONG - shape is good, but all -inf values
 
-		kq := key.MulmatFullPrec(ctx, query)
+	// fmt.Fprintln(os.Stderr, mask.ToString())
+	// panic("Just before ScaledDotProductAttention")
+
+	// TODO - something's wrong here...  probably mask, but rule out the others first...
+
+	if cache != nil {
+		// TODO what to do with vmla?
+		return query.ScaledDotProductAttention(ctx, key, value, scale, "array", []ml.Tensor{mask}, sinks)
+	} else {
+		// TODO transpose shapes are wrong
+		query = query.Transpose(ctx, 0, 2, 1, 3)
+		key = key.Transpose(ctx, 0, 2, 1, 3)
+		value = value.Transpose(ctx, 1, 2, 0, 3).Contiguous(ctx, false)
+
+		kq := query.Matmul(ctx, key)
 
 		kq = kq.Scale(ctx, scale)
 		if mask != nil {
@@ -74,12 +87,12 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 		}
 		kq = kq.Softmax(ctx)
 
-		kqv := value.Mulmat(ctx, kq)
+		kqv := kq.Matmul(ctx, value)
 
 		if vmla != nil {
-			kqv = vmla.Mulmat(ctx, kqv)
+			kqv = kqv.Matmul(ctx, vmla)
 		}
 
-		return kqv.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
+		return kqv.Transpose(ctx, 0, 2, 1, 3).Contiguous(ctx, false)
 	}
 }

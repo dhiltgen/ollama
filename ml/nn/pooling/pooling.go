@@ -28,13 +28,13 @@ func (t Type) String() string {
 
 func (t Type) Forward(ctx ml.Context, hiddenStates ml.Tensor) ml.Tensor {
 	switch t {
-	case TypeMean:
-		hiddenStates = hiddenStates.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx).Mean(ctx)
-		return hiddenStates.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
-	case TypeCLS:
-		return hiddenStates.Slice(ctx, 1, 0, 1, 1)
-	case TypeLast:
-		return hiddenStates.Slice(ctx, 1, hiddenStates.Dim(1)-1, hiddenStates.Dim(1), 1)
+	// case TypeMean:
+	// 	hiddenStates = hiddenStates.Transpose(ctx, 1, 0, 2, 3).Contiguous(ctx, false).Mean(ctx)
+	// 	return hiddenStates.Transpose(ctx, 1, 0, 2, 3).Contiguous(ctx, false)
+	// case TypeCLS:
+	// 	return hiddenStates.Slice(ctx, 1, 0, 1, 1)
+	// case TypeLast:
+	// 	return hiddenStates.Slice(ctx, 1, hiddenStates.Dim(1)-1, hiddenStates.Dim(1), 1)
 	default:
 		panic("unknown pooling type")
 	}

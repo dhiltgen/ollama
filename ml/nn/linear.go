@@ -8,7 +8,7 @@ type Linear struct {
 }
 
 func (m *Linear) Forward(ctx ml.Context, t ml.Tensor) ml.Tensor {
-	t = m.Weight.Mulmat(ctx, t)
+	t = t.Matmul(ctx, m.Weight.Transpose(ctx))
 	if m.Bias != nil {
 		t = t.Add(ctx, m.Bias)
 	}
@@ -22,10 +22,11 @@ type LinearBatch struct {
 }
 
 func (m *LinearBatch) Forward(ctx ml.Context, t, indices ml.Tensor) ml.Tensor {
-	t = m.Weight.MulmatID(ctx, t, indices)
-	if m.Bias != nil {
-		t = t.AddID(ctx, m.Bias, indices)
-	}
+	panic("not yet ported")
+	// t = m.Weight.MulmatID(ctx, t, indices)
+	// if m.Bias != nil {
+	// 	t = t.AddID(ctx, m.Bias, indices)
+	// }
 
 	return t
 }

@@ -3,7 +3,7 @@ include(FetchContent)
 set(MLX_C_BUILD_EXAMPLES OFF)
 
 set(MLX_BUILD_GGUF OFF)
-set(MLX_BUILD_SAFETENSORS OFF)
+set(MLX_BUILD_SAFETENSORS ON)
 
 function(set_target_output_directory _target)
     if(TARGET ${_target})

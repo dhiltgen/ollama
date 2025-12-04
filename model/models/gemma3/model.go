@@ -38,18 +38,18 @@ type MultiModalProjector struct {
 func (p *MultiModalProjector) Forward(ctx ml.Context, visionOutputs ml.Tensor, imageSize, patchSize int, eps float32) ml.Tensor {
 	l := visionOutputs.Dim(0)
 
-	visionOutputs = visionOutputs.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
+	visionOutputs = visionOutputs.Transpose(ctx, 1, 0, 2, 3).Contiguous(ctx, false)
 	patchesPerImage := imageSize / patchSize
 	visionOutputs = visionOutputs.Reshape(ctx, patchesPerImage, patchesPerImage, l)
 
 	kernelSize := patchesPerImage / int(math.Sqrt(float64(p.tokensPerImage)))
 	visionOutputs = visionOutputs.AvgPool2D(ctx, kernelSize, kernelSize, 0)
 	visionOutputs = visionOutputs.Reshape(ctx, visionOutputs.Dim(0)*visionOutputs.Dim(1), l)
-	visionOutputs = visionOutputs.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
+	visionOutputs = visionOutputs.Transpose(ctx, 1, 0, 2, 3).Contiguous(ctx, false)
 	visionOutputs = p.SoftEmbNorm.Forward(ctx, visionOutputs, eps)
 
 	// TODO: inputProjection must be transposed since they're incompatible with visionOutputs
-	visionOutputs = p.InputProjection.Weight.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx).Mulmat(ctx, visionOutputs)
+	visionOutputs = visionOutputs.Matmul(ctx, p.InputProjection.Weight.Transpose(ctx, 1, 0, 2, 3).Contiguous(ctx, false))
 	return visionOutputs
 }
 

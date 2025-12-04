@@ -18,5 +18,12 @@ type RMSNorm struct {
 }
 
 func (m *RMSNorm) Forward(ctx ml.Context, t ml.Tensor, eps float32) ml.Tensor {
-	return t.RMSNorm(ctx, m.Weight, eps)
+	// slog.Info("RMSNorm", "eps", eps)
+	// fmt.Fprintln(os.Stderr, t.ToString())
+	// fmt.Fprintln(os.Stderr, m.Weight.ToString())
+
+	// TODO this is probably model specific, not generalized...
+	w := m.Weight.Add(ctx, ctx.FromInts([]int32{1}, 1))
+
+	return t.RMSNorm(ctx, w, eps)
 }

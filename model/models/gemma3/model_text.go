@@ -1,6 +1,7 @@
 package gemma3
 
 import (
+	"log/slog"
 	"math"
 
 	"github.com/ollama/ollama/fs"
@@ -13,11 +14,11 @@ import (
 )
 
 type TextConfig struct {
-	hiddenSize, numHeads, numKVHeads int
-	attnKeyLen, attnValLen           int
-	eps, ropeScale                   float32
-	ropeLocalBase, ropeGlobalBase    float32
-	largeModelScaling                bool
+	hiddenSize, numHeads, numKVHeads  int
+	attnKeyLen, attnValLen, vocabSize int
+	eps, ropeScale                    float32
+	ropeLocalBase, ropeGlobalBase     float32
+	largeModelScaling                 bool
 }
 
 type TextModel struct {
@@ -32,6 +33,32 @@ type TextModel struct {
 const (
 	gemmaGlobalCacheCount = 6
 	gemma27BLayerCount    = 62
+
+	// Derived from mlx-lm
+	hiddenSize           = int(1152)
+	numHiddenLayers      = int(26)
+	intermediateSize     = int(6912)
+	numAttentionHeads    = int(4)
+	headDim              = int(256)
+	rmsNormEps           = float32(1.0e-6)
+	vocabSize            = int(262144)
+	numKeyValueHeads     = int(1)
+	ropeGlobalBaseFreq   = float32(1000000.0)
+	ropeLocalBaseFreq    = float32(10000.0)
+	ropeTraditional      = false
+	queryPreAttnScalar   = float32(256)
+	slidingWindow        = int(512)
+	slidingWindowPattern = int(6)
+
+	// dim = args.hidden_size
+	// self.n_heads = n_heads = args.num_attention_heads
+	// self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+	// self.repeats = n_heads // n_kv_heads
+	// self.head_dim = head_dim = args.head_dim
+	// self.layer_idx = layer_idx
+
+	// self.scale = args.query_pre_attn_scalar**-0.5
+
 )
 
 const (
@@ -45,7 +72,9 @@ func newTextModel(c fs.Config) *TextModel {
 	m := TextModel{
 		Layers: make([]TextLayer, numBlocks),
 		TextConfig: &TextConfig{
+			// hiddenSize:     hiddenSize, //int(c.Uint("embedding_length")),
 			hiddenSize:     int(c.Uint("embedding_length")),
+			vocabSize:      vocabSize,
 			numHeads:       int(c.Uint("attention.head_count")),
 			numKVHeads:     int(c.Uint("attention.head_count_kv")),
 			attnKeyLen:     int(c.Uint("attention.key_length", 256)),
@@ -77,37 +106,75 @@ type TextSelfAttention struct {
 }
 
 func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, positionIDs ml.Tensor, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
-	batchSize := hiddenState.Dim(1)
+	B := hiddenState.Dim(0)
+	L := hiddenState.Dim(1)
+	slog.Info("XXX start of Forward", "B", B, "L", L, "hiddenState", hiddenState)
 
 	ropeBase := opts.ropeLocalBase
 	if (layer+1)%gemmaGlobalCacheCount == 0 {
 		ropeBase = opts.ropeGlobalBase
 	}
+	// fmt.Fprintf(os.Stderr, hiddenState.ToString())
+	// panic("before q forward") // CORRECT
 
 	q := sa.Query.Forward(ctx, hiddenState)
-	q = q.Reshape(ctx, opts.attnKeyLen, opts.numHeads, batchSize)
+	// fmt.Fprintf(os.Stderr, q.ToString())
+	// panic("after q forward") // CORRECT
+	// slog.Info("XXX before reshape+transpose", "q", q)
+	// slog.Info("XXX", "reshape", []int{B, L, opts.numHeads, -1})
+	q = q.Reshape(ctx, B, L, opts.numHeads, -1).Transpose(ctx, 0, 2, 1, 3)
+	// slog.Info("XXX after reshape+transpose", "q", q)
 	q = sa.QueryNorm.Forward(ctx, q, opts.eps)
-	q = fast.RoPE(ctx, q, positionIDs, opts.attnKeyLen, ropeBase, 1./opts.ropeScale, rope.WithTypeNeoX())
+	// slog.Info("XXX after querynorm", "q", q)
+	traditional := false
+	offset := int(0) // TODO is this right?
 
-	if opts.largeModelScaling {
-		q = q.Scale(ctx, 1.0/math.Sqrt(float64(opts.hiddenSize/opts.numHeads)))
-	} else {
-		q = q.Scale(ctx, 1.0/math.Sqrt(float64(opts.attnKeyLen)))
-	}
+	// fmt.Fprintln(os.Stderr, q.ToString())
+	// panic("before q rope") // CORRECT
 
+	q = q.RoPE(ctx, opts.attnKeyLen, traditional, opts.ropeScale, offset, ml.WithRoPEBase(ropeBase))
+	// fmt.Fprintln(os.Stderr, q.ToString())
+	// panic("after q rope") // CORRECT
+
+	// TODO - this is wrong somehow so commenting out
+	// if opts.largeModelScaling {
+	// 	q = q.Scale(ctx, 1.0/math.Sqrt(float64(opts.hiddenSize/opts.numHeads)))
+	// } else {
+	// 	q = q.Scale(ctx, 1.0/math.Sqrt(float64(opts.attnKeyLen)))
+	// }
+
+	// slog.Info("XXX before Key.Forward", "key", sa.Key.Weight, "hiddenState", hiddenState)
 	k := sa.Key.Forward(ctx, hiddenState)
-	k = k.Reshape(ctx, opts.attnKeyLen, opts.numKVHeads, batchSize)
+	// slog.Info("XXX after Key.Forward", "key", k)
+	k = k.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3)
+	// slog.Info("XXX after reshape", "key", k, "KeyNorm", sa.KeyNorm.Weight)
 	k = sa.KeyNorm.Forward(ctx, k, opts.eps)
-	k = fast.RoPE(ctx, k, positionIDs, opts.attnKeyLen, ropeBase, 1./opts.ropeScale, rope.WithTypeNeoX())
+	// slog.Info("XXX after KeyNorm.Forward", "key", k)
+	k = k.RoPE(ctx, opts.attnKeyLen, traditional, opts.ropeScale, offset, ml.WithRoPEBase(ropeBase))
+	// slog.Info("XXX after RoPE", "key", k)
+	// fmt.Fprintln(os.Stderr, k.ToString())
+	// panic("after k rope") // CORRECT
 
 	v := sa.Value.Forward(ctx, hiddenState)
-	v = v.Reshape(ctx, opts.attnValLen, opts.numKVHeads, batchSize)
+	v = v.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3)
 
 	scaleFactor := 1.0
-	kqv := nn.Attention(ctx, q, k, v, scaleFactor, cache)
-	kqv = kqv.Reshape(ctx, opts.attnValLen*opts.numHeads, batchSize)
 
-	return sa.Output.Forward(ctx, kqv)
+	// fmt.Fprintln(os.Stderr, q.ToString()) // CORRECT now
+	// fmt.Fprintln(os.Stderr, k.ToString()) // CORRECT
+	// fmt.Fprintln(os.Stderr, v.ToString()) // CORRECT
+	// panic("before QKV Attention")
+
+	kqv := nn.Attention(ctx, q, k, v, scaleFactor, cache)
+	// fmt.Fprintln(os.Stderr, kqv.ToString())
+	// panic("after scaled dot product") // WRONG - all nans
+
+	kqv = kqv.Transpose(ctx, 0, 2, 1, 3).Reshape(ctx, B, L, -1)
+
+	t := sa.Output.Forward(ctx, kqv)
+	// fmt.Fprintln(os.Stderr, t.ToString())
+	// panic("final output") // WRONG! nan's
+	return t
 }
 
 func (m *TextModel) Shift(ctx ml.Context, layer int, key, shift ml.Tensor) (ml.Tensor, error) {
@@ -141,16 +208,25 @@ type TextLayer struct {
 
 func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs, outputs ml.Tensor, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
 	residual := hiddenState
+	// fmt.Fprintf(os.Stderr, hiddenState.ToString())
+	// panic("before attention norm") // CORRECT
 
+	// fmt.Fprintf(os.Stderr, l.AttentionNorm.Weight.ToString())
+	// panic("l.AttentionNorm.Weight") // CORRECT
 	hiddenState = l.AttentionNorm.Forward(ctx, hiddenState, opts.eps)
+	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	// panic("after attention norm") // CORRECT
 	hiddenState = l.SelfAttention.Forward(ctx, layer, hiddenState, positionIDs, cache, opts)
+	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	// panic("after self attention")
+
 	hiddenState = l.PostAttentionNorm.Forward(ctx, hiddenState, opts.eps)
 
 	// In the final layer (outputs != nil), optimize by pruning to just the token positions
 	// we need logits for.
 	if outputs != nil {
-		hiddenState = hiddenState.Rows(ctx, outputs)
-		residual = residual.Rows(ctx, outputs)
+		hiddenState = hiddenState.TakeAxes(ctx, outputs, 0)
+		residual = residual.TakeAxes(ctx, outputs, 0)
 	}
 
 	hiddenState = hiddenState.Add(ctx, residual)
@@ -163,16 +239,41 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 }
 
 func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cache) ml.Tensor {
+
 	positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
 
+	// TODO is this the right place to create this?
+	// if m.TokenEmbedding == nil {
+	// 	m.TokenEmbedding = &nn.Embedding{
+	// 		Weight: ctx.RandomNormal([]int{m.vocabSize, m.hiddenSize}, ml.DTypeFloat32, 0, float32(math.Sqrt(1/float64(m.hiddenSize))), nil),
+	// 	}
+	// }
+
+	slog.Info("XXX TextModel.Forward", "batch", batch.Inputs)
+	// fmt.Fprintln(os.Stderr, m.TokenEmbedding.Weight.ToString())
+	// panic("TokenEmbedding") // CORRECT
+
+	// fmt.Fprintln(os.Stderr, batch.Inputs.ToString())
+	// panic("batch.Inputs") // CORRECT
 	hiddenState := m.TokenEmbedding.Forward(ctx, batch.Inputs)
+	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	// panic("TokenEmbedding.Forward") // CORRECt, but has more token zero rows at the end - probably OK
+	slog.Info("XXX scale", "m.TextConfig.hiddenSize", m.TextConfig.hiddenSize, "scale", math.Sqrt(float64(m.TextConfig.hiddenSize)))
 	hiddenState = hiddenState.Scale(ctx, math.Sqrt(float64(m.TextConfig.hiddenSize)))
+	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	// panic("scale") // CORRECT
+	slog.Info("XXX after Scale", "hiddenState", hiddenState)
+
+	// fmt.Fprintf(os.Stderr, hiddenState.ToString())
+	// panic("Does it look OK?")
 
 	// set image embeddings
 	var except []int
 	for _, image := range batch.Multimodal {
 		visionOutputs := image.Multimodal[0].Tensor
-		ctx.Forward(visionOutputs.Copy(ctx, hiddenState.View(ctx, image.Index*hiddenState.Stride(1), visionOutputs.Dim(0)*visionOutputs.Dim(1))))
+		ctx.Forward(visionOutputs.Copy(ctx, hiddenState.AsStrided(ctx,
+			[]int{visionOutputs.Dim(0) * visionOutputs.Dim(1)},
+			[]int{image.Index * hiddenState.Stride(1)}, 0)))
 
 		for i := range visionOutputs.Dim(1) {
 			except = append(except, image.Index+i)
@@ -202,6 +303,8 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 		}
 
 		hiddenState = layer.Forward(ctx, i, hiddenState, positions, lastLayerOutputs, cache, m.TextConfig)
+		// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+		// panic("after first layer")
 	}
 
 	hiddenState = m.OutputNorm.Forward(ctx, hiddenState, m.eps)

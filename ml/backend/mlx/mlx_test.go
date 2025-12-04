@@ -1,0 +1,255 @@
+package mlx
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"reflect"
+	"testing"
+
+	fsggml "github.com/ollama/ollama/fs/ggml"
+	"github.com/ollama/ollama/ml"
+	"github.com/ollama/ollama/ml/nn"
+	"github.com/ollama/ollama/model/input"
+	"github.com/ollama/ollama/model/models/gemma3"
+)
+
+func TestLoadModel(t *testing.T) {
+	dir := "/Users/daniel/Models/gemma-3-4b-it/"
+	b := &Backend{}
+	err := b.LoadSafeTensors(dir)
+	if err != nil {
+		t.Fatalf("load failed: %s", err)
+	}
+}
+
+func TestFromInts(t *testing.T) {
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	data := []int32{1, 2, 3, 4, 5, 6}
+	a := c.FromInts(data, 2, 3)
+	slog.Info("", "array", a)
+	t.Log(a.ToString())
+	if !reflect.DeepEqual(a.Shape(), []int{2, 3}) {
+		t.Fatalf("incorrect shape: %v", a.Shape())
+	}
+}
+
+func TestFromFloats(t *testing.T) {
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	data := []float32{1, 2, 3, 4, 5, 6}
+	a := c.FromFloats(data, 2, 3)
+	slog.Info("", "array", a)
+	t.Log(a.ToString())
+	if !reflect.DeepEqual(a.Shape(), []int{2, 3}) {
+		t.Fatalf("incorrect shape: %v", a.Shape())
+	}
+	res := a.Floats()
+	if !reflect.DeepEqual(res, data) {
+		t.Fatalf("incorrect results: %v", res)
+	}
+}
+
+func TestAdd(t *testing.T) {
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	t1 := c.Arange(0, 24, 1, ml.DTypeFloat16)
+	t2 := c.Arange(0, 24, 1, ml.DTypeFloat16)
+	exp := c.Arange(0, 48, 2, ml.DTypeFloat16)
+	t3 := t1.Add(c, t2)
+	c.Compute(t3, exp)
+	t3f := t3.Floats()
+	if !reflect.DeepEqual(t3f, exp.Floats()) {
+		t.Fatalf("incorrect result: %v", t3f)
+	}
+}
+
+func TestReshapeTranspose(t *testing.T) {
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	t1 := c.Arange(0, 24, 1, ml.DTypeFloat16).Reshape(c, 2, 3, 4).Transpose(c, 0, 2, 1).Contiguous(c, false)
+	c.Compute(t1)
+	t1f := t1.Floats()
+	exp := []float32{
+		0, 4, 8,
+		1, 5, 9,
+		2, 6, 10,
+		3, 7, 11,
+		12, 16, 20,
+		13, 17, 21,
+		14, 18, 22,
+		15, 19, 23,
+	}
+	if !reflect.DeepEqual(t1f, exp) {
+		t.Fatalf("incorrect results: %v", t1f)
+	}
+}
+
+func prod(vals ...int) int {
+	r := 1
+	for _, v := range vals {
+		r *= v
+	}
+	return r
+}
+func TestMatmul(t *testing.T) {
+	// TODO create scenarios...
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	s1 := []int{1, 3, 2, 4}
+	t1 := c.Arange(0, float32(prod(s1...)), 1, ml.DTypeFloat16).Reshape(c, s1...)
+	s2 := []int{4, 2}
+	t2 := c.Arange(0, float32(prod(s2...)), 1, ml.DTypeFloat16).Reshape(c, s2...)
+	t3 := t1.Matmul(c, t2)
+	exp := []float32{
+		28, 34,
+		76, 98,
+
+		124, 162,
+		172, 226,
+
+		220, 290,
+		268, 354,
+	}
+	c.Compute(t3)
+	t3f := t3.Floats()
+	if !reflect.DeepEqual(t3f, exp) {
+		t.Fatalf("incorrect result: %v", t3f)
+	}
+}
+
+// TODO test case on RMSNorm and LayerNorm, RoPE, ScaledDotProductAttention, Take
+
+func TestGemma3(t *testing.T) {
+	// Hacky frankenstein partially GGUF partially safetensors...
+
+	// Why is the sky blue
+	inputs := [512]int32{2, 105, 2364, 107, 36425, 563, 506, 7217, 3730, 106, 107, 105, 4368}
+
+	modelPath := "/Users/daniel/.ollama/models/blobs/sha256-2e1715faf889527461e76d271e827bbe03f3d22b4b86acf6146671d72eb6d11d"
+	r, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatalf("unable to open gemma3:4b-it-fp16: %s", err)
+	}
+	defer r.Close()
+
+	meta, err := fsggml.Decode(r, -1)
+	if err != nil {
+		t.Fatalf("unable to decode: %s", err)
+	}
+
+	model, err := gemma3.New(meta.KV())
+	if err != nil {
+		t.Fatalf("unable to load model: %s", err)
+	}
+	dir := "/Users/daniel/Models/gemma-3-4b-it/"
+	b := &Backend{}
+	ctx := b.NewContext()
+	err = b.LoadSafeTensors(dir)
+	if err != nil {
+		t.Fatalf("load failed: %s", err)
+	}
+
+	// More hacks...
+	g3 := model.(*gemma3.Model)
+	if g3.TextModel == nil {
+		t.Fatal("nil text model")
+	}
+
+	// TODO Load the layers manually for now
+
+	g3.TextModel.TokenEmbedding = &nn.Embedding{
+		Weight: b.Get("language_model.model.embed_tokens.weight"),
+	}
+	g3.TextModel.OutputNorm = &nn.RMSNorm{
+		Weight: b.Get("language_model.model.norm.weight"),
+	}
+	g3.TextModel.Output = &nn.Linear{
+		Weight: b.Get("language_model.model.embed_tokens.weight"),
+	}
+	for i := range g3.TextModel.Layers {
+		g3.TextModel.Layers[i].AttentionNorm = &nn.RMSNorm{
+			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.input_layernorm.weight", i)),
+		}
+		g3.TextModel.Layers[i].SelfAttention = &gemma3.TextSelfAttention{
+			Query: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.q_proj.weight", i)),
+			},
+			QueryNorm: &nn.RMSNorm{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.q_norm.weight", i)),
+			},
+			Key: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.k_proj.weight", i)),
+			},
+			KeyNorm: &nn.RMSNorm{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.k_norm.weight", i)),
+			},
+			Value: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.v_proj.weight", i)),
+			},
+			Output: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.o_proj.weight", i)),
+			},
+		}
+		g3.TextModel.Layers[i].PostAttentionNorm = &nn.RMSNorm{
+			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.post_attention_layernorm.weight", i)),
+		}
+		g3.TextModel.Layers[i].MLPNorm = &nn.RMSNorm{
+			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.pre_feedforward_layernorm.weight", i)),
+		}
+		g3.TextModel.Layers[i].MLP = &gemma3.TextMLP{
+			Up: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.mlp.up_proj.weight", i)),
+			},
+			Down: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.mlp.down_proj.weight", i)),
+			},
+			Gate: &nn.Linear{
+				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.mlp.gate_proj.weight", i)),
+			},
+		}
+		g3.TextModel.Layers[i].PostMLPNorm = &nn.RMSNorm{
+			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.post_feedforward_layernorm.weight", i)),
+		}
+	}
+
+	// TODO multimodal not wired up yet
+
+	// TODO try to run a forward pass with a hard-coded input
+	batch := input.Batch{
+		Inputs:    ctx.FromInts(inputs[:], 1, len(inputs)),
+		Positions: make([]int32, len(inputs)),
+		Sequences: make([]int, len(inputs)),
+	}
+	for i := range len(inputs) {
+		batch.Positions[i] = int32(i)
+	}
+
+	cache := g3.Config().Cache
+	if cache != nil {
+		numSlots := 1
+		batchSize := 512
+		numCtx := 4096
+		cache.Init(b, ml.DTypeFloat16, numSlots, int(numCtx), batchSize)
+		err := cache.StartForward(ctx, batch, true)
+		if err != nil {
+			t.Fatalf("failed cache.StartForward: %s", err)
+		}
+	}
+
+	out, err := g3.Forward(ctx, batch)
+	if err != nil {
+		t.Fatalf("failed forward pass: %s", err)
+	}
+	t.Log("finished forward pass!")
+	ctx.Forward(out)
+	tokens := out.Floats()
+	t.Logf("Output: %v", tokens[:100])
+
+}

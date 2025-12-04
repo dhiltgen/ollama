@@ -7,5 +7,5 @@ type Embedding struct {
 }
 
 func (m *Embedding) Forward(ctx ml.Context, hiddenState ml.Tensor) ml.Tensor {
-	return m.Weight.Rows(ctx, hiddenState)
+	return m.Weight.TakeAxes(ctx, hiddenState, 0)
 }

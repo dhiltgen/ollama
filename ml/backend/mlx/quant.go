@@ -285,6 +285,7 @@ func gguf_load_quantized(data unsafe.Pointer, name string, final_shape []C.int, 
 		biases,
 		32, // group size
 		bits,
+		nil, // TODO mode
 		stream,
 	)
 	C.mlx_array_free(weights)

@@ -118,11 +118,11 @@ func (c *EncoderCache) Put(ctx ml.Context, key, value ml.Tensor) {
 	}
 
 	if c.config.PermutedV {
-		value = value.Permute(ctx, 1, 2, 0, 3)
+		value = value.Transpose(ctx, 1, 2, 0, 3)
 	}
 
 	if _, ok := c.ctxs[c.curLayer]; !ok {
-		c.ctxs[c.curLayer] = c.backend.NewContextSize(2).Layer(c.curLayer)
+		c.ctxs[c.curLayer] = c.backend.NewContext().Layer(c.curLayer)
 	}
 
 	if _, ok := c.keys[c.curLayer]; !ok {

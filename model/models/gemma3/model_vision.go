@@ -90,9 +90,9 @@ func (m *VisionModel) Forward(ctx ml.Context, pixelValues ml.Tensor) ml.Tensor {
 
 	hiddenState := m.PatchEmbedding.Forward(ctx, pixelValues, m.patchSize, m.patchSize, 0, 0, 1, 1)
 	hiddenState = hiddenState.Reshape(ctx, numPatches, m.hiddenSize)
-	hiddenState = hiddenState.Permute(ctx, 1, 0, 2, 3).Contiguous(ctx)
+	hiddenState = hiddenState.Transpose(ctx, 1, 0, 2, 3).Contiguous(ctx, false)
 
-	positionIDs := ctx.Arange(0, float32(numPatches), 1, ml.DTypeI32)
+	positionIDs := ctx.Arange(0, float32(numPatches), 1, ml.DTypeInt32)
 	hiddenState = hiddenState.Add(ctx, m.PositionEmbedding.Forward(ctx, positionIDs))
 
 	for _, layer := range m.Layers {
