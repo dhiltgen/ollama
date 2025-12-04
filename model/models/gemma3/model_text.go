@@ -1,8 +1,10 @@
 package gemma3
 
 import (
+	"fmt"
 	"log/slog"
 	"math"
+	"os"
 
 	"github.com/ollama/ollama/fs"
 	"github.com/ollama/ollama/kvcache"
@@ -225,8 +227,14 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	// In the final layer (outputs != nil), optimize by pruning to just the token positions
 	// we need logits for.
 	if outputs != nil {
-		hiddenState = hiddenState.TakeAxes(ctx, outputs, 0)
-		residual = residual.TakeAxes(ctx, outputs, 0)
+		slog.Info("Before TakeAxes", "hiddenState", hiddenState)
+		slog.Info("Before TakeAxes", "residual", residual)
+		slog.Info("Before TakeAxes", "outputs", outputs)
+		hiddenState = hiddenState.TakeAxes(ctx, outputs, 1)
+		residual = residual.TakeAxes(ctx, outputs, 1)
+		slog.Info("after TakeAxes", "hiddenState", hiddenState)
+		slog.Info("after TakeAxes", "residual", residual)
+		// panic("XXX")
 	}
 
 	hiddenState = hiddenState.Add(ctx, residual)
@@ -307,6 +315,17 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 		// panic("after first layer")
 	}
 
+	slog.Info("XXX before OutputNorm.Forward", "hiddenState", hiddenState)
+	fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	hiddenState = m.OutputNorm.Forward(ctx, hiddenState, m.eps)
+	slog.Info("XXX after OutputNorm.Forward", "hiddenState", hiddenState)
+	fmt.Fprintln(os.Stderr, hiddenState.ToString())
+
+	out := hiddenState.Matmul(ctx, m.TokenEmbedding.Weight.Transpose(ctx))
+	slog.Info("XXX after as_linear equivalent", "hiddenState", out)
+	fmt.Fprintln(os.Stderr, out.ToString())
+
+	// panic("after forward pass")
+
 	return hiddenState
 }

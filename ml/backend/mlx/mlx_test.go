@@ -5,13 +5,18 @@ import (
 	"log/slog"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/ollama/ollama/api"
 	fsggml "github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
+	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
 	"github.com/ollama/ollama/model/models/gemma3"
+	"github.com/ollama/ollama/runner/common"
+	"github.com/ollama/ollama/sample"
 )
 
 func TestLoadModel(t *testing.T) {
@@ -124,6 +129,20 @@ func TestMatmul(t *testing.T) {
 	}
 }
 
+func TestRows(t *testing.T) {
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	t1 := c.Arange(0, 12, 1, ml.DTypeFloat32).Reshape(c, 1, 4, 3)
+	outputs := c.Zeros(ml.DTypeInt32, 1)
+	t2 := t1.TakeAxes(c, outputs, 1)
+	c.Forward(t1, t2).Compute(t1, t2)
+	t.Log(t1.ToString())
+	t.Log(t2.ToString())
+	f := t2.Floats()
+	t.Logf("Result: %v", f)
+}
+
 // TODO test case on RMSNorm and LayerNorm, RoPE, ScaledDotProductAttention, Take
 
 func TestGemma3(t *testing.T) {
@@ -144,7 +163,7 @@ func TestGemma3(t *testing.T) {
 		t.Fatalf("unable to decode: %s", err)
 	}
 
-	model, err := gemma3.New(meta.KV())
+	m, err := gemma3.New(meta.KV())
 	if err != nil {
 		t.Fatalf("unable to load model: %s", err)
 	}
@@ -157,7 +176,7 @@ func TestGemma3(t *testing.T) {
 	}
 
 	// More hacks...
-	g3 := model.(*gemma3.Model)
+	g3 := m.(*gemma3.Model)
 	if g3.TextModel == nil {
 		t.Fatal("nil text model")
 	}
@@ -226,6 +245,7 @@ func TestGemma3(t *testing.T) {
 		Inputs:    ctx.FromInts(inputs[:], 1, len(inputs)),
 		Positions: make([]int32, len(inputs)),
 		Sequences: make([]int, len(inputs)),
+		Outputs:   ctx.Zeros(ml.DTypeInt32, 1),
 	}
 	for i := range len(inputs) {
 		batch.Positions[i] = int32(i)
@@ -242,14 +262,59 @@ func TestGemma3(t *testing.T) {
 			t.Fatalf("failed cache.StartForward: %s", err)
 		}
 	}
+	opts := api.DefaultOptions()
+	var grammar *sample.GrammarSampler
+	sampler := sample.NewSampler(
+		opts.Temperature,
+		opts.TopK,
+		opts.TopP,
+		opts.MinP,
+		opts.Seed,
+		grammar,
+	)
 
-	out, err := g3.Forward(ctx, batch)
-	if err != nil {
-		t.Fatalf("failed forward pass: %s", err)
+	t.Log("Starting Forward pass loop")
+	pendingResponses := []string{}
+	for {
+		out, err := g3.Forward(ctx, batch)
+		if err != nil {
+			t.Fatalf("failed forward pass: %s", err)
+		}
+		ctx.Forward(out)
+		outputs := out.Floats()
+		t.Logf("finished forward pass!  length:%d", len(outputs))
+		// sample a token
+		// vocabSize := len(outputs) / batch.Outputs.Dim(0)
+
+		logits := outputs // TODO subset?
+		token, err := sampler.Sample(logits)
+		if err != nil {
+			t.Fatalf("unable to sample token: %s", err)
+		}
+		t.Logf("Sampled token: %v", token)
+		if m.(model.TextProcessor).Is(token, model.SpecialEOS) {
+			t.Log("hit EOS")
+			break
+		}
+		piece, err := m.(model.TextProcessor).Decode([]int32{token})
+		if err != nil {
+			t.Fatalf("unable to decode token: %s", err)
+		}
+
+		pendingResponses = append(pendingResponses, piece)
+		sequence := strings.Join(pendingResponses, "")
+		if ok, stop := common.FindStop(sequence, opts.Stop); ok {
+			t.Logf("hit stop token: %v", stop)
+			break
+		}
+		t.Logf("Decoded piece: %s", sequence)
+		batch = input.Batch{
+			Inputs:    ctx.FromInts([]int32{token}, 1, 1),
+			Positions: make([]int32, 1),
+			Sequences: make([]int, 1),
+			Outputs:   ctx.Zeros(ml.DTypeInt32, 1),
+		}
+		batch.Positions[0] = 0
 	}
-	t.Log("finished forward pass!")
-	ctx.Forward(out)
-	tokens := out.Floats()
-	t.Logf("Output: %v", tokens[:100])
 
 }
