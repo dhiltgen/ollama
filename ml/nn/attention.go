@@ -3,6 +3,7 @@ package nn
 import (
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
@@ -65,7 +66,7 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "v", value)
 	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask) // WRONG - shape is good, but all -inf values
 
-	// fmt.Fprintln(os.Stderr, mask.ToString())
+	fmt.Fprintln(os.Stderr, key.ToString())
 	// panic("Just before ScaledDotProductAttention")
 
 	// TODO - something's wrong here...  probably mask, but rule out the others first...

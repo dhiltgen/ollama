@@ -149,7 +149,7 @@ func TestGemma3(t *testing.T) {
 	// Hacky frankenstein partially GGUF partially safetensors...
 
 	// Why is the sky blue
-	inputs := [512]int32{2, 105, 2364, 107, 36425, 563, 506, 7217, 3730, 106, 107, 105, 4368}
+	inputs := []int32{2, 105, 2364, 107, 36425, 563, 506, 7217, 3730, 106, 107, 105, 4368}
 
 	modelPath := "/Users/daniel/.ollama/models/blobs/sha256-2e1715faf889527461e76d271e827bbe03f3d22b4b86acf6146671d72eb6d11d"
 	r, err := os.Open(modelPath)
@@ -307,7 +307,7 @@ func TestGemma3(t *testing.T) {
 			t.Logf("hit stop token: %v", stop)
 			break
 		}
-		t.Logf("Decoded piece: %s", sequence)
+		t.Logf("RESULTS: %s", sequence)
 		batch = input.Batch{
 			Inputs:    ctx.FromInts([]int32{token}, 1, 1),
 			Positions: make([]int32, 1),
@@ -315,6 +315,11 @@ func TestGemma3(t *testing.T) {
 			Outputs:   ctx.Zeros(ml.DTypeInt32, 1),
 		}
 		batch.Positions[0] = 0
+		err = cache.StartForward(ctx, batch, true)
+		if err != nil {
+			t.Fatalf("failed cache.StartForward: %s", err)
+		}
+
 	}
 
 }

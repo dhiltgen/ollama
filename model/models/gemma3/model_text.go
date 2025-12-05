@@ -108,6 +108,12 @@ type TextSelfAttention struct {
 }
 
 func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, positionIDs ml.Tensor, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
+	ctx.CompareWith("/tmp/test", hiddenState, true)
+	fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	panic("input to self attention") // CORRECT UP TO HERE...
+
+	// TODO Start working through the model and compare op by op to find where it goes bad
+
 	B := hiddenState.Dim(0)
 	L := hiddenState.Dim(1)
 	slog.Info("XXX start of Forward", "B", B, "L", L, "hiddenState", hiddenState)
@@ -219,7 +225,7 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	// panic("after attention norm") // CORRECT
 	hiddenState = l.SelfAttention.Forward(ctx, layer, hiddenState, positionIDs, cache, opts)
-	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	// panic("after self attention")
 
 	hiddenState = l.PostAttentionNorm.Forward(ctx, hiddenState, opts.eps)
@@ -227,13 +233,13 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	// In the final layer (outputs != nil), optimize by pruning to just the token positions
 	// we need logits for.
 	if outputs != nil {
-		slog.Info("Before TakeAxes", "hiddenState", hiddenState)
-		slog.Info("Before TakeAxes", "residual", residual)
-		slog.Info("Before TakeAxes", "outputs", outputs)
+		// slog.Info("Before TakeAxes", "hiddenState", hiddenState)
+		// slog.Info("Before TakeAxes", "residual", residual)
+		// slog.Info("Before TakeAxes", "outputs", outputs)
 		hiddenState = hiddenState.TakeAxes(ctx, outputs, 1)
 		residual = residual.TakeAxes(ctx, outputs, 1)
-		slog.Info("after TakeAxes", "hiddenState", hiddenState)
-		slog.Info("after TakeAxes", "residual", residual)
+		// slog.Info("after TakeAxes", "hiddenState", hiddenState)
+		// slog.Info("after TakeAxes", "residual", residual)
 		// panic("XXX")
 	}
 
@@ -291,6 +297,8 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 	for i, layer := range m.Layers {
 		// gemma alternates between the sliding window (local) and causal (global)
 		// kv cache every 6 layers
+		// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+		// panic("before first layer") // CORRECT
 		if cache != nil {
 			cacheType := cacheTypeSWA
 			if (i+1)%gemmaGlobalCacheCount == 0 {
@@ -311,8 +319,8 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 		}
 
 		hiddenState = layer.Forward(ctx, i, hiddenState, positions, lastLayerOutputs, cache, m.TextConfig)
-		// fmt.Fprintln(os.Stderr, hiddenState.ToString())
-		// panic("after first layer")
+		fmt.Fprintln(os.Stderr, hiddenState.ToString())
+		// panic("after first layer") // WRONG
 	}
 
 	slog.Info("XXX before OutputNorm.Forward", "hiddenState", hiddenState)

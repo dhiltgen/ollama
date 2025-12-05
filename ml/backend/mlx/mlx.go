@@ -25,8 +25,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -234,6 +236,152 @@ func (c *Context) RandomNormal(shape []int, dtype ml.DType, loc, scale float32, 
 		c.stream,
 	)
 	return newArray(c, r)
+}
+
+func (c *Context) CompareWith(filepath string, a ml.Tensor, abortOnError bool) (err error) {
+	var t *Array
+	defer func() {
+		if err != nil {
+			if t != nil {
+				fmt.Fprintln(os.Stderr, "tensor from file\n"+t.ToString())
+
+			}
+			fmt.Fprintln(os.Stderr, "input tensor\n"+a.ToString())
+		}
+		if abortOnError {
+			if err != nil {
+				panic(fmt.Sprintf("%s", err))
+			}
+		}
+	}()
+	if _, err = os.Stat(filepath); err != nil {
+		filepath += ".safetensors"
+		if _, err = os.Stat(filepath); err != nil {
+			err = fmt.Errorf("failed to stat %s: %w", filepath, err)
+			return
+		}
+		err = nil
+	}
+	// slog.Info("Loading tensors from", "filename", filepath)
+	cFilename := C.CString(filepath)
+	defer C.free(unsafe.Pointer(cFilename))
+	data := C.mlx_map_string_to_array_new() // TODO is this needed or just var it?
+	metadata := C.mlx_map_string_to_string_new()
+	defer C.mlx_map_string_to_array_free(data)
+	defer C.mlx_map_string_to_string_free(metadata)
+
+	stream := C.mlx_default_cpu_stream_new()
+
+	if C.mlx_load_safetensors(&data, &metadata, cFilename, stream) != 0 {
+		// TODO with the current error handling, this will never happen
+		err = fmt.Errorf("load failed")
+		return
+	}
+
+	it := C.mlx_map_string_to_array_iterator_new(data)
+
+	// TODO handle multiple tensors?  Ideally some mechanism to dump out a whole graph and compare
+
+	for {
+		var key *C.cchar_t
+		var value C.mlx_array
+		defer C.mlx_array_free(value)
+		if C.mlx_map_string_to_array_iterator_next(&key, &value, it) != 0 {
+			break
+		}
+		k := C.GoString((*C.char)(key))
+		var r C.mlx_array
+		defer C.mlx_array_free(r)
+		C.mlx_astype(
+			&r,
+			value,
+			C.MLX_FLOAT32,
+			stream,
+		)
+
+		t = &Array{
+			name: k,
+			a:    r,
+		}
+		// slog.Info("XXX read", "tensor", t, "type", t.TypeString())
+		if !reflect.DeepEqual(a.Shape(), t.Shape()) {
+			err = fmt.Errorf("mismatched shapes:  file: %v vs. input %v", t.Shape(), a.Shape())
+			return
+		}
+		// slog.Info("XXX shapes match", "shape", t.Shape())
+		c.Forward(a, t)
+		// TODO handle int types...
+
+		af := a.Floats()
+		tf := t.Floats()
+		cos := cosineSimilarity(af, tf)
+		if cos < 0.99 {
+			err = fmt.Errorf("mismatched shapes:  file: %v vs. input %v", t.Shape(), a.Shape())
+		}
+		slog.Info("XXX tensors are similar")
+
+		err = nil
+
+	}
+	return
+}
+
+func dotProduct[V float32 | float64](v1, v2 []V) V {
+	var result V = 0
+	if len(v1) != len(v2) {
+		return result
+	}
+
+	for i := 0; i < len(v1); i++ {
+		result += v1[i] * v2[i]
+	}
+	return result
+}
+
+func magnitude[V float32 | float64](v []V) V {
+	var result V = 0
+	for _, val := range v {
+		result += val * val
+	}
+	return V(math.Sqrt(float64(result)))
+}
+
+func cosineSimilarity[V float32 | float64](v1, v2 []V) V {
+	mag1 := magnitude(v1)
+	mag2 := magnitude(v2)
+
+	if mag1 == 0 || mag2 == 0 {
+		return 0
+	}
+
+	return dotProduct(v1, v2) / (magnitude(v1) * magnitude(v2))
+}
+
+func euclideanDistance[V float32 | float64](v1, v2 []V) V {
+	if len(v1) != len(v2) {
+		return V(math.Inf(1))
+	}
+
+	var sum V = 0
+	for i := 0; i < len(v1); i++ {
+		diff := v1[i] - v2[i]
+		sum += diff * diff
+	}
+
+	return V(math.Sqrt(float64(sum)))
+}
+
+func manhattanDistance[V float32 | float64](v1, v2 []V) V {
+	if len(v1) != len(v2) {
+		return V(math.Inf(1))
+	}
+
+	var sum V = 0
+	for i := 0; i < len(v1); i++ {
+		sum += V(math.Abs(float64(v1[i] - v2[i])))
+	}
+
+	return sum
 }
 
 type Array struct {

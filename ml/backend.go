@@ -131,6 +131,10 @@ type Context interface {
 
 	// Layer returns a context appropriate for creating intermediate tensors
 	Layer(int) Context
+
+	// Load a tensor from "filename" safetensors file, and compare with the input tensor
+	// Returns error if the shape is inconsistent, or similarity measures are below 99%
+	CompareWith(filename string, a Tensor, abortOnError bool) error
 }
 
 type RoPEOptions struct {
