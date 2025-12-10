@@ -79,9 +79,9 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 	if cache != nil {
 		key, value, mask = cache.Get(ctx)
 	}
-	slog.Info("XXX after cache get", "key", key)
-	slog.Info("XXX after cache get", "value", value)
-	slog.Info("XXX after cache get", "mask", mask)
+	// slog.Info("XXX after cache get", "key", key)
+	// slog.Info("XXX after cache get", "value", value)
+	// slog.Info("XXX after cache get", "mask", mask)
 	// panic("before sdpa")
 
 	// Only use the fast SDPA implementation if we have a cache, since that's what
@@ -92,26 +92,21 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 	fmt.Fprintln(os.Stderr, key.ToString())
 	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "v", value)
 	fmt.Fprintln(os.Stderr, value.ToString())
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask) // WRONG - shape is good, but all -inf values
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask)
 	fmt.Fprintln(os.Stderr, mask.ToString())
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "scale", scale)
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "sinks", sinks)
 
 	// fmt.Fprintln(os.Stderr, key.ToString())
 	// panic("Just before ScaledDotProductAttention")
-	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query.Contiguous(ctx, false), "k": key.Contiguous(ctx, false), "v": value.Contiguous(ctx, false)}, true) // CORRECT
-	panic("input to self attention")                                                                                                                                //
-
-	// ctx.CompareWith("/tmp/test", key, true) // CORRECT
-	// fmt.Fprintln(os.Stderr, key.ToString())
-	// panic("input to self attention") //
-
-	// ctx.CompareWith("/tmp/test", value, true) // CORRECT
-	// fmt.Fprintln(os.Stderr, value.ToString())
-	// panic("input to self attention") //
-
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query.Contiguous(ctx, false), "k": key.Contiguous(ctx, false), "v": value.Contiguous(ctx, false)}, true)
+	// panic("input to ScaledDotProductAttention") // CORRECT 5-9's similarity
 	if cache != nil {
 		// TODO what to do with vmla?
 		return query.ScaledDotProductAttention(ctx, key, value, scale, "array", []ml.Tensor{mask}, sinks)
 		// return query.ScaledDotProductAttention(ctx, key, value, scale, "causal", []ml.Tensor{}, sinks)
+
+		// TODO these two produce identical output, but not similar enough - 92.9% - should be 99.999%
 	} else {
 		panic("else case not supported")
 		// TODO transpose shapes are wrong

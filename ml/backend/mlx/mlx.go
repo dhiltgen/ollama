@@ -400,6 +400,7 @@ func manhattanDistance[V float32 | float64](v1, v2 []V) V {
 type Array struct {
 	name string
 	a    C.mlx_array
+	c    *Context
 
 	sync func()
 }
@@ -415,6 +416,7 @@ func newArray(ctx *Context, a C.mlx_array) *Array {
 	t := &Array{
 		name: name,
 		a:    a,
+		c:    ctx,
 	}
 	// DEBUG memory allocation problems...
 	// slog.Info("XXX Allocated", "array", t, "a", a)
@@ -591,17 +593,17 @@ func (a *Array) SliceUpdate(ctx ml.Context, update ml.Tensor, start, stop, strid
 		ctx.(*Context).stream,
 	)
 	// Release the old array and replace with the new one to ensure the same underlying buffer is used
-	ctx.(*Context).mu.Lock()
-	defer ctx.(*Context).mu.Unlock()
-	for i := range ctx.(*Context).arrays {
-		if ctx.(*Context).arrays[i] == a.a {
+	a.c.mu.Lock()
+	defer a.c.mu.Unlock()
+	for i := range a.c.arrays {
+		if a.c.arrays[i] == a.a {
 			C.mlx_array_free(a.a)
 			a.a = r
-			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			a.c.arrays = append(a.c.arrays[:i], a.c.arrays[i+1:]...)
 			return a
 		}
 	}
-	panic("unable to locate array in provided context")
+	panic("unable to locate array in context")
 }
 
 func (a *Array) SliceUpdateDynamic(ctx ml.Context, update, start ml.Tensor, axes []int) ml.Tensor {
@@ -621,17 +623,17 @@ func (a *Array) SliceUpdateDynamic(ctx ml.Context, update, start ml.Tensor, axes
 		ctx.(*Context).stream,
 	)
 	// Release the old array and replace with the new one to ensure the same underlying buffer is used
-	ctx.(*Context).mu.Lock()
-	defer ctx.(*Context).mu.Unlock()
-	for i := range ctx.(*Context).arrays {
-		if ctx.(*Context).arrays[i] == a.a {
+	a.c.mu.Lock()
+	defer a.c.mu.Unlock()
+	for i := range a.c.arrays {
+		if a.c.arrays[i] == a.a {
 			C.mlx_array_free(a.a)
 			a.a = r
-			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			a.c.arrays = append(a.c.arrays[:i], a.c.arrays[i+1:]...)
 			return a
 		}
 	}
-	panic("unable to locate array in provided context")
+	panic("unable to locate array in context")
 
 }
 
@@ -646,17 +648,17 @@ func (a *Array) PutAlongAxis(ctx ml.Context, indicies, values ml.Tensor, axis in
 		ctx.(*Context).stream,
 	)
 	// Release the old array and replace with the new one to ensure the same underlying buffer is used
-	ctx.(*Context).mu.Lock()
-	defer ctx.(*Context).mu.Unlock()
-	for i := range ctx.(*Context).arrays {
-		if ctx.(*Context).arrays[i] == a.a {
+	a.c.mu.Lock()
+	defer a.c.mu.Unlock()
+	for i := range a.c.arrays {
+		if a.c.arrays[i] == a.a {
 			C.mlx_array_free(a.a)
 			a.a = r
-			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			a.c.arrays = append(a.c.arrays[:i], a.c.arrays[i+1:]...)
 			return a
 		}
 	}
-	panic("unable to locate array in provided context")
+	panic("unable to locate array in context")
 }
 
 func (a *Array) Scatter(ctx ml.Context, indicies []ml.Tensor, updates ml.Tensor, axes []int) ml.Tensor {
@@ -686,17 +688,17 @@ func (a *Array) Scatter(ctx ml.Context, indicies []ml.Tensor, updates ml.Tensor,
 		ctx.(*Context).stream,
 	)
 	// Release the old array and replace with the new one to ensure the same underlying buffer is used
-	ctx.(*Context).mu.Lock()
-	defer ctx.(*Context).mu.Unlock()
-	for i := range ctx.(*Context).arrays {
-		if ctx.(*Context).arrays[i] == a.a {
+	a.c.mu.Lock()
+	defer a.c.mu.Unlock()
+	for i := range a.c.arrays {
+		if a.c.arrays[i] == a.a {
 			C.mlx_array_free(a.a)
 			a.a = r
-			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			a.c.arrays = append(a.c.arrays[:i], a.c.arrays[i+1:]...)
 			return a
 		}
 	}
-	panic("unable to locate array in provided context")
+	panic("unable to locate array in context")
 
 }
 

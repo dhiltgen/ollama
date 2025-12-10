@@ -160,12 +160,12 @@ func TestCaching(t *testing.T) {
 		stop *= float32(x)
 	}
 	// Create the cache
-	cache := c.Zeros(ml.DTypeFloat32, cells, cellSize)
+	cache := c.Zeros(ml.DTypeBfloat16, cells, cellSize)
 	t.Logf("Empty Cache shape%v\n"+cache.ToString(), []int{cells, cellSize})
 
 	// Input tensor
-	t1 := c.Arange(0, stop, 1, ml.DTypeFloat32).Reshape(c, shape...)
-	// t.Logf("Initial Data shape%v\n"+t1.ToString(), shape)
+	t1 := c.Arange(0, stop, 1, ml.DTypeBfloat16).Reshape(c, shape...)
+	t.Logf("Initial Data shape%v\n"+t1.ToString(), shape)
 
 	// Reshape to copy into the cache
 	/*
@@ -178,15 +178,13 @@ func TestCaching(t *testing.T) {
 		up = reshape(up, up_shape);
 	*/
 	numRows := 3
-	up := t1.Reshape(c, numRows, 1, cellSize)
+	up := t1.Reshape(c, numRows, 1, cellSize) // The shape has to look like this for scatter to work properly
 	t.Logf("Data reshaped for cache input shape%v\n"+up.ToString(), []int{batchSize, numKVHeads * headDim})
 
 	// Simulate cells 1,3,5 are available
 	indicies := []ml.Tensor{c.FromInts([]int32{1, 3, 5}, numRows)}
 	t.Logf("Indicies shape%v\n"+indicies[0].ToString(), []int{numRows})
-
-	axis := []int{0}
-
+	axis := []int{0} // The 1,3,5 of the indicies are in reference to axis 0 in the cache shape
 	cache.Scatter(c, indicies, up, axis)
 
 	c.Forward(cache)
@@ -194,8 +192,8 @@ func TestCaching(t *testing.T) {
 	t.Log("Cache after put\n" + cache.ToString())
 
 	// Retrieve cache content and verify it matches
-	out := cache.TakeAxes(c, indicies[0], 0)
-	t.Log("Output\n" + out.ToString())
+	out := cache.TakeAxes(c, indicies[0], 0).Reshape(c, shape...)
+	t.Logf("Output shape%v\n"+out.ToString(), out.Shape())
 
 	t1f := t1.Floats()
 	outf := out.Floats()
@@ -317,7 +315,7 @@ func TestGemma3(t *testing.T) {
 		numSlots := 1
 		batchSize := 512
 		numCtx := 4096
-		cache.Init(b, ml.DTypeFloat16, numSlots, int(numCtx), batchSize)
+		cache.Init(b, ml.DTypeBfloat16, numSlots, int(numCtx), batchSize)
 		err := cache.StartForward(ctx, batch, false)
 		if err != nil {
 			t.Fatalf("failed cache.StartForward: %s", err)

@@ -199,8 +199,8 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// panic("before QKV Attention")
 
 	kqv := nn.Attention(ctx, q, k, v, scaleFactor, cache)
-	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"kqv": kqv}, true) //
-	panic("output from self attention")                                  //
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"kqv": kqv}, true) //
+	// panic("output from self attention")                                  // drifting - 92.9
 
 	// ctx.CompareWith("/tmp/test", kqv, true) //
 	// fmt.Fprintln(os.Stderr, kqv.ToString())
@@ -212,6 +212,9 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	kqv = kqv.Transpose(ctx, 0, 2, 1, 3).Reshape(ctx, B, L, -1)
 
 	t := sa.Output.Forward(ctx, kqv)
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": t}, true) //
+	// panic("output from self attention")                              // drifting - 98
+
 	// fmt.Fprintln(os.Stderr, t.ToString())
 	// panic("final output") // WRONG! nan's
 	return t
@@ -233,6 +236,9 @@ type TextMLP struct {
 }
 
 func (mlp *TextMLP) Forward(ctx ml.Context, hiddenState ml.Tensor, opts *TextConfig) ml.Tensor {
+	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
+	panic("after post attention norm")                                         // WRONG 3%
+
 	hiddenState = mlp.Gate.Forward(ctx, hiddenState).GELU(ctx, mlp.Up.Forward(ctx, hiddenState))
 	return mlp.Down.Forward(ctx, hiddenState)
 }
@@ -257,10 +263,15 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	// panic("after attention norm") // CORRECT
 	hiddenState = l.SelfAttention.Forward(ctx, layer, hiddenState, positionIDs, cache, opts)
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
+	// panic("output from self attention")                                        // drifting - 98
+
 	fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	// panic("after self attention")
 
 	hiddenState = l.PostAttentionNorm.Forward(ctx, hiddenState, opts.eps)
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
+	// panic("after post attention norm")                                         // OK - 99.8
 
 	// In the final layer (outputs != nil), optimize by pruning to just the token positions
 	// we need logits for.
@@ -277,11 +288,23 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 
 	hiddenState = hiddenState.Add(ctx, residual)
 	residual = hiddenState
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
+	// panic("after post attention norm")                                         // WRONG - 99.8%
 
+	slog.Info("XXX", "eps", opts.eps)
 	hiddenState = l.MLPNorm.Forward(ctx, hiddenState, opts.eps)
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
+	// panic("after post attention norm")                                         // drifting 97.2%
+
 	hiddenState = l.MLP.Forward(ctx, hiddenState, opts)
+	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
+	panic("after post attention norm")                                         // WRONG 3%
 	hiddenState = l.PostMLPNorm.Forward(ctx, hiddenState, opts.eps)
-	return hiddenState.Add(ctx, residual)
+	x := hiddenState.Add(ctx, residual)
+	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": x}, true) //
+	panic("after post attention norm")                               // WRONG - 63%
+
+	return x
 }
 
 func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cache) ml.Tensor {
