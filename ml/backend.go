@@ -134,7 +134,7 @@ type Context interface {
 
 	// Load a tensor from "filename" safetensors file, and compare with the input tensor
 	// Returns error if the shape is inconsistent, or similarity measures are below 99%
-	CompareWith(filename string, a Tensor, abortOnError bool) error
+	CompareWith(filename string, tensors map[string]Tensor, abortOnError bool) error
 }
 
 type RoPEOptions struct {
@@ -224,7 +224,14 @@ type Tensor interface {
 	// Repeat(ctx Context, dim, n int) Tensor
 	// Concat(ctx Context, t2 Tensor, dim int) Tensor
 	// Rows(ctx Context, t2 Tensor) Tensor
-	SliceUpdate(ctx Context, update Tensor, start, stop, strides []int) Tensor
+
+	// TODO these probably aren't actually needed - false starts on trying to wire up cache
+	// SliceUpdate(ctx Context, update Tensor, start, stop, strides []int) Tensor
+	// SliceUpdateDynamic(ctx Context, update, start Tensor, axes []int) Tensor
+	// PutAlongAxis(ctx Context, indicies, values Tensor, axis int) Tensor
+
+	Scatter(ctx Context, indicies []Tensor, updates Tensor, axes []int) Tensor
+
 	Copy(ctx Context, t2 Tensor) Tensor
 	// Duplicate(ctx Context) Tensor
 

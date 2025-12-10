@@ -143,6 +143,67 @@ func TestRows(t *testing.T) {
 	t.Logf("Result: %v", f)
 }
 
+func TestCaching(t *testing.T) {
+	// Validate the caching algorithm
+	b := &Backend{}
+	c := b.NewContext()
+	defer c.Close()
+	batchSize := 3
+	headDim := 4
+	numKVHeads := 2
+	// Make cache twice the size of one test batch
+	cells := batchSize * 2
+	cellSize := numKVHeads * headDim
+	shape := []int{1, numKVHeads, batchSize, headDim}
+	stop := float32(1)
+	for _, x := range shape {
+		stop *= float32(x)
+	}
+	// Create the cache
+	cache := c.Zeros(ml.DTypeFloat32, cells, cellSize)
+	t.Logf("Empty Cache shape%v\n"+cache.ToString(), []int{cells, cellSize})
+
+	// Input tensor
+	t1 := c.Arange(0, stop, 1, ml.DTypeFloat32).Reshape(c, shape...)
+	// t.Logf("Initial Data shape%v\n"+t1.ToString(), shape)
+
+	// Reshape to copy into the cache
+	/*
+		From MLX python/src/indexing.cpp mlx_scatter_args_array
+		// The update shape must broadcast with indices.shape + [1] + src.shape[1:]
+		auto up_shape = indices.shape();
+		up_shape.insert(up_shape.end(), src.shape().begin() + 1, src.shape().end());
+		up = broadcast_to(up, up_shape);
+		up_shape.insert(up_shape.begin() + indices.ndim(), 1);
+		up = reshape(up, up_shape);
+	*/
+	numRows := 3
+	up := t1.Reshape(c, numRows, 1, cellSize)
+	t.Logf("Data reshaped for cache input shape%v\n"+up.ToString(), []int{batchSize, numKVHeads * headDim})
+
+	// Simulate cells 1,3,5 are available
+	indicies := []ml.Tensor{c.FromInts([]int32{1, 3, 5}, numRows)}
+	t.Logf("Indicies shape%v\n"+indicies[0].ToString(), []int{numRows})
+
+	axis := []int{0}
+
+	cache.Scatter(c, indicies, up, axis)
+
+	c.Forward(cache)
+	// Cache should contain the data now
+	t.Log("Cache after put\n" + cache.ToString())
+
+	// Retrieve cache content and verify it matches
+	out := cache.TakeAxes(c, indicies[0], 0)
+	t.Log("Output\n" + out.ToString())
+
+	t1f := t1.Floats()
+	outf := out.Floats()
+	if !reflect.DeepEqual(t1f, outf) {
+		t.Fatalf("mismatched in->out\n%v\n ->\n%v", t1f, outf)
+	}
+}
+
 // TODO test case on RMSNorm and LayerNorm, RoPE, ScaledDotProductAttention, Take
 
 func TestGemma3(t *testing.T) {
@@ -257,7 +318,7 @@ func TestGemma3(t *testing.T) {
 		batchSize := 512
 		numCtx := 4096
 		cache.Init(b, ml.DTypeFloat16, numSlots, int(numCtx), batchSize)
-		err := cache.StartForward(ctx, batch, true)
+		err := cache.StartForward(ctx, batch, false)
 		if err != nil {
 			t.Fatalf("failed cache.StartForward: %s", err)
 		}
@@ -315,7 +376,7 @@ func TestGemma3(t *testing.T) {
 			Outputs:   ctx.Zeros(ml.DTypeInt32, 1),
 		}
 		batch.Positions[0] = 0
-		err = cache.StartForward(ctx, batch, true)
+		err = cache.StartForward(ctx, batch, false)
 		if err != nil {
 			t.Fatalf("failed cache.StartForward: %s", err)
 		}

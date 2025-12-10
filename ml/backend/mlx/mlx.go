@@ -238,15 +238,18 @@ func (c *Context) RandomNormal(shape []int, dtype ml.DType, loc, scale float32, 
 	return newArray(c, r)
 }
 
-func (c *Context) CompareWith(filepath string, a ml.Tensor, abortOnError bool) (err error) {
-	var t *Array
+func (c *Context) CompareWith(filepath string, tensors map[string]ml.Tensor, abortOnError bool) (err error) {
+	fileTensors := map[string]*Array{}
 	defer func() {
 		if err != nil {
-			if t != nil {
-				fmt.Fprintln(os.Stderr, "tensor from file\n"+t.ToString())
-
+			for k, v := range tensors {
+				fmt.Fprintln(os.Stderr, "input tensor "+k+"\n"+v.ToString())
+				if fv, ok := fileTensors[k]; ok {
+					fmt.Fprintln(os.Stderr, " file tensor "+k+"\n"+fv.ToString())
+				} else {
+					fmt.Fprintln(os.Stderr, " file tensor "+k+" missing!\n")
+				}
 			}
-			fmt.Fprintln(os.Stderr, "input tensor\n"+a.ToString())
 		}
 		if abortOnError {
 			if err != nil {
@@ -279,8 +282,10 @@ func (c *Context) CompareWith(filepath string, a ml.Tensor, abortOnError bool) (
 	}
 
 	it := C.mlx_map_string_to_array_iterator_new(data)
-
-	// TODO handle multiple tensors?  Ideally some mechanism to dump out a whole graph and compare
+	allTensors := []ml.Tensor{}
+	for _, t := range tensors {
+		allTensors = append(allTensors, t)
+	}
 
 	for {
 		var key *C.cchar_t
@@ -299,30 +304,38 @@ func (c *Context) CompareWith(filepath string, a ml.Tensor, abortOnError bool) (
 			stream,
 		)
 
-		t = &Array{
+		fileTensors[k] = &Array{
 			name: k,
 			a:    r,
 		}
 		// slog.Info("XXX read", "tensor", t, "type", t.TypeString())
+		allTensors = append(allTensors, fileTensors[k])
+	}
+	c.Forward(allTensors...)
+	for k, t := range tensors {
+		a, ok := fileTensors[k]
+		if !ok {
+			err = fmt.Errorf("tensor named %s not found in file", k)
+			return
+		}
 		if !reflect.DeepEqual(a.Shape(), t.Shape()) {
 			err = fmt.Errorf("mismatched shapes:  file: %v vs. input %v", t.Shape(), a.Shape())
 			return
 		}
 		// slog.Info("XXX shapes match", "shape", t.Shape())
-		c.Forward(a, t)
 		// TODO handle int types...
 
 		af := a.Floats()
 		tf := t.Floats()
 		cos := cosineSimilarity(af, tf)
 		if cos < 0.99 {
-			err = fmt.Errorf("mismatched shapes:  file: %v vs. input %v", t.Shape(), a.Shape())
+			err = fmt.Errorf("%s shapes match, but not similar enough:  %v", k, cos)
+			return
 		}
-		slog.Info("XXX tensors are similar")
-
-		err = nil
-
+		slog.Info("XXX tensors are similar", k, cos)
 	}
+	err = nil
+
 	return
 }
 
@@ -403,6 +416,8 @@ func newArray(ctx *Context, a C.mlx_array) *Array {
 		name: name,
 		a:    a,
 	}
+	// DEBUG memory allocation problems...
+	// slog.Info("XXX Allocated", "array", t, "a", a)
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	ctx.arrays = append(ctx.arrays, a)
@@ -576,9 +591,113 @@ func (a *Array) SliceUpdate(ctx ml.Context, update ml.Tensor, start, stop, strid
 		ctx.(*Context).stream,
 	)
 	// Release the old array and replace with the new one to ensure the same underlying buffer is used
-	C.mlx_array_free(a.a)
-	a.a = r
-	return a
+	ctx.(*Context).mu.Lock()
+	defer ctx.(*Context).mu.Unlock()
+	for i := range ctx.(*Context).arrays {
+		if ctx.(*Context).arrays[i] == a.a {
+			C.mlx_array_free(a.a)
+			a.a = r
+			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			return a
+		}
+	}
+	panic("unable to locate array in provided context")
+}
+
+func (a *Array) SliceUpdateDynamic(ctx ml.Context, update, start ml.Tensor, axes []int) ml.Tensor {
+	cAxes := make([]C.int, len(axes))
+	for i := range axes {
+		cAxes[i] = C.int(axes[i])
+	}
+
+	var r C.mlx_array
+	C.mlx_slice_update_dynamic(
+		&r,
+		a.a,
+		update.(*Array).a,
+		start.(*Array).a,
+		(*C.int)(unsafe.Pointer(&cAxes[0])),
+		C.size_t(len(cAxes)),
+		ctx.(*Context).stream,
+	)
+	// Release the old array and replace with the new one to ensure the same underlying buffer is used
+	ctx.(*Context).mu.Lock()
+	defer ctx.(*Context).mu.Unlock()
+	for i := range ctx.(*Context).arrays {
+		if ctx.(*Context).arrays[i] == a.a {
+			C.mlx_array_free(a.a)
+			a.a = r
+			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			return a
+		}
+	}
+	panic("unable to locate array in provided context")
+
+}
+
+func (a *Array) PutAlongAxis(ctx ml.Context, indicies, values ml.Tensor, axis int) ml.Tensor {
+	var r C.mlx_array
+	C.mlx_put_along_axis(
+		&r,
+		a.a,
+		indicies.(*Array).a,
+		values.(*Array).a,
+		C.int(axis),
+		ctx.(*Context).stream,
+	)
+	// Release the old array and replace with the new one to ensure the same underlying buffer is used
+	ctx.(*Context).mu.Lock()
+	defer ctx.(*Context).mu.Unlock()
+	for i := range ctx.(*Context).arrays {
+		if ctx.(*Context).arrays[i] == a.a {
+			C.mlx_array_free(a.a)
+			a.a = r
+			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			return a
+		}
+	}
+	panic("unable to locate array in provided context")
+}
+
+func (a *Array) Scatter(ctx ml.Context, indicies []ml.Tensor, updates ml.Tensor, axes []int) ml.Tensor {
+
+	cAxes := make([]C.int, len(axes))
+	for i := range axes {
+		cAxes[i] = C.int(axes[i])
+	}
+	var cAxes0 *C.int
+	if len(cAxes) > 0 {
+		cAxes0 = (*C.int)(unsafe.Pointer(&cAxes[0]))
+	}
+	indiciesVec := C.mlx_vector_array_new()
+	defer C.mlx_vector_array_free(indiciesVec)
+	for _, ind := range indicies {
+		C.mlx_vector_array_append_value(indiciesVec, ind.(*Array).a)
+	}
+
+	var r C.mlx_array
+	C.mlx_scatter(
+		&r,
+		a.a,
+		indiciesVec,
+		updates.(*Array).a,
+		cAxes0,
+		C.size_t(len(cAxes)),
+		ctx.(*Context).stream,
+	)
+	// Release the old array and replace with the new one to ensure the same underlying buffer is used
+	ctx.(*Context).mu.Lock()
+	defer ctx.(*Context).mu.Unlock()
+	for i := range ctx.(*Context).arrays {
+		if ctx.(*Context).arrays[i] == a.a {
+			C.mlx_array_free(a.a)
+			a.a = r
+			ctx.(*Context).arrays = append(ctx.(*Context).arrays[:i], ctx.(*Context).arrays[i+1:]...)
+			return a
+		}
+	}
+	panic("unable to locate array in provided context")
+
 }
 
 func (a *Array) Copy(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
@@ -867,19 +986,27 @@ func (a *Array) AsStrided(ctx ml.Context, shape, strides []int, offset int) ml.T
 	var r C.mlx_array
 	sh := make([]C.int, len(shape))
 	st := make([]C.int64_t, len(strides))
+	var sh0 *C.int
+	var st0 *C.int64_t
 	for i, s := range shape {
 		sh[i] = C.int(s)
 	}
 	for i, s := range strides {
 		st[i] = C.int64_t(s)
 	}
+	if len(sh) > 0 {
+		sh0 = (*C.int)(unsafe.Pointer(&sh[0]))
+	}
+	if len(st) > 0 {
+		st0 = (*C.int64_t)(unsafe.Pointer(&st[0]))
+	}
 
 	C.mlx_as_strided(
 		&r,
 		a.a,
-		(*C.int)(unsafe.Pointer(&sh[0])),
+		sh0,
 		C.size_t(len(sh)),
-		(*C.int64_t)(unsafe.Pointer(&st[0])),
+		st0,
 		C.size_t(len(st)),
 		C.size_t(offset),
 		ctx.(*Context).stream,

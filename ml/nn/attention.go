@@ -32,7 +32,21 @@ func AttentionWithSinks(ctx ml.Context, query, key, value, sinks ml.Tensor, scal
 }
 
 func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla ml.Tensor, scale float64, cache kvcache.Cache) ml.Tensor {
+	// ctx.CompareWith("/tmp/test", query, true) //
+	// fmt.Fprintln(os.Stderr, query.ToString())
+	// panic("input to self attention") //
+	// ctx.CompareWith("/tmp/test", value.Contiguous(ctx, false), true) // requires contiguous, then correct
+	// fmt.Fprintln(os.Stderr, value.ToString())
+	// panic("before forward") //
+
+	slog.Info("XXX Before ScaledDotProductAttention and cache put", "query", query)
+	slog.Info("XXX Before ScaledDotProductAttention and cache put", "key", key)
+	slog.Info("XXX Before ScaledDotProductAttention and cache put", "value", value)
 	ctx.Forward(query)
+	// ctx.CompareWith("/tmp/test", query, true) //
+	// fmt.Fprintln(os.Stderr, query.ToString())
+	// panic("input to self attention") //
+
 	if key != nil && value != nil {
 		if query.Dim(0) != key.Dim(0) {
 			panic(fmt.Errorf("d_k in attention operation does not match between query(%v) and key(%v)", query.Dim(0), key.Dim(0)))
@@ -54,27 +68,52 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 		panic("key & value tensors must be provided if cache is nil")
 	}
 
+	// ctx.CompareWith("/tmp/test", key, true) //
+	// fmt.Fprintln(os.Stderr, key.ToString())
+	// panic("before cache") // CORRECT
+	// ctx.CompareWith("/tmp/test", value, true) //
+	// fmt.Fprintln(os.Stderr, value.ToString())
+	// panic("before cache") //
+
 	var mask ml.Tensor
 	if cache != nil {
 		key, value, mask = cache.Get(ctx)
 	}
+	slog.Info("XXX after cache get", "key", key)
+	slog.Info("XXX after cache get", "value", value)
+	slog.Info("XXX after cache get", "mask", mask)
+	// panic("before sdpa")
 
 	// Only use the fast SDPA implementation if we have a cache, since that's what
 	// will do any expected backend-specific transformations for us
 	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "q", query)
+	fmt.Fprintln(os.Stderr, query.ToString())
 	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "k", key)
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "v", value)
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask) // WRONG - shape is good, but all -inf values
-
 	fmt.Fprintln(os.Stderr, key.ToString())
-	// panic("Just before ScaledDotProductAttention")
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "v", value)
+	fmt.Fprintln(os.Stderr, value.ToString())
+	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask) // WRONG - shape is good, but all -inf values
+	fmt.Fprintln(os.Stderr, mask.ToString())
 
-	// TODO - something's wrong here...  probably mask, but rule out the others first...
+	// fmt.Fprintln(os.Stderr, key.ToString())
+	// panic("Just before ScaledDotProductAttention")
+	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query.Contiguous(ctx, false), "k": key.Contiguous(ctx, false), "v": value.Contiguous(ctx, false)}, true) // CORRECT
+	panic("input to self attention")                                                                                                                                //
+
+	// ctx.CompareWith("/tmp/test", key, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, key.ToString())
+	// panic("input to self attention") //
+
+	// ctx.CompareWith("/tmp/test", value, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, value.ToString())
+	// panic("input to self attention") //
 
 	if cache != nil {
 		// TODO what to do with vmla?
 		return query.ScaledDotProductAttention(ctx, key, value, scale, "array", []ml.Tensor{mask}, sinks)
+		// return query.ScaledDotProductAttention(ctx, key, value, scale, "causal", []ml.Tensor{}, sinks)
 	} else {
+		panic("else case not supported")
 		// TODO transpose shapes are wrong
 		query = query.Transpose(ctx, 0, 2, 1, 3)
 		key = key.Transpose(ctx, 0, 2, 1, 3)

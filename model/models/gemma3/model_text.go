@@ -108,9 +108,6 @@ type TextSelfAttention struct {
 }
 
 func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, positionIDs ml.Tensor, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
-	ctx.CompareWith("/tmp/test", hiddenState, true)
-	fmt.Fprintln(os.Stderr, hiddenState.ToString())
-	panic("input to self attention") // CORRECT UP TO HERE...
 
 	// TODO Start working through the model and compare op by op to find where it goes bad
 
@@ -126,6 +123,10 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// panic("before q forward") // CORRECT
 
 	q := sa.Query.Forward(ctx, hiddenState)
+	// ctx.CompareWith("/tmp/test", q, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, q.ToString())
+	// panic("input to self attention") // CORRECT UP TO HERE...
+
 	// fmt.Fprintf(os.Stderr, q.ToString())
 	// panic("after q forward") // CORRECT
 	// slog.Info("XXX before reshape+transpose", "q", q)
@@ -133,6 +134,10 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	q = q.Reshape(ctx, B, L, opts.numHeads, -1).Transpose(ctx, 0, 2, 1, 3)
 	// slog.Info("XXX after reshape+transpose", "q", q)
 	q = sa.QueryNorm.Forward(ctx, q, opts.eps)
+	// ctx.CompareWith("/tmp/test", q, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, q.ToString())
+	// panic("input to self attention") // CORRECT UP TO HERE...
+
 	// slog.Info("XXX after querynorm", "q", q)
 	traditional := false
 	offset := int(0) // TODO is this right?
@@ -141,6 +146,10 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// panic("before q rope") // CORRECT
 
 	q = q.RoPE(ctx, opts.attnKeyLen, traditional, opts.ropeScale, offset, ml.WithRoPEBase(ropeBase))
+	// ctx.CompareWith("/tmp/test", q, true) //CORRECT
+	// fmt.Fprintln(os.Stderr, q.ToString())
+	// panic("input to self attention") //
+
 	// fmt.Fprintln(os.Stderr, q.ToString())
 	// panic("after q rope") // CORRECT
 
@@ -153,18 +162,34 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 
 	// slog.Info("XXX before Key.Forward", "key", sa.Key.Weight, "hiddenState", hiddenState)
 	k := sa.Key.Forward(ctx, hiddenState)
+	// ctx.CompareWith("/tmp/test", k, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, k.ToString())
+	// panic("input to self attention") // CORRECT
+
 	// slog.Info("XXX after Key.Forward", "key", k)
 	k = k.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3)
 	// slog.Info("XXX after reshape", "key", k, "KeyNorm", sa.KeyNorm.Weight)
 	k = sa.KeyNorm.Forward(ctx, k, opts.eps)
+	// ctx.CompareWith("/tmp/test", k, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, k.ToString())
+	// panic("input to self attention") // CORRECT
+
 	// slog.Info("XXX after KeyNorm.Forward", "key", k)
 	k = k.RoPE(ctx, opts.attnKeyLen, traditional, opts.ropeScale, offset, ml.WithRoPEBase(ropeBase))
+	// ctx.CompareWith("/tmp/test", k, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, k.ToString())
+	// panic("input to self attention") //
+
 	// slog.Info("XXX after RoPE", "key", k)
 	// fmt.Fprintln(os.Stderr, k.ToString())
 	// panic("after k rope") // CORRECT
 
 	v := sa.Value.Forward(ctx, hiddenState)
-	v = v.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3)
+	// ctx.CompareWith("/tmp/test", v, true) // CORRECT
+	// fmt.Fprintln(os.Stderr, v.ToString())
+	// panic("input to self attention")
+
+	v = v.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3).Contiguous(ctx, false)
 
 	scaleFactor := 1.0
 
@@ -174,6 +199,13 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// panic("before QKV Attention")
 
 	kqv := nn.Attention(ctx, q, k, v, scaleFactor, cache)
+	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"kqv": kqv}, true) //
+	panic("output from self attention")                                  //
+
+	// ctx.CompareWith("/tmp/test", kqv, true) //
+	// fmt.Fprintln(os.Stderr, kqv.ToString())
+	// panic("output from self attention") //
+
 	// fmt.Fprintln(os.Stderr, kqv.ToString())
 	// panic("after scaled dot product") // WRONG - all nans
 

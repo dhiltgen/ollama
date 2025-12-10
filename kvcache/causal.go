@@ -394,7 +394,10 @@ func (c *Causal) buildMask(ctx ml.Context) ml.Tensor {
 	length := c.curCellRange.max - c.curCellRange.min + 1
 
 	mask := make([]float32, batchSize*length)
-	slog.Info("XXX Causal.buildMask", "size", len(mask), "shape", []int{1, batchSize, length})
+	// slog.Info("XXX Causal.buildMask", "c.curCellRange.min", c.curCellRange.min, "c.curCellRange.max", c.curCellRange.max, "size", len(mask), "shape", []int{1, batchSize, length}, "c.cells", c.cells)
+	// slog.Info("XXX Causal.buildMask", "except", c.opts.Except)
+	// panic("build mask")
+	maskCount := 0
 
 	for i := range c.curBatchSize {
 		enabled := !slices.Contains(c.opts.Except, i)
@@ -403,11 +406,14 @@ func (c *Causal) buildMask(ctx ml.Context) ml.Tensor {
 				(enabled && c.cells[j].pos > c.curPositions[i]) ||
 				c.chunkSize > 0 && c.cells[j].pos < c.curPositions[i]-c.curPositions[i]%c.chunkSize ||
 				c.cells[j].pos < c.curPositions[i]-c.swaWindowSize {
-				// mask[i*length+(j-c.curCellRange.min)] = float32(math.Inf(-1))
-				mask[i*length+(j-c.curCellRange.min)] = float32(0)
+				mask[i*length+(j-c.curCellRange.min)] = float32(math.Inf(-1))
+				maskCount++
+				// mask[i*length+(j-c.curCellRange.min)] = float32(0)
 				// slog.Info("MASK", "cell", []int{i * length, (j - c.curCellRange.min)})
 				// } else {
 				// 	slog.Info("KEEP", "cell", []int{i * length, (j - c.curCellRange.min)})
+				// } else {
+				// 	mask[i*length+(j-c.curCellRange.min)] = float32(math.Inf(-1))
 			}
 		}
 	}
@@ -416,6 +422,7 @@ func (c *Causal) buildMask(ctx ml.Context) ml.Tensor {
 	// has already been masked out because the sequence doesn't match.
 	for i := c.curBatchSize * length; i < len(mask); i++ {
 		mask[i] = float32(math.Inf(-1))
+		maskCount++
 	}
 
 	maskTensor := ctx.Input().FromFloats(mask, 1, batchSize, length)
@@ -423,6 +430,8 @@ func (c *Causal) buildMask(ctx ml.Context) ml.Tensor {
 	// if c.config.MaskDType != ml.DTypeFloat32 {
 	// 	maskTensor = maskTensor.Cast(ctx, c.config.MaskDType)
 	// }
+
+	slog.Info("XXX Causal.buildMask", "c.curCellRange.min", c.curCellRange.min, "c.curCellRange.max", c.curCellRange.max, "size", len(mask), "shape", []int{1, batchSize, length}, "masked", maskCount, "unmasked", len(mask)-maskCount)
 
 	return maskTensor
 }
@@ -467,7 +476,7 @@ func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
 
 	key = key.AsStrided(ctx,
 		[]int{1, numKVHeads, cachedSize, kHeadDim},
-		[]int{key.Stride(0), key.Stride(1)}, // TODO probably wrong
+		[]int{}, // TODO probably wrong // Tried 1,1 and that doesn't work either
 		rowSize*c.curCellRange.min)
 	// slog.Info("XXX Causal.Get after AsStrided", "key", key)
 	// panic("XXX")
@@ -491,7 +500,7 @@ func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
 
 	value = value.AsStrided(ctx,
 		[]int{1, numKVHeads, cachedSize, vHeadDim},
-		[]int{value.Stride(0), value.Stride(1)}, // TODO probably wrong
+		[]int{}, // TODO probably wrong, // Tried 1,1 and that doesn't work either
 		rowSize*c.curCellRange.min,
 	)
 	// slog.Info("XXX Causal.Get after AsStrided", "value", value)
@@ -543,24 +552,25 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 		// }
 	}
 
-	key = key.Reshape(ctx, batchSize, kHeadDim*numKVHeads)
+	key = key.Reshape(ctx, batchSize, kHeadDim*numKVHeads).Contiguous(ctx, false) // TODO contiguous may not be needed
 
 	// slog.Info("XXX Causal.Put after reshape", "keyCache", keyCache)
 	// panic("XXX")
-	curLoc := 0 // TODO c.curLoc is now a tensor
-	kSize := numKVHeads * kHeadDim
-	vSize := numKVHeads * vHeadDim
-	start := []int{int(curLoc), 0}
-	kStop := []int{int(curLoc + batchSize), int(kSize)}
-	vStop := []int{int(curLoc + batchSize), int(vSize)}
-	strides := []int{1, 1}
+	// curLoc := 0 // TODO c.curLoc is now a tensor
+	// kSize := numKVHeads * kHeadDim
+	// vSize := numKVHeads * vHeadDim
+	// start := []int{int(curLoc), 0}
+	// kStop := []int{int(curLoc + batchSize), int(kSize)}
+	// vStop := []int{int(curLoc + batchSize), int(vSize)}
+	// strides := []int{1, 1}
 
 	// slog.Info("XXX Causal.Put Key SliceUpdate", "keyCache", keyCache)
 	// slog.Info("XXX Causal.Put Key SliceUpdate", "key", key)
 
 	// slog.Info("XXX Causal.Put Key SliceUpdate", "start", start, "kStop", kStop, "strides", strides)
 
-	ctx.Forward(c.keys[c.curLayer].SliceUpdate(ctx, key, start, kStop, strides))
+	// ctx.Forward(c.keys[c.curLayer].SliceUpdate(ctx, key, start, kStop, strides))
+	ctx.Forward(c.keys[c.curLayer].Scatter(ctx, []ml.Tensor{key}, nil, nil))
 	// fmt.Fprintln(os.Stderr, keyCache.ToString())
 	// panic("input value")
 
@@ -578,12 +588,12 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 
 	// 	ctx.Forward(valueCache.SliceUpdate(ctx, value, start, vStop, strides))
 	// } else {
-	value = value.Reshape(ctx, batchSize, vHeadDim*numKVHeads)
+	value = value.Reshape(ctx, batchSize, vHeadDim*numKVHeads).Contiguous(ctx, false) // TODO contiguous may not be needed
 	// slog.Info("XXX Causal.Put Value SliceUpdate", "valueCache", valueCache)
 	// slog.Info("XXX Causal.Put Value SliceUpdate", "value", value)
 	// slog.Info("XXX Causal.Put Value SliceUpdate", "start", start, "vStop", vStop, "strides", strides)
 
-	ctx.Forward(c.values[c.curLayer].SliceUpdate(ctx, value, start, vStop, strides))
+	ctx.Forward(c.values[c.curLayer].Scatter(ctx, []ml.Tensor{value}, nil, nil))
 	// }
 }
 
