@@ -2,8 +2,6 @@ package nn
 
 import (
 	"fmt"
-	"log/slog"
-	"os"
 
 	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/ml"
@@ -32,20 +30,7 @@ func AttentionWithSinks(ctx ml.Context, query, key, value, sinks ml.Tensor, scal
 }
 
 func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla ml.Tensor, scale float64, cache kvcache.Cache) ml.Tensor {
-	// ctx.CompareWith("/tmp/test", query, true) //
-	// fmt.Fprintln(os.Stderr, query.ToString())
-	// panic("input to self attention") //
-	// ctx.CompareWith("/tmp/test", value.Contiguous(ctx, false), true) // requires contiguous, then correct
-	// fmt.Fprintln(os.Stderr, value.ToString())
-	// panic("before forward") //
-
-	slog.Info("XXX Before ScaledDotProductAttention and cache put", "query", query)
-	slog.Info("XXX Before ScaledDotProductAttention and cache put", "key", key)
-	slog.Info("XXX Before ScaledDotProductAttention and cache put", "value", value)
 	ctx.Forward(query)
-	// ctx.CompareWith("/tmp/test", query, true) //
-	// fmt.Fprintln(os.Stderr, query.ToString())
-	// panic("input to self attention") //
 
 	if key != nil && value != nil {
 		if query.Dim(0) != key.Dim(0) {
@@ -68,39 +53,25 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 		panic("key & value tensors must be provided if cache is nil")
 	}
 
-	// ctx.CompareWith("/tmp/test", key, true) //
-	// fmt.Fprintln(os.Stderr, key.ToString())
-	// panic("before cache") // CORRECT
-	// ctx.CompareWith("/tmp/test", value, true) //
-	// fmt.Fprintln(os.Stderr, value.ToString())
-	// panic("before cache") //
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query, "k": key, "v": value}, true)
+	// panic("after cache get") //
+	// 2025/12/10 16:02:33 INFO XXX tensors are similar q=0.9999869465827942 shape="[1 8 13 256]" min_difference=[-0.07926178] max_difference=[0.07012844]
+	// 2025/12/10 16:02:33 INFO XXX tensors are similar k=0.9999891519546509 shape="[1 4 13 256]" min_difference=[-0.21365738] max_difference=[0.19916534]
+	// 2025/12/10 16:02:33 INFO XXX tensors are similar v=0.9999960660934448 shape="[1 4 13 256]" min_difference=[-0.32923126] max_difference=[0.32646942]
 
 	var mask ml.Tensor
 	if cache != nil {
 		key, value, mask = cache.Get(ctx)
 	}
-	// slog.Info("XXX after cache get", "key", key)
-	// slog.Info("XXX after cache get", "value", value)
-	// slog.Info("XXX after cache get", "mask", mask)
-	// panic("before sdpa")
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query, "k": key, "v": value}, true)
+	// panic("after cache get") //
+	// 2025/12/10 15:34:03 INFO XXX tensors are similar q=0.9999869465827942 shape="[1 8 13 256]" min_difference=[-0.07926178] max_difference=[0.07012844]
+	// 2025/12/10 15:34:03 INFO XXX tensors are similar k=0.9999881982803345 shape="[1 4 13 256]" min_difference=[-0.25] max_difference=[0.25]
+	// 2025/12/10 15:34:03 INFO XXX tensors are similar v=0.9999913573265076 shape="[1 4 13 256]" min_difference=[-0.5] max_difference=[0.5]
 
 	// Only use the fast SDPA implementation if we have a cache, since that's what
 	// will do any expected backend-specific transformations for us
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "q", query)
-	fmt.Fprintln(os.Stderr, query.ToString())
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "k", key)
-	fmt.Fprintln(os.Stderr, key.ToString())
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "v", value)
-	fmt.Fprintln(os.Stderr, value.ToString())
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "mask", mask)
-	fmt.Fprintln(os.Stderr, mask.ToString())
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "scale", scale)
-	slog.Info("XXX before mlx_fast_scaled_dot_product_attention", "sinks", sinks)
 
-	// fmt.Fprintln(os.Stderr, key.ToString())
-	// panic("Just before ScaledDotProductAttention")
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query.Contiguous(ctx, false), "k": key.Contiguous(ctx, false), "v": value.Contiguous(ctx, false)}, true)
-	// panic("input to ScaledDotProductAttention") // CORRECT 5-9's similarity
 	if cache != nil {
 		// TODO what to do with vmla?
 		return query.ScaledDotProductAttention(ctx, key, value, scale, "array", []ml.Tensor{mask}, sinks)

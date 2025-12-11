@@ -210,6 +210,7 @@ func (c *Causal) SetConfig(config ml.CacheConfig) {
 }
 
 func (c *Causal) Close() {
+	slog.Info("XXX Causal.Close called", "number of contexts", len(c.ctxs))
 	for _, ctx := range c.ctxs {
 		ctx.Close()
 	}
@@ -498,6 +499,7 @@ func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
 	// fmt.Fprintln(os.Stderr, key.ToString())
 	// fmt.Fprintln(os.Stderr, value.ToString())
 	// panic("XXX")
+	slog.Info("XXX Mask", "curLayer", c.curLayer, "shape", c.curMask.Shape())
 
 	return key, value, c.curMask
 }
@@ -520,6 +522,7 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 
 	// slog.Info("XXX", "c.ctxs", c.ctxs, "c.curLayer", c.curLayer, "backend", c.backend)
 	if _, ok := c.ctxs[c.curLayer]; !ok {
+		slog.Info("XXX Causal.Put creating new context", "c.curLayer", c.curLayer)
 		c.ctxs[c.curLayer] = c.backend.NewContext().Layer(c.curLayer)
 	}
 
@@ -671,6 +674,7 @@ func (c *Causal) shift(seq int, beginIndex, offset int32) error {
 
 		offsets = offsets[batchFirst : batchLast+1]
 
+		slog.Info("XXX Causal.shift creating new temporary context")
 		ctx := c.backend.NewContext()
 		kShift := ctx.Input().FromInts(offsets, len(offsets))
 

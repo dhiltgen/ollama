@@ -239,6 +239,7 @@ func (c *Context) RandomNormal(shape []int, dtype ml.DType, loc, scale float32, 
 }
 
 func (c *Context) CompareWith(filepath string, tensors map[string]ml.Tensor, abortOnError bool) (err error) {
+	minCosine := float32(0.96) // TODO too low...
 	fileTensors := map[string]*Array{}
 	defer func() {
 		if err != nil {
@@ -324,15 +325,37 @@ func (c *Context) CompareWith(filepath string, tensors map[string]ml.Tensor, abo
 		}
 		// slog.Info("XXX shapes match", "shape", t.Shape())
 		// TODO handle int types...
+		tDType := t.DType()
+		if tDType != ml.DTypeFloat16 && tDType != ml.DTypeFloat32 {
+			var r C.mlx_array
+			defer C.mlx_array_free(r)
+			C.mlx_astype(
+				&r,
+				t.(*Array).a,
+				C.MLX_FLOAT32,
+				stream,
+			)
+			t = &Array{
+				a: r,
+			}
+			c.Forward(t)
+		}
 
 		af := a.Floats()
 		tf := t.Floats()
 		cos := cosineSimilarity(af, tf)
-		if cos < 0.99 {
-			err = fmt.Errorf("%s shapes match, but not similar enough:  %v", k, cos)
+		diff := a.Sub(c, t)
+		min := diff.Min(c, nil, true)
+		max := diff.Max(c, nil, true)
+		c.Forward(min, max)
+		minf := min.Floats()
+		maxf := max.Floats()
+		if cos < minCosine {
+			err = fmt.Errorf("%s shapes match, but not similar enough:  %v  min_difference=%v max_difference=%v", k, cos, minf, maxf)
 			return
 		}
-		slog.Info("XXX tensors are similar", k, cos)
+
+		slog.Info("XXX tensors are similar", k, cos, "shape", t.Shape(), "min_difference", minf, "max_difference", maxf)
 	}
 	err = nil
 
@@ -694,7 +717,7 @@ func (a *Array) Scatter(ctx ml.Context, indicies []ml.Tensor, updates ml.Tensor,
 		if a.c.arrays[i] == a.a {
 			C.mlx_array_free(a.a)
 			a.a = r
-			a.c.arrays = append(a.c.arrays[:i], a.c.arrays[i+1:]...)
+			a.c.arrays[i] = r
 			return a
 		}
 	}
@@ -723,6 +746,76 @@ func (a *Array) Add(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
 	return newArray(ctx.(*Context), r)
 }
 
+func (a *Array) Sub(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
+	var r C.mlx_array
+	C.mlx_subtract(
+		&r,
+		a.a,
+		a2.(*Array).a,
+		ctx.(*Context).stream,
+	)
+	return newArray(ctx.(*Context), r)
+}
+
+func (a *Array) Max(ctx ml.Context, axes []int, keepDims bool) ml.Tensor {
+	var r C.mlx_array
+	cAxes := make([]C.int, len(axes))
+	for i := range axes {
+		cAxes[i] = C.int(axes[i])
+	}
+	var cAxes0 *C.int
+	if len(cAxes) > 0 {
+		cAxes0 = (*C.int)(unsafe.Pointer(&cAxes[0]))
+		C.mlx_max_axes(
+			&r,
+			a.a,
+			cAxes0,
+			C.size_t(len(cAxes)),
+			C._Bool(keepDims),
+			ctx.(*Context).stream,
+		)
+	} else {
+		C.mlx_max(
+			&r,
+			a.a,
+			C._Bool(keepDims),
+			ctx.(*Context).stream,
+		)
+
+	}
+
+	return newArray(ctx.(*Context), r)
+}
+
+func (a *Array) Min(ctx ml.Context, axes []int, keepDims bool) ml.Tensor {
+	var r C.mlx_array
+	cAxes := make([]C.int, len(axes))
+	for i := range axes {
+		cAxes[i] = C.int(axes[i])
+	}
+	var cAxes0 *C.int
+	if len(cAxes) > 0 {
+		cAxes0 = (*C.int)(unsafe.Pointer(&cAxes[0]))
+		C.mlx_min_axes(
+			&r,
+			a.a,
+			cAxes0,
+			C.size_t(len(cAxes)),
+			C._Bool(keepDims),
+			ctx.(*Context).stream,
+		)
+	} else {
+		C.mlx_min(
+			&r,
+			a.a,
+			C._Bool(keepDims),
+			ctx.(*Context).stream,
+		)
+	}
+
+	return newArray(ctx.(*Context), r)
+}
+
 func (a *Array) Matmul(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
 	var r C.mlx_array
 	C.mlx_matmul(
@@ -735,7 +828,7 @@ func (a *Array) Matmul(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
 }
 
 func (a *Array) RMSNorm(ctx ml.Context, w ml.Tensor, eps float32) ml.Tensor {
-	slog.Info("MLX.RMSNorm", "a", a, "w", w)
+	// slog.Info("MLX.RMSNorm", "a", a, "w", w)
 	var r C.mlx_array
 	C.mlx_fast_rms_norm(
 		&r,
@@ -854,6 +947,13 @@ func (queries *Array) ScaledDotProductAttention(ctx ml.Context, keys, values ml.
 		C.mlx_vector_array_append_value(maskVec, m.(*Array).a)
 	}
 
+	slog.Info("MLX.ScaledDotProductAttention", "queries", queries)
+	slog.Info("MLX.ScaledDotProductAttention", "keys", keys)
+	slog.Info("MLX.ScaledDotProductAttention", "values", values)
+	if len(masks) > 0 {
+		slog.Info("MLX.ScaledDotProductAttention", "masks", masks[0])
+	}
+
 	C.mlx_fast_scaled_dot_product_attention(
 		&r,
 		queries.a,
@@ -911,6 +1011,14 @@ func (a *Array) GELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
 	C.mlx_sigmoid(&r2, r1, ctx.(*Context).stream)
 	defer C.mlx_array_free(r2)
 	C.mlx_multiply(&r3, a.a, r2, ctx.(*Context).stream)
+
+	if len(up) > 0 {
+		var r4 C.mlx_array
+		defer C.mlx_array_free(r3)
+		C.mlx_multiply(&r4, r3, up[0].(*Array).a, ctx.(*Context).stream)
+		return newArray(ctx.(*Context), r4)
+	}
+
 	return newArray(ctx.(*Context), r3)
 }
 
@@ -1465,9 +1573,6 @@ func (a *Array) TypeString() string {
 // 	panic("NOT YET IMPLEMENTED")
 // }
 
-// func (a *Array) Sub(ctx ml.Context, a2 ml.Tensor) ml.Tensor {
-// 	panic("NOT YET IMPLEMENTED")
-// }
 // func (a *Array) Chunk(ctx ml.Context, dim int, size int) []ml.Tensor {
 // 	panic("NOT YET IMPLEMENTED")
 

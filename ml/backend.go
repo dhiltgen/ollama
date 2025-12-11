@@ -176,9 +176,12 @@ type Tensor interface {
 	// FromInts([]int32)
 
 	Add(ctx Context, t2 Tensor) Tensor
-	// Sub(ctx Context, t2 Tensor) Tensor
+	Sub(ctx Context, t2 Tensor) Tensor
 	// Mul(ctx Context, t2 Tensor) Tensor
 	// Div(ctx Context, t2 Tensor) Tensor
+
+	Max(ctx Context, axes []int, keepDims bool) Tensor
+	Min(ctx Context, axes []int, keepDims bool) Tensor
 
 	Matmul(ctx Context, a2 Tensor) Tensor
 	// Mulmat(ctx Context, t2 Tensor) Tensor
