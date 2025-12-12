@@ -63,7 +63,7 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 	if cache != nil {
 		key, value, mask = cache.Get(ctx)
 	}
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query, "k": key, "v": value}, true)
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": query.Contiguous(ctx, false), "k": key.Contiguous(ctx, false), "v": value.Contiguous(ctx, false)}, true)
 	// panic("after cache get") //
 	// 2025/12/10 15:34:03 INFO XXX tensors are similar q=0.9999869465827942 shape="[1 8 13 256]" min_difference=[-0.07926178] max_difference=[0.07012844]
 	// 2025/12/10 15:34:03 INFO XXX tensors are similar k=0.9999881982803345 shape="[1 4 13 256]" min_difference=[-0.25] max_difference=[0.25]
@@ -74,8 +74,8 @@ func AttentionWithVMLA(ctx ml.Context, query, key, value, sinks ml.Tensor, vmla 
 
 	if cache != nil {
 		// TODO what to do with vmla?
-		return query.ScaledDotProductAttention(ctx, key, value, scale, "array", []ml.Tensor{mask}, sinks)
-		// return query.ScaledDotProductAttention(ctx, key, value, scale, "causal", []ml.Tensor{}, sinks)
+		// return query.Transpose(ctx, 0, 2, 1, 3).ScaledDotProductAttention(ctx, key.Transpose(ctx, 0, 2, 1, 3), value.Transpose(ctx, 0, 2, 1, 3), scale, "array", []ml.Tensor{mask}, sinks)
+		return query.ScaledDotProductAttention(ctx, key, value, scale, "causal", []ml.Tensor{}, sinks)
 
 		// TODO these two produce identical output, but not similar enough - 92.9% - should be 99.999%
 	} else {

@@ -136,7 +136,7 @@ func (b *Backend) Get(name string) ml.Tensor {
 }
 
 func (b *Backend) NewContext() ml.Context {
-	slog.Info("MLX.NewContext")
+	// slog.Info("MLX.NewContext")
 	return &Context{
 		stream: C.mlx_default_gpu_stream_new(),
 	}
@@ -320,7 +320,7 @@ func (c *Context) CompareWith(filepath string, tensors map[string]ml.Tensor, abo
 			return
 		}
 		if !reflect.DeepEqual(a.Shape(), t.Shape()) {
-			err = fmt.Errorf("mismatched shapes:  file: %v vs. input %v", t.Shape(), a.Shape())
+			err = fmt.Errorf("mismatched shapes:  file: %v vs. input %v", a.Shape(), t.Shape())
 			return
 		}
 		// slog.Info("XXX shapes match", "shape", t.Shape())
@@ -947,12 +947,13 @@ func (queries *Array) ScaledDotProductAttention(ctx ml.Context, keys, values ml.
 		C.mlx_vector_array_append_value(maskVec, m.(*Array).a)
 	}
 
-	slog.Info("MLX.ScaledDotProductAttention", "queries", queries)
-	slog.Info("MLX.ScaledDotProductAttention", "keys", keys)
-	slog.Info("MLX.ScaledDotProductAttention", "values", values)
-	if len(masks) > 0 {
-		slog.Info("MLX.ScaledDotProductAttention", "masks", masks[0])
-	}
+	// slog.Info("MLX.ScaledDotProductAttention", "queries", queries)
+	// slog.Info("MLX.ScaledDotProductAttention", "keys", keys)
+	// slog.Info("MLX.ScaledDotProductAttention", "values", values)
+	// if len(masks) > 0 {
+	// 	slog.Info("MLX.ScaledDotProductAttention", "masks", masks[0])
+	// }
+	// slog.Info("MLX.ScaledDotProductAttention", "scale", scale)
 
 	C.mlx_fast_scaled_dot_product_attention(
 		&r,

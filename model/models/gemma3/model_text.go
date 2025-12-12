@@ -1,7 +1,6 @@
 package gemma3
 
 import (
-	"log/slog"
 	"math"
 
 	"github.com/ollama/ollama/fs"
@@ -112,7 +111,7 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 
 	B := hiddenState.Dim(0)
 	L := hiddenState.Dim(1)
-	slog.Info("XXX start of Forward", "B", B, "L", L, "hiddenState", hiddenState)
+	// slog.Info("XXX start of Forward", "B", B, "L", L, "hiddenState", hiddenState)
 
 	ropeBase := opts.ropeLocalBase
 	if (layer+1)%gemmaGlobalCacheCount == 0 {
@@ -156,28 +155,19 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// 	q = q.Scale(ctx, 1.0/math.Sqrt(float64(opts.attnKeyLen)))
 	// }
 
-	scaleFactor := 1.0
+	scaleFactor := math.Pow(256, -0.5)
 
 	kqv := nn.Attention(ctx, q, k, v, scaleFactor, cache)
 
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"kqv": kqv}, true)
-	// panic("output from self attention") // 0.92970455  min_difference=[-79.21126] max_difference=[61.469276]
-
-	// ctx.CompareWith("/tmp/test", kqv, true) //
-	// fmt.Fprintln(os.Stderr, kqv.ToString())
-	// panic("output from self attention") //
-
-	// fmt.Fprintln(os.Stderr, kqv.ToString())
-	// panic("after scaled dot product") // WRONG - all nans
+	// panic("output from self attention") // kqv=0.9999763369560242 shape="[1 8 13 256]" min_difference=[-0.85839653] max_difference=[1.2572632]
 
 	kqv = kqv.Transpose(ctx, 0, 2, 1, 3).Reshape(ctx, B, L, -1)
 
 	t := sa.Output.Forward(ctx, kqv)
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": t}, true) //
-	// panic("output from self attention")                              // drifting - 98
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": t}, true)
+	// panic("output from self attention") // t=0.9999837279319763 shape="[1 13 2560]" min_difference=[-0.42661285] max_difference=[0.6028366]
 
-	// fmt.Fprintln(os.Stderr, t.ToString())
-	// panic("final output") // WRONG! nan's
 	return t
 }
 
@@ -237,15 +227,12 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
 	// panic("after AttentionNorm") // h=0.9999882578849792 shape="[1 13 2560]" min_difference=[-0.7509308] max_difference=[1.9148865]
 	hiddenState = l.SelfAttention.Forward(ctx, layer, hiddenState, positionIDs, cache, opts)
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
-	// panic("after SelfAttention") // 0.98037267  min_difference=[-33.667545] max_difference=[33.031944]
-
-	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
-	// panic("after self attention")
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
+	// panic("after SelfAttention") // t=0.9999837279319763 shape="[1 13 2560]" min_difference=[-0.42661285] max_difference=[0.6028366]
 
 	hiddenState = l.PostAttentionNorm.Forward(ctx, hiddenState, opts.eps)
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true) //
-	// panic("after post attention norm")                                         // OK - 99.8
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
+	// panic("after post attention norm") // t=0.9999939203262329 shape="[1 13 2560]" min_difference=[-4.0560303] max_difference=[3.5961914]
 
 	// In the final layer (outputs != nil), optimize by pruning to just the token positions
 	// we need logits for.
@@ -262,24 +249,27 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 
 	hiddenState = hiddenState.Add(ctx, residual)
 	residual = hiddenState
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState, "rmsweight": l.MLPNorm.Weight}, true) //
-	// panic("before MLPNorm")                                                                                   //
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
+	// panic("before MLPNorm") // h=0.9999914765357971 shape="[1 13 2560]" min_difference=[-4.541565] max_difference=[3.4016113]
 
-	slog.Info("XXX", "eps", opts.eps)
 	hiddenState = l.MLPNorm.Forward(ctx, hiddenState, opts.eps)
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"mlpn": hiddenState}, true) //
-	// panic("after post attention norm")                                            // drifting 97.2%
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
+	// panic("after post attention norm") // h=0.9999774694442749 shape="[1 13 2560]" min_difference=[-0.30542183] max_difference=[0.124988556]
 
 	hiddenState = l.MLP.Forward(ctx, hiddenState, opts) // TODO this is where it goes bad most likely...
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
-	// panic("after post attention norm") // t=0.9825537800788879 shape="[1 13 2560]" min_difference=[-4.51235] max_difference=[4.1807137]
+	// panic("after post attention norm") // t=0.9998757243156433 shape="[1 13 2560]" min_difference=[-0.41888905] max_difference=[0.43873215]
+
 	hiddenState = l.PostMLPNorm.Forward(ctx, hiddenState, opts.eps)
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
-	// panic("after post attention norm") // t=0.999803900718689 shape="[1 13 2560]" min_difference=[-102.41018] max_difference=[24.567497]
-	x := hiddenState.Add(ctx, residual)
-	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": x}, true)
-	// panic("after post attention norm") // 99.98%
+	// panic("after post attention norm") // t=0.9999986886978149 shape="[1 13 2560]" min_difference=[-39] max_difference=[6.501816]
 
+	x := hiddenState.Add(ctx, residual)
+	// slog.Info("5", "hiddenState", x)
+	// if outputs != nil {
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": x}, true)
+	// panic("after post attention norm") // t=0.9999957084655762 shape="[1 13 2560]" min_difference=[-62.378906] max_difference=[7.8084717]
+	// }
 	return x
 }
 
@@ -294,7 +284,7 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 	// 	}
 	// }
 
-	slog.Info("XXX TextModel.Forward", "batch", batch.Inputs)
+	// slog.Info("XXX TextModel.Forward", "batch", batch.Inputs)
 	// fmt.Fprintln(os.Stderr, m.TokenEmbedding.Weight.ToString())
 	// panic("TokenEmbedding") // CORRECT
 
@@ -303,11 +293,11 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 	hiddenState := m.TokenEmbedding.Forward(ctx, batch.Inputs)
 	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	// panic("TokenEmbedding.Forward") // CORRECt, but has more token zero rows at the end - probably OK
-	slog.Info("XXX scale", "m.TextConfig.hiddenSize", m.TextConfig.hiddenSize, "scale", math.Sqrt(float64(m.TextConfig.hiddenSize)))
+	// slog.Info("XXX scale", "m.TextConfig.hiddenSize", m.TextConfig.hiddenSize, "scale", math.Sqrt(float64(m.TextConfig.hiddenSize)))
 	hiddenState = hiddenState.Scale(ctx, math.Sqrt(float64(m.TextConfig.hiddenSize)))
 	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	// panic("scale") // CORRECT
-	slog.Info("XXX after Scale", "hiddenState", hiddenState)
+	// slog.Info("XXX after Scale", "hiddenState", hiddenState)
 
 	// fmt.Fprintf(os.Stderr, hiddenState.ToString())
 	// panic("Does it look OK?")
@@ -331,34 +321,42 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 		// fmt.Fprintln(os.Stderr, hiddenState.ToString())
 		// panic("before first layer") // CORRECT
 		if cache != nil {
-			cacheType := cacheTypeSWA
-			if (i+1)%gemmaGlobalCacheCount == 0 {
-				cacheType = cacheTypeCausal
-			}
+			// cacheType := cacheTypeSWA
+			// if (i+1)%gemmaGlobalCacheCount == 0 {
+			// 	cacheType = cacheTypeCausal
+			// }
 			cache.SetLayer(i)
-			wc := cache.(*kvcache.WrapperCache)
-			wc.SetLayerType(cacheType)
 
-			if causal, ok := wc.UnderlyingCache().(*kvcache.Causal); ok {
-				causal.SetCausal(ctx, kvcache.CausalOptions{Except: except})
-			}
+			// TODO this needs to come back
+			// wc := cache.(*kvcache.WrapperCache)
+			// wc.SetLayerType(cacheType)
+
+			// if causal, ok := wc.UnderlyingCache().(*kvcache.Causal); ok {
+			// 	causal.SetCausal(ctx, kvcache.CausalOptions{Except: except})
+			// }
 		}
 
 		var lastLayerOutputs ml.Tensor
 		if i == len(m.Layers)-1 {
+			// slog.Info("XXX last layer", "i", i)
+			// panic("last layer")
 			lastLayerOutputs = batch.Outputs
 		}
 
 		hiddenState = layer.Forward(ctx, i, hiddenState, positions, lastLayerOutputs, cache, m.TextConfig)
-		// fmt.Fprintln(os.Stderr, hiddenState.ToString())
-		// panic("after first layer") // WRONG
+		// if i == 33 {
+		// 	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
+		// 	panic("after post attention norm") //
+		// }
 	}
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
+	// panic("after post attention norm") // mismatched shapes:  file: [1 1 2560] vs. input [1 13 2560]
 
 	// slog.Info("XXX before OutputNorm.Forward", "hiddenState", hiddenState)
 	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
 	hiddenState = m.OutputNorm.Forward(ctx, hiddenState, m.eps)
-	// slog.Info("XXX after OutputNorm.Forward", "hiddenState", hiddenState)
-	// fmt.Fprintln(os.Stderr, hiddenState.ToString())
+	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
+	// panic("after post attention norm") //
 
 	// out := hiddenState.Matmul(ctx, m.TokenEmbedding.Weight.Transpose(ctx))
 	// slog.Info("XXX after as_linear equivalent", "hiddenState", out)

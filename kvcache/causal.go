@@ -217,7 +217,7 @@ func (c *Causal) Close() {
 }
 
 func (c *Causal) StartForward(ctx ml.Context, batch input.Batch, reserve bool) error {
-	slog.Info("XXX Causal.StartForward", "batch", batch)
+	slog.Info("XXX Causal.StartForward", "cell count", len(c.cells), "prior batch size", c.curBatchSize, "positions", len(batch.Positions), "reserve", reserve, "batch", batch)
 	// panic("XXX Causal.StartForward")
 	c.curBatchSize = len(batch.Positions)
 	c.curSequences = batch.Sequences
@@ -233,6 +233,7 @@ func (c *Causal) StartForward(ctx ml.Context, batch input.Batch, reserve bool) e
 		if err != nil {
 			return err
 		}
+		slog.Info("XXX Causal.StartForward", "findLocs len", len(locs))
 
 		for i, pos := range batch.Positions {
 			seq := batch.Sequences[i]
@@ -263,6 +264,29 @@ func (c *Causal) StartForward(ctx ml.Context, batch input.Batch, reserve bool) e
 		c.curCellRange.min = 0
 		c.curCellRange.max = len(c.cells) - 1
 	}
+
+	// XXX Building up the locs for what's already processed (if any)
+	dummyLocs := []int{}
+	c.curCellRange.min = roundDown(c.curCellRange.min, c.config.CachePadding)
+	c.curCellRange.max = roundUp(c.curCellRange.max+1, c.config.CachePadding) - 1
+
+	for i := range c.curBatchSize {
+		enabled := !slices.Contains(c.opts.Except, i)
+		for j := c.curCellRange.min; j <= c.curCellRange.max; j++ {
+			if !slices.Contains(c.cells[j].sequences, c.curSequences[i]) ||
+				(enabled && c.cells[j].pos > c.curPositions[i]) ||
+				c.chunkSize > 0 && c.cells[j].pos < c.curPositions[i]-c.curPositions[i]%c.chunkSize ||
+				c.cells[j].pos < c.curPositions[i]-c.swaWindowSize {
+				// mask[i*length+(j-c.curCellRange.min)] = float32(math.Inf(-1))
+			} else {
+				if len(dummyLocs) == 0 || dummyLocs[len(dummyLocs)-1] != i {
+					dummyLocs = append(dummyLocs, i)
+				}
+			}
+		}
+	}
+	slog.Info("XXX Causa.StartForward calculated locations", "locs", dummyLocs)
+
 	slog.Info("XXX Causal.StartForward", "locs", locs)
 	c.curLoc = ctx.Input().FromInts(locs, len(locs))
 	c.curMask = c.buildMask(ctx)
@@ -411,13 +435,13 @@ func (c *Causal) buildMask(ctx ml.Context) ml.Tensor {
 		mask[i] = float32(math.Inf(-1))
 	}
 
-	maskTensor := ctx.Input().FromFloats(mask, 1, batchSize, length)
+	maskTensor := ctx.Input().FromFloats(mask, batchSize, length)
 
 	// if c.config.MaskDType != ml.DTypeFloat32 {
 	// 	maskTensor = maskTensor.Cast(ctx, c.config.MaskDType)
 	// }
 
-	slog.Info("XXX Causal.buildMask", "c.curCellRange.min", c.curCellRange.min, "c.curCellRange.max", c.curCellRange.max, "size", len(mask), "shape", []int{1, batchSize, length})
+	slog.Info("XXX Causal.buildMask", "c.curBatchSize", c.curBatchSize, "c.config.MaskBatchPadding", c.config.MaskBatchPadding, "c.curCellRange.min", c.curCellRange.min, "c.curCellRange.max", c.curCellRange.max, "size", len(mask), "shape", []int{1, batchSize, length})
 
 	return maskTensor
 }
@@ -450,20 +474,25 @@ func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
 	vHeadDim := c.vHeadDims[c.curLayer]
 	numKVHeads := c.numKVHeads[c.curLayer]
 	// rowSize := numKVHeads * c.curBatchSize
-	// cachedSize := c.curMask.Dim(2)
+	// cachedSize := c.curMask.Dim(1)
+	cachedSize := c.curLoc.Dim(0)
 	// kCellSize := kHeadDim * numKVHeads
 	// vCellSize := vHeadDim * numKVHeads
 
-	// slog.Info("XXX Causal.Get", "key", key)
-	// slog.Info("XXX Causal.Get", "value", value)
-	// slog.Info("XXX Causal.Get", "curMask", c.curMask)
-	// slog.Info("XXX Causal.Get", "kHeadDim", kHeadDim, "numKVHeads", numKVHeads, "rowSize", rowSize, "cachedSize", cachedSize)
+	slog.Info("XXX Causal.Get full cache", "key", key)
+	slog.Info("XXX Causal.Get full cache", "value", value)
+	slog.Info("XXX Causal.Get full cache", "curloc", c.curLoc)
+	slog.Info("XXX Causal.Get", "curMask", c.curMask)
+	slog.Info("XXX Causal.Get", "kHeadDim", kHeadDim, "numKVHeads", numKVHeads, "cachedSize", cachedSize, "kHeadDim", kHeadDim)
 	// panic("XXX")
 
 	// fmt.Fprintln(os.Stderr, key.ToString())
 	// panic("full cache value")
 
-	key = key.TakeAxes(ctx, c.curLoc, 0).Reshape(ctx, 1, numKVHeads, c.curBatchSize, kHeadDim)
+	// TODO we should use TakeAxes to gather the cells from curLoc, but for now to be consistent with GGML, just grab a larger chunk and mask
+	key = key.TakeAxes(ctx, c.curLoc, 0).Reshape(ctx, 1, numKVHeads, cachedSize, kHeadDim)
+	// key = key.AsStrided(ctx, []int{1, numKVHeads, cachedSize, kHeadDim}, []int{}, rowSize*c.curCellRange.min)
+
 	// slog.Info("XXX Causal.Get after AsStrided", "key", key)
 	// panic("XXX")
 
@@ -484,7 +513,10 @@ func (c *Causal) Get(ctx ml.Context) (ml.Tensor, ml.Tensor, ml.Tensor) {
 	// slog.Info("XXX Causal.Get before AsStrided", "vHeadDim", vHeadDim, "rowSize", rowSize)
 	// panic("XXX")
 
-	value = value.TakeAxes(ctx, c.curLoc, 0).Reshape(ctx, 1, numKVHeads, c.curBatchSize, vHeadDim)
+	// TODO we should use TakeAxes to gather the cells from curLoc, but for now to be consistent with GGML, just grab a larger chunk and mask
+	value = value.TakeAxes(ctx, c.curLoc, 0).Reshape(ctx, 1, numKVHeads, cachedSize, vHeadDim)
+	// value = value.AsStrided(ctx, []int{1, numKVHeads, cachedSize, vHeadDim}, []int{}, rowSize*c.curCellRange.min)
+
 	// slog.Info("XXX Causal.Get after AsStrided", "value", value)
 	// panic("XXX")
 
@@ -513,7 +545,7 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 	vCellSize := vHeadDim * numKVHeads
 
 	// slog.Info("XXX Causal.Put", "key", key, "value", value)
-	// slog.Info("XXX Causal.Put", "kHeadDim", kHeadDim, "vHeadDim", vHeadDim, "numKVHeads", numKVHeads, "batchSize", batchSize)
+	slog.Info("XXX Causal.Put", "kHeadDim", kHeadDim, "vHeadDim", vHeadDim, "numKVHeads", numKVHeads, "batchSize", batchSize)
 	// panic("XXX")
 
 	if c.curBatchSize != batchSize {
@@ -527,6 +559,8 @@ func (c *Causal) Put(ctx ml.Context, key, value ml.Tensor) {
 	}
 
 	if _, ok := c.keys[c.curLayer]; !ok {
+		slog.Info("XXX Causal.Put allocating keys", "c.curLayer", c.curLayer, "shape", []int{len(c.cells), kCellSize})
+
 		c.keys[c.curLayer] = c.ctxs[c.curLayer].Zeros(c.DType, len(c.cells), kCellSize)
 		c.kHeadDims[c.curLayer] = kHeadDim
 		c.vHeadDims[c.curLayer] = vHeadDim

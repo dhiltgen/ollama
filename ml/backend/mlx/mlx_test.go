@@ -315,6 +315,11 @@ func TestGemma3(t *testing.T) {
 		numSlots := 1
 		batchSize := 512
 		numCtx := 4096
+
+		// Note: this is inconsistent with mlx-py, but trying to be consistent with the GGML cache impl to get things working
+		// cache.SetConfig(ml.CacheConfig{CachePadding: 256, MaskDType: ml.DTypeBfloat16, MaskBatchPadding: 64})
+		cache.SetConfig(ml.CacheConfig{CachePadding: 0, MaskDType: ml.DTypeBfloat16, MaskBatchPadding: 0})
+
 		cache.Init(b, ml.DTypeBfloat16, numSlots, int(numCtx), batchSize)
 		err := cache.StartForward(ctx, batch, false)
 		if err != nil {
