@@ -304,7 +304,7 @@ func TestGemma3(t *testing.T) {
 		Inputs:    ctx.FromInts(inputs[:], 1, len(inputs)),
 		Positions: make([]int32, len(inputs)),
 		Sequences: make([]int, len(inputs)),
-		Outputs:   ctx.Zeros(ml.DTypeInt32, 1),
+		Outputs:   ctx.FromInts([]int32{int32(len(inputs) - 1)}, 1),
 	}
 	for i := range len(inputs) {
 		batch.Positions[i] = int32(i)
@@ -351,6 +351,9 @@ func TestGemma3(t *testing.T) {
 		// vocabSize := len(outputs) / batch.Outputs.Dim(0)
 
 		logits := outputs // TODO subset?
+		// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"l": out}, true)
+		// panic("after post attention norm") //
+
 		token, err := sampler.Sample(logits)
 		if err != nil {
 			t.Fatalf("unable to sample token: %s", err)
@@ -376,7 +379,7 @@ func TestGemma3(t *testing.T) {
 			Inputs:    ctx.FromInts([]int32{token}, 1, 1),
 			Positions: make([]int32, 1),
 			Sequences: make([]int, 1),
-			Outputs:   ctx.Zeros(ml.DTypeInt32, 1),
+			Outputs:   ctx.FromInts([]int32{0}, 1),
 		}
 		batch.Positions[0] = 0
 		err = cache.StartForward(ctx, batch, false)
