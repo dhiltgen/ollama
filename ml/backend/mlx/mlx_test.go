@@ -305,10 +305,12 @@ func TestGemma3(t *testing.T) {
 		Positions: make([]int32, len(inputs)),
 		Sequences: make([]int, len(inputs)),
 		Outputs:   ctx.FromInts([]int32{int32(len(inputs) - 1)}, 1),
+		Offset:    0,
 	}
 	for i := range len(inputs) {
 		batch.Positions[i] = int32(i)
 	}
+	offset := len(inputs)
 
 	cache := g3.Config().Cache
 	if cache != nil {
@@ -380,7 +382,9 @@ func TestGemma3(t *testing.T) {
 			Positions: make([]int32, 1),
 			Sequences: make([]int, 1),
 			Outputs:   ctx.FromInts([]int32{0}, 1),
+			Offset:    offset,
 		}
+		offset++
 		batch.Positions[0] = 0
 		err = cache.StartForward(ctx, batch, false)
 		if err != nil {

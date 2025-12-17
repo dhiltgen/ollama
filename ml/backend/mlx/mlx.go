@@ -517,6 +517,27 @@ func (c *Context) FromInts(s []int32, shape ...int) ml.Tensor {
 	)
 }
 
+func (a *Array) Ints() []int32 {
+	if a.sync != nil {
+		a.sync()
+	}
+	l := (int)(C.mlx_array_size(a.a))
+
+	switch C.mlx_array_dtype(a.a) {
+	case C.MLX_INT32:
+		data := C.mlx_array_data_int32(a.a)
+		if data == nil {
+			panic("nil data, wasn't eval'd")
+		}
+		i32s := unsafe.Slice((*int32)(data), l)
+		return i32s
+
+		// TODO other types via conversion?
+	default:
+		panic(fmt.Sprintf("unsupported dtype for Ints: %d", C.mlx_array_dtype(a.a)))
+	}
+}
+
 func (c *Context) Zeros(dtype ml.DType, shape ...int) ml.Tensor {
 	sh := make([]C.int, len(shape))
 	for i, s := range shape {
@@ -1646,12 +1667,6 @@ func (a *Array) TypeString() string {
 // 	panic("NOT YET IMPLEMENTED")
 // }
 // func (c *Array) FromBytes(s []byte) {
-// 	panic("NOT YET IMPLEMENTED")
-// }
-// func (c *Array) FromFloats([]float32) {
-// 	panic("NOT YET IMPLEMENTED")
-// }
-// func (c *Array) FromInts([]int32) {
 // 	panic("NOT YET IMPLEMENTED")
 // }
 

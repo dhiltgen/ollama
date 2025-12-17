@@ -73,7 +73,7 @@ func (c *MLXCausal) StartForward(ctx ml.Context, batch input.Batch, reserve bool
 	}
 	c.curLocGet = ctx.Input().FromInts(locsGet, len(locsGet))
 	c.curLocPut = ctx.Input().FromInts(locsPut, len(locsPut))
-	// slog.Info("XXX MLXCausal.StartForward", "put", locsPut, "get", locsGet)
+	// slog.Info("XXX MLXCausal.StartForward", "offset", c.offset, "put", locsPut, "get", locsGet)
 
 	return nil
 }
@@ -84,6 +84,8 @@ func (c *MLXCausal) Put(ctx ml.Context, key, value ml.Tensor) {
 	batchSize := key.Dim(2)
 	kCellSize := kHeadDim * numKVHeads
 	vCellSize := vHeadDim * numKVHeads
+	// slog.Info("XXX Causal.Put", "kHeadDim", kHeadDim, "vHeadDim", vHeadDim, "numKVHeads", numKVHeads, "batchSize", batchSize, "kCellSize", kCellSize, "vCellSize", vCellSize)
+
 	if _, ok := c.ctxs[c.curLayer]; !ok {
 		// slog.Info("XXX Causal.Put creating new context", "c.curLayer", c.curLayer)
 		c.ctxs[c.curLayer] = c.backend.NewContext().Layer(c.curLayer)
@@ -99,6 +101,9 @@ func (c *MLXCausal) Put(ctx ml.Context, key, value ml.Tensor) {
 	}
 	key = key.Reshape(ctx, batchSize, 1, kCellSize)
 
+	// slog.Info("XXX MLXCausal.Put ", "c.keys[c.curLayer]", c.keys[c.curLayer])
+	// slog.Info("XXX MLXCausal.Put ", "c.curLocPut", c.curLocPut)
+	// slog.Info("XXX MLXCausal.Put ", "key", key)
 	ctx.Forward(c.keys[c.curLayer].Scatter(ctx, []ml.Tensor{c.curLocPut}, key, []int{0}))
 	value = value.Reshape(ctx, batchSize, 1, vCellSize)
 	ctx.Forward(c.values[c.curLayer].Scatter(ctx, []ml.Tensor{c.curLocPut}, value, []int{0}))

@@ -104,7 +104,7 @@ type TextSelfAttention struct {
 	Output    *nn.Linear  `gguf:"attn_output"`
 }
 
-func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, positionIDs ml.Tensor, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
+func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState ml.Tensor, offset int, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
 
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
 	// panic("starting layer forward") // h=0.9999882578849792 shape="[1 13 2560]" min_difference=[-0.7509308] max_difference=[1.9148865]
@@ -121,6 +121,10 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	q := sa.Query.Forward(ctx, hiddenState)
 	k := sa.Key.Forward(ctx, hiddenState)
 	v := sa.Value.Forward(ctx, hiddenState)
+	// slog.Info("XXX TextSelfAttention.Forward after initial forward", "hiddenState", hiddenState)
+	// slog.Info("XXX TextSelfAttention.Forward after initial forward", "q", q)
+	// slog.Info("XXX TextSelfAttention.Forward after initial forward", "k", k)
+	// slog.Info("XXX TextSelfAttention.Forward after initial forward", "v", v)
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"q": q, "k": k, "v": v}, true)
 	// 	panic("after qkv forward") //
 	// 2025/12/10 15:24:26 INFO XXX tensors are similar k=0.9999958872795105 shape="[1 13 1024]" min_difference=[-0.5005493] max_difference=[0.5308075]
@@ -130,6 +134,10 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	q = q.Reshape(ctx, B, L, opts.numHeads, -1).Transpose(ctx, 0, 2, 1, 3)
 	k = k.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3)
 	v = v.Reshape(ctx, B, L, opts.numKVHeads, -1).Transpose(ctx, 0, 2, 1, 3).Contiguous(ctx, false)
+	// slog.Info("XXX TextSelfAttention.Forward after reshape", "hiddenState", hiddenState)
+	// slog.Info("XXX TextSelfAttention.Forward after reshape", "q", q)
+	// slog.Info("XXX TextSelfAttention.Forward after reshape", "k", k)
+	// slog.Info("XXX TextSelfAttention.Forward after reshape", "v", v)
 
 	q = sa.QueryNorm.Forward(ctx, q, opts.eps)
 	k = sa.KeyNorm.Forward(ctx, k, opts.eps)
@@ -139,7 +147,12 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// 2025/12/10 15:27:45 INFO XXX tensors are similar k=0.9999889731407166 shape="[1 4 13 256]" min_difference=[-0.20866394] max_difference=[0.19916534]
 
 	traditional := false
-	offset := int(0) // TODO is this right?
+
+	// TODO inefficient
+	// ctx.Forward(positionIDs)
+	// positions := positionIDs.Ints()
+	// slog.Info("XXX Positions", "positions", positions) // TODO - not right - switches to zero on generate passes
+	// offset := int(positions[0])
 
 	q = q.RoPE(ctx, opts.attnKeyLen, traditional, opts.ropeScale, offset, ml.WithRoPEBase(ropeBase))
 	k = k.RoPE(ctx, opts.attnKeyLen, traditional, opts.ropeScale, offset, ml.WithRoPEBase(ropeBase))
@@ -147,6 +160,8 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// panic("after qk rope") //
 	// 2025/12/10 15:30:34 INFO XXX tensors are similar q=0.9999869465827942 shape="[1 8 13 256]" min_difference=[-0.07926178] max_difference=[0.07012844]
 	// 2025/12/10 15:30:34 INFO XXX tensors are similar k=0.9999891519546509 shape="[1 4 13 256]" min_difference=[-0.21365738] max_difference=[0.19916534]
+	// slog.Info("XXX TextSelfAttention.Forward after rope", "q", q)
+	// slog.Info("XXX TextSelfAttention.Forward after rope", "k", k)
 
 	// TODO - this is wrong somehow so commenting out
 	// if opts.largeModelScaling {
@@ -156,8 +171,13 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 	// }
 
 	scaleFactor := math.Pow(256, -0.5)
+	// slog.Info("XXX TextSelfAttention.Forward before attention", "hiddenState", hiddenState)
+	// slog.Info("XXX TextSelfAttention.Forward before attention", "q", q)
+	// slog.Info("XXX TextSelfAttention.Forward before attention", "k", k)
+	// slog.Info("XXX TextSelfAttention.Forward before attention", "v", v)
 
 	kqv := nn.Attention(ctx, q, k, v, scaleFactor, cache)
+	// slog.Info("XXX TextSelfAttention.Forward after attention", "kqv", kqv)
 
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"kqv": kqv}, true)
 	// panic("output from self attention") // kqv=0.9999763369560242 shape="[1 8 13 256]" min_difference=[-0.85839653] max_difference=[1.2572632]
@@ -218,7 +238,7 @@ type TextLayer struct {
 	PostMLPNorm       *nn.RMSNorm `gguf:"post_ffw_norm"`
 }
 
-func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs, outputs ml.Tensor, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
+func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, outputs ml.Tensor, offset int, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
 	// panic("starting layer forward") // h=0.9999922513961792 shape="[1 13 2560]" min_difference=[-0.03314209] max_difference=[0.10057831]
 
@@ -226,7 +246,7 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	hiddenState = l.AttentionNorm.Forward(ctx, hiddenState, opts.eps)
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"h": hiddenState}, true)
 	// panic("after AttentionNorm") // h=0.9999882578849792 shape="[1 13 2560]" min_difference=[-0.7509308] max_difference=[1.9148865]
-	hiddenState = l.SelfAttention.Forward(ctx, layer, hiddenState, positionIDs, cache, opts)
+	hiddenState = l.SelfAttention.Forward(ctx, layer, hiddenState, offset, cache, opts)
 	// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
 	// panic("after SelfAttention") // t=0.9999837279319763 shape="[1 13 2560]" min_difference=[-0.42661285] max_difference=[0.6028366]
 
@@ -237,7 +257,7 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 	// In the final layer (outputs != nil), optimize by pruning to just the token positions
 	// we need logits for.
 	if outputs != nil {
-		// slog.Info("Before TakeAxes", "hiddenState", hiddenState)
+		// slog.Info("Before TakeAxes", "layer", layer, "hiddenState", hiddenState)
 		// slog.Info("Before TakeAxes", "residual", residual)
 		// slog.Info("Before TakeAxes", "outputs", outputs)
 		hiddenState = hiddenState.TakeAxes(ctx, outputs, 1)
@@ -275,7 +295,7 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positionIDs,
 
 func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cache) ml.Tensor {
 
-	positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
+	// positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
 
 	// TODO is this the right place to create this?
 	// if m.TokenEmbedding == nil {
@@ -336,14 +356,16 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 			// }
 		}
 
+		var offset int
 		var lastLayerOutputs ml.Tensor
 		if i == len(m.Layers)-1 {
 			// slog.Info("XXX last layer", "i", i)
 			// panic("last layer")
+			offset = batch.Offset
 			lastLayerOutputs = batch.Outputs
 		}
 
-		hiddenState = layer.Forward(ctx, i, hiddenState, positions, lastLayerOutputs, cache, m.TextConfig)
+		hiddenState = layer.Forward(ctx, i, hiddenState, lastLayerOutputs, offset, cache, m.TextConfig)
 		// if i == 33 {
 		// 	ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"t": hiddenState}, true)
 		// 	panic("after post attention norm") //

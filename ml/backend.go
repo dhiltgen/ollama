@@ -170,6 +170,7 @@ type Tensor interface {
 
 	// Bytes() []byte
 	Floats() []float32
+	Ints() []int32
 
 	// FromBytes([]byte)
 	// FromFloats([]float32)

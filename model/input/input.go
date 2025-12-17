@@ -58,6 +58,10 @@ type Batch struct {
 	// be returned.
 	Outputs ml.Tensor
 
+	// TODO maybe not the optimal way to handle this
+	// Offset of final tensor in the final batch
+	Offset int
+
 	// Positions is the position for each Input, relative to its sequence. Equal
 	// in length to Inputs.
 	Positions []int32
