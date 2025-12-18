@@ -18,7 +18,7 @@ type llamaAdapter struct {
 
 var _ AdapterConverter = (*llamaAdapter)(nil)
 
-func (p *llamaAdapter) KV(baseKV ggml.KV) ggml.KV {
+func (p *llamaAdapter) KV(baseKV KV) KV {
 	kv := p.AdapterParameters.KV()
 	kv["general.architecture"] = "llama"
 	kv["llama.attention.head_count"] = baseKV["llama.attention.head_count"]

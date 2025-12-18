@@ -15,7 +15,7 @@ type gemma2Adapter struct {
 
 var _ AdapterConverter = (*gemma2Adapter)(nil)
 
-func (p *gemma2Adapter) KV(baseKV ggml.KV) ggml.KV {
+func (p *gemma2Adapter) KV(baseKV KV) KV {
 	kv := p.AdapterParameters.KV()
 	kv["general.architecture"] = "gemma2"
 	return kv
