@@ -34,14 +34,14 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/ollama/ollama/convert"
 	"github.com/ollama/ollama/fs"
-	fsggml "github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/ml"
 	"github.com/x448/float16"
 )
 
 func init() {
-	// ml.RegisterBackend("mlx", New)
+	ml.RegisterBackend("mlx", New)
 	C.set_error_handler()
 }
 
@@ -59,8 +59,26 @@ type SafetensorsIndex struct {
 }
 
 type Backend struct {
-	meta    *fsggml.GGML
+	meta    fs.Config
 	tensors map[string]*Array
+}
+
+func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
+	// TODO assumes modelPath is actually a directory for now...
+	kv, tokenizer, err := convert.LoadModelMetadata(os.DirFS(modelPath))
+	if err != nil {
+		return nil, fmt.Errorf("unable to load model: %w", err)
+	}
+
+	b := &Backend{
+		meta: kv.KV(tokenizer),
+	}
+
+	err = b.LoadSafeTensors(modelPath)
+	if err != nil {
+		return nil, fmt.Errorf("safetensors load failed: %w", err)
+	}
+	return b, nil
 }
 
 func (b *Backend) LoadSafeTensors(dir string) error {
@@ -123,7 +141,7 @@ func (b *Backend) LoadSafeTensors(dir string) error {
 				name: k,
 				a:    value,
 			}
-			slog.Info("XXX read", "tensor", b.tensors[k], "type", b.tensors[k].TypeString())
+			// slog.Info("XXX read", "tensor", b.tensors[k], "type", b.tensors[k].TypeString())
 		}
 	}
 
@@ -131,8 +149,14 @@ func (b *Backend) LoadSafeTensors(dir string) error {
 }
 
 func (b *Backend) Get(name string) ml.Tensor {
-	slog.Info("Fetching", "tensor", name, "type", b.tensors[name].TypeString())
-	return b.tensors[name]
+	var t ml.Tensor
+	var ok bool
+	if t, ok = b.tensors[name]; !ok {
+		// slog.Warn("unable to locate", "tensor", name)
+		return nil
+	}
+	// slog.Info("Fetching", "tensor", name, "type", b.tensors[name].TypeString())
+	return t
 }
 
 func (b *Backend) NewContext() ml.Context {
@@ -143,7 +167,7 @@ func (b *Backend) NewContext() ml.Context {
 }
 
 func (b *Backend) Config() fs.Config {
-	return b.meta.KV()
+	return b.meta
 }
 
 type Context struct {
@@ -1316,169 +1340,6 @@ func (a *Array) TypeString() string {
 
 // // TODO needs adjusting below here
 // // ------------------------------------------------
-// func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
-// 	r, err := os.Open(modelPath)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	defer r.Close()
-
-// 	meta, err := fsggml.Decode(r, -1)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	// TODO all this loading logic will be replaced by the new model loading abstraction, including any necessary transformations
-// 	// As currently structured, this likely causes a significant performance impact
-
-// 	tensors := make(map[string]*Array, len(meta.Tensors().Items()))
-// 	// sr := io.NewSectionReader(r, int64(meta.Tensors().Offset), n-int64(meta.Tensors().Offset))
-
-// 	slog.Info("initializing MLX GPU backend")
-// 	stream := C.mlx_default_gpu_stream_new()
-
-// 	var g errgroup.Group
-// 	var mu sync.Mutex
-// 	vec := C.mlx_vector_array_new()
-// 	defer C.mlx_vector_array_free(vec)
-// 	// unmutate := func(name string, shape []C.int, r C.mlx_array) error {
-// 	// 	// TODO - is this code memory access safe, or does the delayed processing cause potential memory access after Go frees the stack?
-
-// 	// 	// TODO performance: Since these operations are ~static yet cause a lot of additional nodes in the graph
-// 	// 	// Ideally these should be applied "on the fly" at load time, so the tensor has the data ready to go.
-// 	// 	defer C.mlx_array_free(r)
-
-// 	// 	var n_head []uint64
-// 	// 	if strings.Contains(name, "attn_q") {
-// 	// 		n_head = meta.KV().HeadCount() // Q
-// 	// 	} else {
-// 	// 		n_head = meta.KV().HeadCountKV() // K
-// 	// 	}
-// 	// 	tmpShape := []C.int{C.int(n_head[0] /* WRONG? */), C.int(math.Floor(math.Floor(float64(shape[0]) / float64(n_head[0] /* WRONG?*/) / float64(2)))), 2, shape[1]}
-// 	// 	var shaped C.mlx_array
-// 	// 	C.mlx_reshape(&shaped, r, &tmpShape[0], C.size_t(len(tmpShape)), stream)
-// 	// 	defer C.mlx_array_free(shaped)
-// 	// 	var swapped C.mlx_array
-// 	// 	C.mlx_swapaxes(
-// 	// 		&swapped,
-// 	// 		shaped,
-// 	// 		1,
-// 	// 		2,
-// 	// 		stream,
-// 	// 	)
-// 	// 	defer C.mlx_array_free(swapped)
-
-// 	// 	var reshaped C.mlx_array
-// 	// 	C.mlx_reshape(
-// 	// 		&reshaped,
-// 	// 		swapped,
-// 	// 		&shape[0],
-// 	// 		C.size_t(len(shape)),
-// 	// 		stream,
-// 	// 	)
-// 	// 	mu.Lock()
-// 	// 	defer mu.Unlock()
-// 	// 	C.mlx_vector_array_append_value(vec, reshaped)
-// 	// 	tmp := &Array{a: reshaped, name: name}
-// 	// 	tensors[name] = tmp
-// 	// 	return nil
-// 	// }
-// 	for _, t := range meta.Tensors().Items() {
-// 		g.Go(func() error {
-// 			var b bytes.Buffer
-// 			n, err := io.Copy(&b, io.NewSectionReader(r, int64(meta.Tensors().Offset+t.Offset), int64(t.Size())))
-// 			if err != nil {
-// 				return err
-// 			}
-
-// 			if n != int64(t.Size()) {
-// 				return fmt.Errorf("expected %d bytes, got %d", t.Size(), n)
-// 			}
-
-// 			cbytes := C.CBytes(b.Bytes())
-// 			defer C.free(cbytes)
-
-// 			// Inverted
-// 			shape := make([]C.int, len(t.Shape))
-// 			i := len(t.Shape) - 1
-// 			for _, dim := range t.Shape {
-// 				shape[i] = C.int(dim)
-// 				i--
-// 			}
-// 			var r C.mlx_array
-
-// 			switch t.Kind {
-// 			case 0: // GGML_TYPE_F32
-// 				a := C.mlx_array_new_data(
-// 					cbytes,
-// 					&shape[0],
-// 					C.int(len(shape)),
-// 					C.MLX_FLOAT32,
-// 				)
-// 				// MLX fp32 ops are significantly slower than fp16
-// 				C.mlx_astype(
-// 					&r,
-// 					a,
-// 					C.MLX_FLOAT16,
-// 					stream,
-// 				)
-// 				defer C.mlx_array_free(a)
-// 			case 1: // GGML_TYPE_F16
-// 				r = C.mlx_array_new_data(
-// 					cbytes,
-// 					&shape[0],
-// 					C.int(len(shape)),
-// 					C.MLX_FLOAT16,
-// 				)
-// 			case 30: // GGML_TYPE_BF16
-// 				r = C.mlx_array_new_data(
-// 					cbytes,
-// 					&shape[0],
-// 					C.int(len(shape)),
-// 					C.MLX_BFLOAT16,
-// 				)
-// 			case 2, 8: // GGML_TYPE_Q4_0, GGML_TYPE_Q8_0
-// 				// Note: theoretically GGML_TYPE_Q4_1 (3) should work, but spits out garbage so omitting for now
-// 				r, err = gguf_load_quantized(cbytes, t.Name, shape, t.Kind, stream)
-// 				if err != nil {
-// 					panic(err.Error())
-// 				}
-// 			case 12, 14: // GGML_TYPE_Q4_K, GGML_TYPE_Q6_K
-// 				// TODO any special cases?
-// 				r, err = load_k_quantized(cbytes, t.Name, shape, t.Kind, stream)
-// 				if err != nil {
-// 					panic(err)
-// 				}
-// 			default:
-// 				return fmt.Errorf("unsupported dtype %v", t)
-// 			}
-
-// 			// Q/K are are mutated and we need to reverse that mutation
-// 			// TODO - this is only for llama based models and shouldn't be applied universally
-// 			// but only applies to some backends at the moment...  maybe?
-// 			// if meta.KV().Architecture() == "llama" && (strings.HasSuffix(t.Name, "attn_q.weight") || strings.HasSuffix(t.Name, "attn_q.bias") || strings.HasSuffix(t.Name, "attn_k.weight") || strings.HasSuffix(t.Name, "attn_k.bias")) {
-// 			// 	return unmutate(t.Name, shape, r)
-// 			// }
-// 			mu.Lock()
-// 			defer mu.Unlock()
-// 			C.mlx_vector_array_append_value(vec, r)
-// 			tmp := &Array{a: r, name: t.Name}
-// 			tmp.name = t.Name
-// 			tensors[t.Name] = tmp
-// 			return nil
-// 		})
-// 	}
-
-// 	if err := g.Wait(); err != nil {
-// 		return nil, err
-// 	}
-// 	C.mlx_async_eval(vec)
-
-// 	return &Backend{
-// 		meta:    meta,
-// 		tensors: tensors,
-// 	}, nil
-// }
 
 // type Backend struct {
 // 	meta    *fsggml.GGML

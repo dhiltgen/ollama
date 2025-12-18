@@ -18,10 +18,10 @@ type Model struct {
 	model.Base
 	model.SentencePiece
 
-	*VisionModel `gguf:"v"`
-	*TextModel
+	*VisionModel `gguf:"vision_tower.vision_model"`
+	*TextModel   `gguf:"language_model.model"`
 
-	*MultiModalProjector `gguf:"mm"`
+	*MultiModalProjector `gguf:"multi_modal_projector"`
 
 	ImageProcessor
 }
@@ -30,7 +30,7 @@ var _ model.MultimodalProcessor = (*Model)(nil)
 
 type MultiModalProjector struct {
 	SoftEmbNorm     *nn.RMSNorm `gguf:"mm_soft_emb_norm"`
-	InputProjection *nn.Linear  `gguf:"mm_input_projection"`
+	InputProjection *nn.Linear  `gguf:"mm_input_projection_weight"` // TODO .weight vs _weight
 
 	tokensPerImage int
 }

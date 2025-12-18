@@ -21,10 +21,10 @@ type TextConfig struct {
 }
 
 type TextModel struct {
-	TokenEmbedding *nn.Embedding `gguf:"token_embd"`
-	Layers         []TextLayer   `gguf:"blk"`
-	OutputNorm     *nn.RMSNorm   `gguf:"output_norm"`
-	Output         *nn.Linear    `gguf:"output,alt:token_embd"`
+	TokenEmbedding *nn.Embedding `gguf:"embed_tokens"`
+	Layers         []TextLayer   `gguf:"layers"`
+	OutputNorm     *nn.RMSNorm   `gguf:"norm"`
+	Output         *nn.Linear    `gguf:"embed_tokens"`
 
 	*TextConfig
 }
@@ -82,12 +82,12 @@ func newTextModel(c fs.Config) *TextModel {
 }
 
 type TextSelfAttention struct {
-	Query     *nn.Linear  `gguf:"attn_q"`
-	QueryNorm *nn.RMSNorm `gguf:"attn_q_norm"`
-	Key       *nn.Linear  `gguf:"attn_k"`
-	KeyNorm   *nn.RMSNorm `gguf:"attn_k_norm"`
-	Value     *nn.Linear  `gguf:"attn_v"`
-	Output    *nn.Linear  `gguf:"attn_output"`
+	Query     *nn.Linear  `gguf:"q_proj"`
+	QueryNorm *nn.RMSNorm `gguf:"q_norm"`
+	Key       *nn.Linear  `gguf:"k_proj"`
+	KeyNorm   *nn.RMSNorm `gguf:"k_norm"`
+	Value     *nn.Linear  `gguf:"v_proj"`
+	Output    *nn.Linear  `gguf:"o_proj"`
 }
 
 func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState ml.Tensor, offset int, cache kvcache.Cache, opts *TextConfig) ml.Tensor {
@@ -187,9 +187,9 @@ func (m *TextModel) Shift(ctx ml.Context, layer int, key, shift ml.Tensor) (ml.T
 }
 
 type TextMLP struct {
-	Up   *nn.Linear `gguf:"ffn_up"`
-	Down *nn.Linear `gguf:"ffn_down"`
-	Gate *nn.Linear `gguf:"ffn_gate"`
+	Up   *nn.Linear `gguf:"up_proj"`
+	Down *nn.Linear `gguf:"down_proj"`
+	Gate *nn.Linear `gguf:"gate_proj"`
 }
 
 func (mlp *TextMLP) Forward(ctx ml.Context, hiddenState ml.Tensor, opts *TextConfig) ml.Tensor {
@@ -216,12 +216,12 @@ func (mlp *TextMLP) Forward(ctx ml.Context, hiddenState ml.Tensor, opts *TextCon
 }
 
 type TextLayer struct {
-	AttentionNorm     *nn.RMSNorm `gguf:"attn_norm"`
-	SelfAttention     *TextSelfAttention
-	PostAttentionNorm *nn.RMSNorm `gguf:"post_attention_norm"`
-	MLPNorm           *nn.RMSNorm `gguf:"ffn_norm"`
-	MLP               *TextMLP
-	PostMLPNorm       *nn.RMSNorm `gguf:"post_ffw_norm"`
+	AttentionNorm     *nn.RMSNorm        `gguf:"input_layernorm"`
+	SelfAttention     *TextSelfAttention `gguf:"self_attn"`
+	PostAttentionNorm *nn.RMSNorm        `gguf:"post_attention_layernorm"`
+	MLPNorm           *nn.RMSNorm        `gguf:"pre_feedforward_layernorm"`
+	MLP               *TextMLP           `gguf:"mlp"`
+	PostMLPNorm       *nn.RMSNorm        `gguf:"post_feedforward_layernorm"`
 }
 
 func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, outputs ml.Tensor, offset int, cache kvcache.Cache, opts *TextConfig) ml.Tensor {

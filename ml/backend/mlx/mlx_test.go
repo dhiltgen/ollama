@@ -1,7 +1,6 @@
 package mlx
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"reflect"
@@ -9,15 +8,18 @@ import (
 	"testing"
 
 	"github.com/ollama/ollama/api"
-	"github.com/ollama/ollama/convert"
 	"github.com/ollama/ollama/ml"
-	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/model"
 	"github.com/ollama/ollama/model/input"
-	"github.com/ollama/ollama/model/models/gemma3"
+	_ "github.com/ollama/ollama/model/models/gemma3"
 	"github.com/ollama/ollama/runner/common"
 	"github.com/ollama/ollama/sample"
 )
+
+func init() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
+}
 
 func TestLoadModel(t *testing.T) {
 	dir := "/Users/daniel/Models/gemma-3-4b-it/"
@@ -202,102 +204,20 @@ func TestCaching(t *testing.T) {
 	}
 }
 
-// TODO test case on RMSNorm and LayerNorm, RoPE, ScaledDotProductAttention, Take
-
 func TestGemma3(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	slog.SetDefault(logger)
-
 	// Why is the sky blue
 	inputs := []int32{2, 105, 2364, 107, 36425, 563, 506, 7217, 3730, 106, 107, 105, 4368}
 
 	dir := "/Users/daniel/Models/gemma-3-4b-it/"
 
-	kv, tokenizer, err := convert.LoadModelMetadata(os.DirFS(dir))
+	m, err := model.New(dir, ml.BackendParams{})
 	if err != nil {
 		t.Fatalf("unable to load model: %s", err)
 	}
-	// slog.Info("XXX KV", "kv", kv)
-	// t.Logf("Tokenizer %v", tokenizer)
-
-	m, err := gemma3.New(kv.KV(tokenizer))
-	if err != nil {
-		t.Fatalf("unable to load model: %s", err)
-	}
-
-	b := &Backend{}
+	b := m.Backend()
 	ctx := b.NewContext()
-	err = b.LoadSafeTensors(dir)
-	if err != nil {
-		t.Fatalf("load failed: %s", err)
-	}
 
-	// More hacks...
-	g3 := m.(*gemma3.Model)
-	if g3.TextModel == nil {
-		t.Fatal("nil text model")
-	}
-
-	// TODO Load the layers manually for now
-
-	g3.TextModel.TokenEmbedding = &nn.Embedding{
-		Weight: b.Get("language_model.model.embed_tokens.weight"),
-	}
-	g3.TextModel.OutputNorm = &nn.RMSNorm{
-		Weight: b.Get("language_model.model.norm.weight"),
-	}
-	g3.TextModel.Output = &nn.Linear{
-		Weight: b.Get("language_model.model.embed_tokens.weight"),
-	}
-	for i := range g3.TextModel.Layers {
-		g3.TextModel.Layers[i].AttentionNorm = &nn.RMSNorm{
-			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.input_layernorm.weight", i)),
-		}
-		g3.TextModel.Layers[i].SelfAttention = &gemma3.TextSelfAttention{
-			Query: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.q_proj.weight", i)),
-			},
-			QueryNorm: &nn.RMSNorm{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.q_norm.weight", i)),
-			},
-			Key: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.k_proj.weight", i)),
-			},
-			KeyNorm: &nn.RMSNorm{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.k_norm.weight", i)),
-			},
-			Value: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.v_proj.weight", i)),
-			},
-			Output: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.self_attn.o_proj.weight", i)),
-			},
-		}
-		g3.TextModel.Layers[i].PostAttentionNorm = &nn.RMSNorm{
-			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.post_attention_layernorm.weight", i)),
-		}
-		g3.TextModel.Layers[i].MLPNorm = &nn.RMSNorm{
-			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.pre_feedforward_layernorm.weight", i)),
-		}
-		g3.TextModel.Layers[i].MLP = &gemma3.TextMLP{
-			Up: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.mlp.up_proj.weight", i)),
-			},
-			Down: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.mlp.down_proj.weight", i)),
-			},
-			Gate: &nn.Linear{
-				Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.mlp.gate_proj.weight", i)),
-			},
-		}
-		g3.TextModel.Layers[i].PostMLPNorm = &nn.RMSNorm{
-			Weight: b.Get(fmt.Sprintf("language_model.model.layers.%d.post_feedforward_layernorm.weight", i)),
-		}
-	}
-
-	// TODO multimodal not wired up yet
-
-	// TODO try to run a forward pass with a hard-coded input
+	// TODO try to run a forward pass with a hard-coded text input
 	batch := input.Batch{
 		Inputs:    ctx.FromInts(inputs[:], 1, len(inputs)),
 		Positions: make([]int32, len(inputs)),
@@ -310,7 +230,7 @@ func TestGemma3(t *testing.T) {
 	}
 	offset := len(inputs)
 
-	cache := g3.Config().Cache
+	cache := m.Config().Cache
 	if cache != nil {
 		numSlots := 1
 		batchSize := 512
@@ -340,7 +260,7 @@ func TestGemma3(t *testing.T) {
 	t.Log("Starting Forward pass loop")
 	pendingResponses := []string{}
 	for {
-		out, err := g3.Forward(ctx, batch)
+		out, err := m.Forward(ctx, batch)
 		if err != nil {
 			t.Fatalf("failed forward pass: %s", err)
 		}
@@ -348,12 +268,7 @@ func TestGemma3(t *testing.T) {
 		outputs := out.Floats()
 		t.Logf("finished forward pass!  length:%d", len(outputs))
 		// sample a token
-		// vocabSize := len(outputs) / batch.Outputs.Dim(0)
-
-		logits := outputs // TODO subset?
-		// ctx.CompareWith("/tmp/test", map[string]ml.Tensor{"l": out}, true)
-		// panic("after post attention norm") //
-
+		logits := outputs
 		token, err := sampler.Sample(logits)
 		if err != nil {
 			t.Fatalf("unable to sample token: %s", err)
@@ -388,7 +303,5 @@ func TestGemma3(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed cache.StartForward: %s", err)
 		}
-
 	}
-
 }

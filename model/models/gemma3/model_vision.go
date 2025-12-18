@@ -11,10 +11,10 @@ import (
 var batchSize int = 1
 
 type VisionSelfAttention struct {
-	Query  *nn.Linear `gguf:"attn_q"`
-	Key    *nn.Linear `gguf:"attn_k"`
-	Value  *nn.Linear `gguf:"attn_v"`
-	Output *nn.Linear `gguf:"attn_output"`
+	Query  *nn.Linear `gguf:"self_attn.q_proj"`
+	Key    *nn.Linear `gguf:"self_attn.k_proj"`
+	Value  *nn.Linear `gguf:"self_attn.v_proj"`
+	Output *nn.Linear `gguf:"self_attn.out_proj"`
 }
 
 func (sa *VisionSelfAttention) Forward(ctx ml.Context, hiddenState ml.Tensor, opts *VisionModelOptions) ml.Tensor {
@@ -76,11 +76,11 @@ type VisionModelOptions struct {
 }
 
 type VisionModel struct {
-	PatchEmbedding    *nn.Conv2D    `gguf:"patch_embedding"`
-	PositionEmbedding *nn.Embedding `gguf:"position_embedding"`
+	PatchEmbedding    *nn.Conv2D    `gguf:"embeddings.patch_embedding"`
+	PositionEmbedding *nn.Embedding `gguf:"embeddings.position_embedding"`
 	PostLayerNorm     *nn.LayerNorm `gguf:"post_layernorm"`
 
-	Layers []VisionEncoderLayer `gguf:"blk"`
+	Layers []VisionEncoderLayer `gguf:"encoder.layers"`
 
 	*VisionModelOptions
 }
