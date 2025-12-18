@@ -54,6 +54,7 @@ func (p *MultiModalProjector) Forward(ctx ml.Context, visionOutputs ml.Tensor, i
 }
 
 func New(c fs.Config) (model.Model, error) {
+	// slog.Info("XXX Config", "c", c)
 	m := Model{
 		SentencePiece: model.NewSentencePiece(
 			&model.Vocabulary{

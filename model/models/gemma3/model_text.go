@@ -13,11 +13,11 @@ import (
 )
 
 type TextConfig struct {
-	hiddenSize, numHeads, numKVHeads  int
-	attnKeyLen, attnValLen, vocabSize int
-	eps, ropeScale                    float32
-	ropeLocalBase, ropeGlobalBase     float32
-	largeModelScaling                 bool
+	hiddenSize, numHeads, numKVHeads int
+	attnKeyLen                       int
+	eps, ropeScale                   float32
+	ropeLocalBase, ropeGlobalBase    float32
+	largeModelScaling                bool
 }
 
 type TextModel struct {
@@ -33,37 +33,20 @@ const (
 	gemmaGlobalCacheCount = 6
 	gemma27BLayerCount    = 62
 
-	// Derived from mlx-lm
-	hiddenSize           = int(1152)
-	numHiddenLayers      = int(26)
-	intermediateSize     = int(6912)
-	numAttentionHeads    = int(4)
-	headDim              = int(256)
-	rmsNormEps           = float32(1.0e-6)
-	vocabSize            = int(262144)
-	numKeyValueHeads     = int(1)
-	ropeGlobalBaseFreq   = float32(1000000.0)
-	ropeLocalBaseFreq    = float32(10000.0)
-	ropeTraditional      = false
-	queryPreAttnScalar   = float32(256)
-	slidingWindow        = int(512)
-	slidingWindowPattern = int(6)
-
-	// dim = args.hidden_size
-	// self.n_heads = n_heads = args.num_attention_heads
-	// self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-	// self.repeats = n_heads // n_kv_heads
-	// self.head_dim = head_dim = args.head_dim
-	// self.layer_idx = layer_idx
-
-	// self.scale = args.query_pre_attn_scalar**-0.5
-
+	// TODO some of these are specific to 4b and will need adjustment logic
+	numHeads       = int(8)
+	numKVHeads     = int(4)
+	attnKeyLen     = int(256)
+	eps            = float32(1e-06)
+	ropeLocalBase  = float32(10000.0)
+	ropeGlobalBase = float32(1000000.0)
+	ropeScale      = int(1)
 )
 
-const (
-	cacheTypeSWA = iota
-	cacheTypeCausal
-)
+// const (
+// 	cacheTypeSWA = iota
+// 	cacheTypeCausal
+// )
 
 func newTextModel(c fs.Config) *TextModel {
 	numBlocks := int(c.Uint("block_count"))
@@ -72,21 +55,24 @@ func newTextModel(c fs.Config) *TextModel {
 		Layers: make([]TextLayer, numBlocks),
 		TextConfig: &TextConfig{
 			// hiddenSize:     hiddenSize, //int(c.Uint("embedding_length")),
-			hiddenSize:     int(c.Uint("embedding_length")),
-			vocabSize:      vocabSize,
-			numHeads:       int(c.Uint("attention.head_count")),
-			numKVHeads:     int(c.Uint("attention.head_count_kv")),
-			attnKeyLen:     int(c.Uint("attention.key_length", 256)),
-			attnValLen:     int(c.Uint("attention.value_length", 256)),
-			eps:            c.Float("attention.layer_norm_rms_epsilon", 1e-06),
-			ropeLocalBase:  c.Float("rope.local.freq_base", 10000.0),
-			ropeGlobalBase: c.Float("rope.global.freq_base", 1000000.0),
-			ropeScale:      1,
+			hiddenSize: int(c.Uint("embedding_length")), // 2560 -- config.json: text_config.hidden_size
+
+			numHeads:       int(c.Uint("attention.head_count")),                // 8 -- hard coded in python implementation for the model, 4 in some places, then overridden as 8
+			numKVHeads:     int(c.Uint("attention.head_count_kv")),             // 4 -- same as above
+			attnKeyLen:     int(c.Uint("attention.key_length", 256)),           //256 -- rope settings, hardcoded in model definition python
+			eps:            c.Float("attention.layer_norm_rms_epsilon", 1e-06), // 1e-06 - hardcoded in model definition python
+			ropeLocalBase:  c.Float("rope.local.freq_base", 10000.0),           // 10000 - hardcoded in python
+			ropeGlobalBase: c.Float("rope.global.freq_base", 1000000.0),        // 1e+06 - hardcoded in python
+			ropeScale:      1,                                                  // 1 - default is 1, implied in python code
+			// vocabSize:      vocabSize,                                          // 262144
+			// attnValLen:     int(c.Uint("attention.value_length", 256)),         //256
 			// NOTE: the rope.scaling.factor is set incorrectly in the official QAT weights
 			//       (8 instead of 1)
 			// ropeScale:      c.Float("rope.scaling.factor", 1.0),
 		},
 	}
+	// slog.Info("XXX Metadata", "TextConfig", m.TextConfig)
+	// panic("XXX")
 
 	if numBlocks == gemma27BLayerCount {
 		m.largeModelScaling = true

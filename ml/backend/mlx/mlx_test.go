@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/ollama/ollama/api"
-	fsggml "github.com/ollama/ollama/fs/ggml"
+	"github.com/ollama/ollama/convert"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn"
 	"github.com/ollama/ollama/model"
@@ -205,28 +205,26 @@ func TestCaching(t *testing.T) {
 // TODO test case on RMSNorm and LayerNorm, RoPE, ScaledDotProductAttention, Take
 
 func TestGemma3(t *testing.T) {
-	// Hacky frankenstein partially GGUF partially safetensors...
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	slog.SetDefault(logger)
 
 	// Why is the sky blue
 	inputs := []int32{2, 105, 2364, 107, 36425, 563, 506, 7217, 3730, 106, 107, 105, 4368}
 
-	modelPath := "/Users/daniel/.ollama/models/blobs/sha256-2e1715faf889527461e76d271e827bbe03f3d22b4b86acf6146671d72eb6d11d"
-	r, err := os.Open(modelPath)
-	if err != nil {
-		t.Fatalf("unable to open gemma3:4b-it-fp16: %s", err)
-	}
-	defer r.Close()
+	dir := "/Users/daniel/Models/gemma-3-4b-it/"
 
-	meta, err := fsggml.Decode(r, -1)
-	if err != nil {
-		t.Fatalf("unable to decode: %s", err)
-	}
-
-	m, err := gemma3.New(meta.KV())
+	kv, tokenizer, err := convert.LoadModelMetadata(os.DirFS(dir))
 	if err != nil {
 		t.Fatalf("unable to load model: %s", err)
 	}
-	dir := "/Users/daniel/Models/gemma-3-4b-it/"
+	// slog.Info("XXX KV", "kv", kv)
+	// t.Logf("Tokenizer %v", tokenizer)
+
+	m, err := gemma3.New(kv.KV(tokenizer))
+	if err != nil {
+		t.Fatalf("unable to load model: %s", err)
+	}
+
 	b := &Backend{}
 	ctx := b.NewContext()
 	err = b.LoadSafeTensors(dir)
