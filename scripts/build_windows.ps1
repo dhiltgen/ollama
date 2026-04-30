@@ -308,6 +308,8 @@ function mlxCuda13 {
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
             & cmake --install build\mlx_cuda_v$cudaMajorVer --component "MLX" --strip
             if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --install build\mlx_cuda_v$cudaMajorVer --component "MLX_VENDOR"
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
         } else {
             Write-Output "CUDA v$cudaMajorVer not detected, skipping MLX build"
         }
