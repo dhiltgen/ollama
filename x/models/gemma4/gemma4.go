@@ -116,6 +116,8 @@ type Attention struct {
 	QNorm *nn.RMSNorm
 	KNorm *nn.RMSNorm
 
+	FusedKV *fusedLinearSet
+
 	// Norm weight for Q/K RMSNorm.
 	QNormScaled *mlx.Array
 	KNormScaled *mlx.Array
@@ -123,9 +125,25 @@ type Attention struct {
 
 // MLP is the feed-forward network with GELU activation.
 type MLP struct {
-	GateProj nn.LinearLayer
-	UpProj   nn.LinearLayer
-	DownProj nn.LinearLayer
+	GateProj    nn.LinearLayer
+	UpProj      nn.LinearLayer
+	DownProj    nn.LinearLayer
+	FusedGateUp *fusedLinearSet
+}
+
+type fusedLinearSet struct {
+	Weight *mlx.Array
+	Scales *mlx.Array
+	Biases *mlx.Array
+
+	OutBiases       []*mlx.Array
+	OutGlobalScales []*mlx.Array
+	OutDims         []int32
+
+	GroupSize int
+	Bits      int
+	Mode      string
+	Quantized bool
 }
 
 // stackedExpertResult holds the result of collecting and stacking per-expert weights.
@@ -159,6 +177,161 @@ func sliceAxis1(a *mlx.Array, start, stop int32) *mlx.Array {
 	beg[1] = start
 	end[1] = stop
 	return mlx.SliceStartStop(a, beg, end)
+}
+
+func validArray(a *mlx.Array) bool {
+	return a != nil && a.Valid()
+}
+
+func sameShapeExcept(a, b *mlx.Array, axis int) bool {
+	if !validArray(a) || !validArray(b) || a.NumDims() != b.NumDims() {
+		return false
+	}
+	for i := 0; i < a.NumDims(); i++ {
+		if i != axis && a.Dim(i) != b.Dim(i) {
+			return false
+		}
+	}
+	return true
+}
+
+func concatMaterialized(a, b *mlx.Array, axis int) *mlx.Array {
+	if !validArray(a) || !validArray(b) {
+		return nil
+	}
+	out := mlx.Concatenate([]*mlx.Array{a, b}, axis).Clone()
+	mlx.Eval(out)
+	return out
+}
+
+func concatMaterializedMany(arrays []*mlx.Array, axis int) *mlx.Array {
+	if len(arrays) == 0 {
+		return nil
+	}
+	for _, a := range arrays {
+		if !validArray(a) {
+			return nil
+		}
+	}
+	out := mlx.Concatenate(arrays, axis).Clone()
+	mlx.Eval(out)
+	return out
+}
+
+func splitLastDim(a *mlx.Array, outDims []int32) []*mlx.Array {
+	shape := a.Dims()
+	out := make([]*mlx.Array, 0, len(outDims))
+	offset := int32(0)
+	for _, dim := range outDims {
+		start := make([]int32, len(shape))
+		stop := make([]int32, len(shape))
+		for i, d := range shape {
+			stop[i] = int32(d)
+		}
+		start[len(start)-1] = offset
+		stop[len(stop)-1] = offset + dim
+		out = append(out, mlx.SliceStartStop(a, start, stop))
+		offset += dim
+	}
+	return out
+}
+
+func tryFuseGateUpLinear(gate, up nn.LinearLayer) *fusedLinearSet {
+	return tryFuseLinearSet(gate, up)
+}
+
+func tryFuseLinearSet(layers ...nn.LinearLayer) *fusedLinearSet {
+	if len(layers) < 2 {
+		return nil
+	}
+	switch first := layers[0].(type) {
+	case *nn.QuantizedLinear:
+		qLayers := make([]*nn.QuantizedLinear, len(layers))
+		weights := make([]*mlx.Array, len(layers))
+		scales := make([]*mlx.Array, len(layers))
+		outBiases := make([]*mlx.Array, len(layers))
+		outGlobalScales := make([]*mlx.Array, len(layers))
+		outDims := make([]int32, len(layers))
+		hasQBiases := validArray(first.QBiases)
+
+		for i, layer := range layers {
+			ql, ok := layer.(*nn.QuantizedLinear)
+			if !ok || ql.GroupSize != first.GroupSize || ql.Bits != first.Bits || ql.Mode != first.Mode {
+				return nil
+			}
+			if !sameShapeExcept(first.Weight, ql.Weight, 0) || !sameShapeExcept(first.Scales, ql.Scales, 0) {
+				return nil
+			}
+			if validArray(ql.QBiases) != hasQBiases {
+				return nil
+			}
+			if hasQBiases && !sameShapeExcept(first.QBiases, ql.QBiases, 0) {
+				return nil
+			}
+			qLayers[i] = ql
+			weights[i] = ql.Weight
+			scales[i] = ql.Scales
+			outBiases[i] = ql.Bias
+			outGlobalScales[i] = ql.GlobalScale
+			outDims[i] = ql.OutputDim()
+		}
+
+		weight := concatMaterializedMany(weights, 0)
+		scale := concatMaterializedMany(scales, 0)
+		if weight == nil || scale == nil {
+			return nil
+		}
+
+		var qbiases *mlx.Array
+		if hasQBiases {
+			qbiasParts := make([]*mlx.Array, len(qLayers))
+			for i, ql := range qLayers {
+				qbiasParts[i] = ql.QBiases
+			}
+			qbiases = concatMaterializedMany(qbiasParts, 0)
+			if qbiases == nil {
+				return nil
+			}
+		}
+
+		return &fusedLinearSet{
+			Weight:          weight,
+			Scales:          scale,
+			Biases:          qbiases,
+			OutBiases:       outBiases,
+			OutGlobalScales: outGlobalScales,
+			OutDims:         outDims,
+			GroupSize:       first.GroupSize,
+			Bits:            first.Bits,
+			Mode:            first.Mode,
+			Quantized:       true,
+		}
+	case *nn.Linear:
+		weights := make([]*mlx.Array, len(layers))
+		outBiases := make([]*mlx.Array, len(layers))
+		outDims := make([]int32, len(layers))
+		for i, layer := range layers {
+			l, ok := layer.(*nn.Linear)
+			if !ok || !sameShapeExcept(first.Weight, l.Weight, 0) {
+				return nil
+			}
+			weights[i] = l.Weight
+			outBiases[i] = l.Bias
+			outDims[i] = l.OutputDim()
+		}
+		weight := concatMaterializedMany(weights, 0)
+		if weight == nil {
+			return nil
+		}
+		return &fusedLinearSet{
+			Weight:          weight,
+			OutBiases:       outBiases,
+			OutGlobalScales: make([]*mlx.Array, len(layers)),
+			OutDims:         outDims,
+		}
+	default:
+		return nil
+	}
 }
 
 // transposeForGatherMM transposes stacked expert weights from [experts, out, in]
@@ -714,6 +887,9 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		layer.Attention.KProj = linears.Make(layerPrefix + ".self_attn.k_proj")
 		layer.Attention.VProj = linears.Make(layerPrefix + ".self_attn.v_proj")
 		layer.Attention.OProj = linears.Make(layerPrefix + ".self_attn.o_proj")
+		if layer.Attention.VProj != nil {
+			layer.Attention.FusedKV = tryFuseLinearSet(layer.Attention.KProj, layer.Attention.VProj)
+		}
 
 		if w := tensors[layerPrefix+".self_attn.q_norm.weight"]; w != nil {
 			layer.Attention.QNorm = nn.NewRMSNorm(w, m.RMSNormEps)
@@ -726,6 +902,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		layer.MLP.GateProj = linears.Make(layerPrefix + ".mlp.gate_proj")
 		layer.MLP.UpProj = linears.Make(layerPrefix + ".mlp.up_proj")
 		layer.MLP.DownProj = linears.Make(layerPrefix + ".mlp.down_proj")
+		layer.MLP.FusedGateUp = tryFuseGateUpLinear(layer.MLP.GateProj, layer.MLP.UpProj)
 
 		// Layer scalar (all layers in new weights, was full-attention only in earlier releases).
 		if w := tensors[layerPrefix+".layer_scalar"]; w != nil {
@@ -1118,7 +1295,8 @@ func (m *Model) NewCaches() []cache.Cache {
 }
 
 // computePLEInputs computes per-layer embeddings and projections.
-// Returns shape [B, L, NumHiddenLayers, HiddenSizePerLayer].
+// Returns shape [NumHiddenLayers, B, L, HiddenSizePerLayer] so each layer
+// receives a layout-friendly [B, L, HiddenSizePerLayer] slice.
 func (m *Model) computePLEInputs(tokens, h *mlx.Array) *mlx.Array {
 	dims := tokens.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
@@ -1143,18 +1321,20 @@ func (m *Model) computePLEInputs(tokens, h *mlx.Array) *mlx.Array {
 	// Combine: (proj + emb) * 2^(-0.5)
 	combined := mlx.Add(pleProj, pleEmb)
 	combined = mlx.MulScalar(combined, m.PLECombineScale)
+	combined = mlx.Transpose(combined, 2, 0, 1, 3)
+	combined = mlx.Contiguous(combined, false)
 
 	return combined
 }
 
 // sliceLayerDim extracts a single layer's PLE input from the combined tensor.
-// Input shape: [B, L, NumLayers, PLEDim], output shape: [B, L, PLEDim].
+// Input shape: [NumLayers, B, L, PLEDim], output shape: [B, L, PLEDim].
 func sliceLayerDim(combined *mlx.Array, layerIdx, B, L, pleDim int32) *mlx.Array {
 	sliced := mlx.SliceStartStop(combined,
-		[]int32{0, 0, layerIdx, 0},
-		[]int32{B, L, layerIdx + 1, pleDim},
+		[]int32{layerIdx, 0, 0, 0},
+		[]int32{layerIdx + 1, B, L, pleDim},
 	)
-	return mlx.Squeeze(sliced, 2)
+	return mlx.Squeeze(sliced, 0)
 }
 
 func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *TextConfig, pleInput *mlx.Array, donor *sharedHistory) (*mlx.Array, *sharedHistory) {
@@ -1241,13 +1421,20 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 			kvHeads = cfg.NumGlobalKeyValueHeads
 		}
 
-		k := a.KProj.Forward(x)
+		var k, v *mlx.Array
+		if a.FusedKV != nil {
+			parts := a.FusedKV.Forward(x)
+			k, v = parts[0], parts[1]
+		} else {
+			k = a.KProj.Forward(x)
+			if a.VProj != nil {
+				v = a.VProj.Forward(x)
+			}
+		}
 		k = mlx.Reshape(k, B, L, kvHeads, headDim)
 		k = mlx.Transpose(k, 0, 2, 1, 3)
 
-		var v *mlx.Array
-		if a.VProj != nil {
-			v = a.VProj.Forward(x)
+		if v != nil {
 			v = mlx.Reshape(v, B, L, kvHeads, headDim)
 			v = mlx.Transpose(v, 0, 2, 1, 3)
 		} else {
@@ -1276,52 +1463,15 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 		}
 	}
 
-	var out *mlx.Array
-	if headDim > 128 && L > 1 && !mlx.MetalIsAvailable() {
-		// Manual attention for CUDA prefill with head_dim > 128.
-		// cuDNN SDPA requires head_dim <= 128, and the MLX CUDA SDPA vector
-		// kernel only handles L < 4 (generation). For prefill, we fall back
-		// to explicit matmul+softmax+matmul on CUDA.
-		var k, v *mlx.Array
-		mask := nn.CausalMask().Intersect(nn.QPaddingMask(b, q.DType()))
-		if kv.history != nil {
-			k, v = kv.history.K(), kv.history.V()
-			mask = kv.history.Mask(mask)
-		} else {
-			k, v = kv.k, kv.v
-			mask = mask.Intersect(nn.KPaddingMask(b, k.Dim(2), b.SeqQueryLens, q.DType()))
-			mask = mask.Intersect(kv.mask)
-		}
-		kvHeads := int32(k.Dim(1))
-		nRepeats := cfg.NumAttentionHeads / kvHeads
-		kLen := int32(k.Dim(2))
-		// AsArray returns [B, 1, L, K]; reshape to rank 5 so that
-		// right-to-left broadcast against scores [B, kvHeads,
-		// nRepeats, L, K] aligns the batch dim correctly.
-		maskArr := mlx.Reshape(mask.AsArray(b, int(kLen), q.DType()), B, 1, 1, L, kLen)
-
-		q = mlx.MulScalar(q, scale)
-		q = mlx.Reshape(q, B, kvHeads, nRepeats, L, headDim)
-		k = mlx.Reshape(k, B, kvHeads, 1, kLen, headDim)
-		v = mlx.Reshape(v, B, kvHeads, 1, kLen, headDim)
-
-		kT := mlx.Transpose(k, 0, 1, 2, 4, 3)
-		scores := mlx.Matmul(q, kT)
-		scores = mlx.Add(scores, maskArr)
-		scores = mlx.SoftmaxAxis(scores, -1, true)
-		out = mlx.Matmul(scores, v)
-		out = mlx.Reshape(out, B, cfg.NumAttentionHeads, L, headDim)
+	var opt nn.SDPAOption
+	mask := nn.CausalMask()
+	if kv.history != nil {
+		opt = nn.WithKVHistory(kv.history)
 	} else {
-		var opt nn.SDPAOption
-		mask := nn.CausalMask()
-		if kv.history != nil {
-			opt = nn.WithKVHistory(kv.history)
-		} else {
-			opt = nn.WithKV(kv.k, kv.v, b.SeqQueryLens)
-			mask = mask.Intersect(kv.mask)
-		}
-		out = nn.ScaledDotProductAttention(b, q, scale, opt, nn.WithMask(mask))
+		opt = nn.WithKV(kv.k, kv.v, b.SeqQueryLens)
+		mask = mask.Intersect(kv.mask)
 	}
+	out := nn.ScaledDotProductAttention(b, q, scale, opt, nn.WithMask(mask))
 	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*headDim)
 	if !mlx.MetalIsAvailable() {
 		// Force contiguous layout before OProj on CUDA where matmul handles
@@ -1332,9 +1482,33 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 }
 
 func (m *MLP) Forward(x *mlx.Array) *mlx.Array {
+	if m.FusedGateUp != nil {
+		parts := m.FusedGateUp.Forward(x)
+		return m.DownProj.Forward(mlx.GeGLU(parts[0], parts[1]))
+	}
 	gate := m.GateProj.Forward(x)
 	up := m.UpProj.Forward(x)
 	return m.DownProj.Forward(mlx.GeGLU(gate, up))
+}
+
+func (f *fusedLinearSet) Forward(x *mlx.Array) []*mlx.Array {
+	var out *mlx.Array
+	if f.Quantized {
+		out = mlx.FastQuantizedMatmul(x, f.Weight, f.Scales, f.Biases, true, f.GroupSize, f.Bits, f.Mode)
+	} else {
+		out = x.Matmul(f.Weight.Transpose(1, 0))
+	}
+
+	parts := splitLastDim(out, f.OutDims)
+	for i := range parts {
+		if validArray(f.OutGlobalScales[i]) {
+			parts[i] = mlx.Mul(parts[i], f.OutGlobalScales[i])
+		}
+		if validArray(f.OutBiases[i]) {
+			parts[i] = parts[i].Add(f.OutBiases[i])
+		}
+	}
+	return parts
 }
 
 // Forward runs the router to select top-k experts per token.
