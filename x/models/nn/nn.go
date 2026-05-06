@@ -114,10 +114,10 @@ func (ql *QuantizedLinear) Forward(x *mlx.Array) *mlx.Array {
 		// F32 scalar (weight_scale_2 in NVIDIA's format).
 		// TODO: switch to a fused double-scale matmul once MLX has kernel
 		// coverage for this path.
-		out = mlx.QuantizedMatmul(x, ql.Weight, ql.Scales, ql.QBiases, true, ql.GroupSize, ql.Bits, ql.Mode)
+		out = mlx.FastQuantizedMatmul(x, ql.Weight, ql.Scales, ql.QBiases, true, ql.GroupSize, ql.Bits, ql.Mode)
 		out = mlx.Mul(out, ql.GlobalScale)
 	} else {
-		out = mlx.QuantizedMatmul(x, ql.Weight, ql.Scales, ql.QBiases, true, ql.GroupSize, ql.Bits, ql.Mode)
+		out = mlx.FastQuantizedMatmul(x, ql.Weight, ql.Scales, ql.QBiases, true, ql.GroupSize, ql.Bits, ql.Mode)
 	}
 	if ql.Bias != nil && ql.Bias.Valid() {
 		out = out.Add(ql.Bias)
