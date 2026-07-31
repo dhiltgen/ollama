@@ -493,11 +493,15 @@ func suppressAudioCapability(m *Model, arch string) bool {
 }
 
 func isNemotron3NanoSafetensors(m *Model) bool {
-	return m.Config.ModelFormat == "safetensors" &&
-		(m.Config.Parser == "nemotron-3-nano" ||
-			m.Config.Renderer == "nemotron-3-nano" ||
-			m.Config.ModelFamily == "nemotron_h_omni" ||
-			slices.Contains(m.Config.ModelFamilies, "nemotron_h_omni"))
+	return isNemotron3NanoSafetensorsConfig(m.Config)
+}
+
+func isNemotron3NanoSafetensorsConfig(cfg model.ConfigV2) bool {
+	return cfg.ModelFormat == "safetensors" &&
+		(cfg.Parser == "nemotron-3-nano" ||
+			cfg.Renderer == "nemotron-3-nano" ||
+			cfg.ModelFamily == "nemotron_h_omni" ||
+			slices.Contains(cfg.ModelFamilies, "nemotron_h_omni"))
 }
 
 func projectorHasAudio(f *gguf.File) bool {
