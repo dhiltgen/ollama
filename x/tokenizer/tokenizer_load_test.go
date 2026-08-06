@@ -1,9 +1,30 @@
 package tokenizer
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestSpecialTokenConfigKeepsStringEOSAlongsideGenerationEOS(t *testing.T) {
+	tok := &Tokenizer{
+		vocab: &Vocabulary{BOS: -1, PAD: -1},
+		specialTokens: map[string]int32{
+			"</s>":       2,
+			"<|im_end|>": 11,
+		},
+	}
+
+	applySpecialTokenConfig(tok, specialTokenConfigData{
+		generationConfigJSON: []byte(`{"eos_token_id":2}`),
+		tokenizerConfigJSON:  []byte(`{"eos_token":"<|im_end|>"}`),
+		specialTokensMapJSON: []byte(`{"eos_token":{"content":"<|im_end|>"}}`),
+	})
+
+	if got, want := tok.EOSTokens(), []int32{2, 11}; !slices.Equal(got, want) {
+		t.Fatalf("EOS tokens = %v, want %v", got, want)
+	}
+}
 
 func TestLoadFromBytesRejectsWordPiece(t *testing.T) {
 	data := []byte(`{

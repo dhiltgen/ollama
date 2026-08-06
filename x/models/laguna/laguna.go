@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
 
 	"github.com/ollama/ollama/x/mlxrunner/batch"
@@ -665,6 +666,16 @@ func canFuseQuantizedGateUp(gateW, upW *stackedExpertWeights) bool {
 	return gateW.Weight.NumDims() == 3 && upW.Weight.NumDims() == 3
 }
 
+func deviceSupportsQuantizedGateUpFusion() bool {
+	return platformSupportsQuantizedGateUpFusion(runtime.GOOS, runtime.GOARCH)
+}
+
+func platformSupportsQuantizedGateUpFusion(goos, goarch string) bool {
+	// Packing the full expert stacks exceeds the usable shared system-memory
+	// budget on Windows/ARM64 during load. Keep the unfused representation.
+	return goos != "windows" || goarch != "arm64"
+}
+
 func canFuseDenseQuantizedLinears(a, b *nn.QuantizedLinear) bool {
 	if a == nil || b == nil || a.Scales == nil || b.Scales == nil {
 		return false
@@ -1092,7 +1103,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			}
 			sw := &SwitchMLP{}
 			if gateW.Scales != nil && upW.Scales != nil {
-				if canFuseQuantizedGateUp(gateW, upW) {
+				if canFuseQuantizedGateUp(gateW, upW) && deviceSupportsQuantizedGateUpFusion() {
 					sw.GateUpWeightQ = fuseExpertStacks(gateW.Weight, upW.Weight, 1)
 					sw.GateUpScales = fuseExpertStacks(gateW.Scales, upW.Scales, 1)
 					sw.GateUpBiases = fuseExpertStacks(gateW.Biases, upW.Biases, 1)
@@ -1239,7 +1250,11 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 		idxAll := mlx.Flatten(idxFlat)
 		order := mlx.Argsort(idxAll, 0)
 		invOrder = mlx.Argsort(order, 0)
-		xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
+		if sortedX, ok := mlx.FastSortedMoEDispatch(xFlat, order); ok {
+			xFlat = sortedX
+		} else {
+			xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
+		}
 		idxFlat = mlx.Reshape(mlx.Take(idxAll, order, 0), n, 1)
 	}
 
@@ -1280,7 +1295,11 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 		down = mlx.GatherMM(hidden, weightForGatherMM(s.DownWeight, s.DownWeightSourceLayout), nil, idxFlat, doSort)
 	}
 	if doSort {
-		down = mlx.Reshape(mlx.Take(mlx.Squeeze(mlx.Squeeze(down, 2), 1), invOrder, 0), B*L, topK, cfg.HiddenSize)
+		if sortedDown, ok := mlx.FastSortedMoEUnsort(down, invOrder); ok {
+			down = mlx.Reshape(sortedDown, B*L, topK, cfg.HiddenSize)
+		} else {
+			down = mlx.Reshape(mlx.Take(mlx.Squeeze(mlx.Squeeze(down, 2), 1), invOrder, 0), B*L, topK, cfg.HiddenSize)
+		}
 	} else {
 		down = mlx.Squeeze(down, 2)
 	}
@@ -1306,6 +1325,15 @@ func (m *SparseMoE) route(xFlat *mlx.Array, cfg *Config) (scores, inds *mlx.Arra
 	var probs, neg *mlx.Array
 	if m.EScoreCorrectionBias != nil && cfg.NumExpertsPerTok == 8 {
 		normalize := cfg.NormTopKProb
+		if normalize && m.SwitchMLP != nil &&
+			m.SwitchMLP.UpGlobalScale == nil && m.SwitchMLP.DownGlobalScale == nil {
+			if scores, inds, ok := mlx.FastSigmoidMoERouter256(
+				gates,
+				m.EScoreCorrectionBias,
+			); ok {
+				return scores, inds, false
+			}
+		}
 		if m.SwitchMLP != nil && m.SwitchMLP.UpGlobalScale != nil && m.SwitchMLP.DownGlobalScale != nil {
 			fn := lagunaSigmoidTopK8Scaled
 			if normalize {

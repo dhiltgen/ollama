@@ -1,14 +1,34 @@
 package mlx
 
+import "sync"
+
 var (
+	supportsFastMamba2ScanWithSnapshot = sync.OnceValue(func() bool {
+		return !CUDAIsAvailable() && MetalIsAvailable()
+	})
+
 	mamba2Scan = &gpuKernel{
 		name:    "mamba2_scan",
 		inputs:  []string{"hidden", "b_state", "c_state", "dt", "state_in", "a", "d", "dt_bias", "T"},
 		outputs: []string{"y", "state_out"},
 		metal:   gpuSource{source: mamba2ScanMetalKernelSource},
+		cuda:    gpuSource{source: mamba2ScanCUDAKernelSource},
+	}
+	mamba2ScanBF16DT = &gpuKernel{
+		name:    "mamba2_scan_bf16_dt",
+		inputs:  []string{"hidden", "b_state", "c_state", "dt", "state_in", "a", "d", "dt_bias", "T"},
+		outputs: []string{"y", "state_out"},
+		metal:   gpuSource{source: mamba2ScanMetalKernelSource},
+		cuda:    gpuSource{source: mamba2ScanCUDAKernelSource},
 	}
 	mamba2ScanSnapshot = &gpuKernel{
 		name:    "mamba2_scan_snapshot",
+		inputs:  []string{"hidden", "b_state", "c_state", "dt", "state_in", "a", "d", "dt_bias", "T", "split"},
+		outputs: []string{"y", "states_out"},
+		metal:   gpuSource{source: mamba2ScanSnapshotMetalKernelSource},
+	}
+	mamba2ScanSnapshotBF16DT = &gpuKernel{
+		name:    "mamba2_scan_snapshot_bf16_dt",
 		inputs:  []string{"hidden", "b_state", "c_state", "dt", "state_in", "a", "d", "dt_bias", "T", "split"},
 		outputs: []string{"y", "states_out"},
 		metal:   gpuSource{source: mamba2ScanSnapshotMetalKernelSource},
@@ -115,11 +135,68 @@ for (int i = 0; i < n_per_t; ++i) {
 }
 `
 
+const mamba2ScanCUDAKernelSource = `
+auto lane = threadIdx.x;
+auto d_idx = blockIdx.y * blockDim.y + threadIdx.y;
+auto bh_idx = blockIdx.z;
+if (d_idx >= D) {
+  return;
+}
+
+auto b_idx = bh_idx / H;
+auto h_idx = bh_idx % H;
+auto g_idx = h_idx / (H / G);
+constexpr int n_per_t = S / 32;
+int t_count = static_cast<int>(*T);
+
+auto state_offset = ((b_idx * H + h_idx) * D + d_idx) * S;
+float state[n_per_t];
+#pragma unroll
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * lane + i;
+  state[i] = static_cast<float>(state_in[state_offset + s_idx]);
+}
+
+for (int t = 0; t < t_count; ++t) {
+  auto bth = (b_idx * t_count + t) * H + h_idx;
+  float dt_raw = static_cast<float>(dt[bth]) + static_cast<float>(dt_bias[h_idx]);
+  float dt_val = fmaxf(dt_raw, 0.0f) + log1pf(expf(-fabsf(dt_raw)));
+  float decay = expf(dt_val * static_cast<float>(a[h_idx]));
+  float x_val = static_cast<float>(hidden[bth * D + d_idx]);
+
+  float out = 0.0f;
+  auto bs_base = ((b_idx * t_count + t) * G + g_idx) * S;
+#pragma unroll
+  for (int i = 0; i < n_per_t; ++i) {
+    auto s_idx = n_per_t * lane + i;
+    float b_val = static_cast<float>(b_state[bs_base + s_idx]);
+    float c_val = static_cast<float>(c_state[bs_base + s_idx]);
+    state[i] = state[i] * decay + x_val * (dt_val * b_val);
+    out += state[i] * c_val;
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    out += __shfl_down_sync(0xffffffff, out, offset);
+  }
+  if (lane == 0) {
+    y[bth * D + d_idx] = out + x_val * static_cast<float>(d[h_idx]);
+  }
+}
+
+#pragma unroll
+for (int i = 0; i < n_per_t; ++i) {
+  auto s_idx = n_per_t * lane + i;
+  state_out[state_offset + s_idx] = state[i];
+}
+`
+
 func mamba2ScanValidate(hidden, bState, cState, dt, state, a, d, dtBias *Array) (B, T, H, G, D, S int, ok bool) {
 	if hidden == nil || bState == nil || cState == nil || dt == nil || state == nil || a == nil || d == nil || dtBias == nil {
 		return 0, 0, 0, 0, 0, 0, false
 	}
-	if hidden.DType() != DTypeFloat32 || bState.DType() != DTypeFloat32 || cState.DType() != DTypeFloat32 || dt.DType() != DTypeFloat32 ||
+	if hidden.DType() != DTypeFloat32 || bState.DType() != DTypeFloat32 || cState.DType() != DTypeFloat32 ||
+		(dt.DType() != DTypeFloat32 && dt.DType() != DTypeBFloat16) ||
 		state.DType() != DTypeFloat32 || a.DType() != DTypeFloat32 || d.DType() != DTypeFloat32 || dtBias.DType() != DTypeFloat32 {
 		return 0, 0, 0, 0, 0, 0, false
 	}
@@ -139,9 +216,8 @@ func mamba2ScanValidate(hidden, bState, cState, dt, state, a, d, dtBias *Array) 
 	B, T, H, D = hd[0], hd[1], hd[2], hd[3]
 	G = bd[2]
 	S = bd[3]
-	// S must be a multiple of the Metal simdgroup width (32): the kernel
-	// partitions the S state slots across 32 lanes (n_per_t = S/32) and
-	// reduces with simd_sum, so a non-multiple would drop tail slots.
+	// Both backends partition the state across a 32-lane SIMD group/warp, so
+	// a non-multiple would drop tail slots during the reduction.
 	if B <= 0 || T <= 0 || H <= 0 || G <= 0 || D <= 0 || S <= 0 || H%G != 0 || S%32 != 0 {
 		return 0, 0, 0, 0, 0, 0, false
 	}
@@ -171,13 +247,26 @@ func mamba2ScanTemplateArgs(B, H, G, D, S int) []gpuIntArg {
 	}
 }
 
-func mamba2ScanMetalKernelApply(hidden, bState, cState, dt, state, a, d, dtBias *Array) (y, nextState *Array, ok bool) {
+func mamba2ScanKernelForDT(dt DType, snapshot bool) *gpuKernel {
+	if snapshot {
+		if dt == DTypeBFloat16 {
+			return mamba2ScanSnapshotBF16DT
+		}
+		return mamba2ScanSnapshot
+	}
+	if dt == DTypeBFloat16 {
+		return mamba2ScanBF16DT
+	}
+	return mamba2Scan
+}
+
+func mamba2ScanKernelApply(hidden, bState, cState, dt, state, a, d, dtBias *Array) (y, nextState *Array, ok bool) {
 	B, T, H, G, D, S, ok := mamba2ScanValidate(hidden, bState, cState, dt, state, a, d, dtBias)
 	if !ok {
 		return nil, nil, false
 	}
 
-	outs, ok := mamba2Scan.applyMetal(gpuLaunch{
+	launch := gpuLaunch{
 		ints: mamba2ScanTemplateArgs(B, H, G, D, S),
 		outputs: []gpuOutputSpec{
 			{"MAMBA2_SCAN_Y", []int32{int32(B), int32(T), int32(H), int32(D)}, DTypeFloat32},
@@ -186,20 +275,25 @@ func mamba2ScanMetalKernelApply(hidden, bState, cState, dt, state, a, d, dtBias 
 		grid:        [3]int{32, D, B * H},
 		threadGroup: [3]int{32, min(D, 4), 1},
 		inputs:      []*Array{hidden, bState, cState, dt, state, a, d, dtBias, FromValue(T)},
-	})
+	}
+	kernel := mamba2ScanKernelForDT(dt.DType(), false)
+	outs, ok := kernel.applyCUDA(launch)
+	if !ok {
+		outs, ok = kernel.applyMetal(launch)
+	}
 	if !ok {
 		return nil, nil, false
 	}
 	return outs[0], outs[1], true
 }
 
-func mamba2ScanSnapshotMetalKernelApply(hidden, bState, cState, dt, state, a, d, dtBias *Array, split int) (y, nextState, snapshotState *Array, ok bool) {
+func mamba2ScanSnapshotKernelApply(hidden, bState, cState, dt, state, a, d, dtBias *Array, split int) (y, nextState, snapshotState *Array, ok bool) {
 	B, T, H, G, D, S, ok := mamba2ScanValidate(hidden, bState, cState, dt, state, a, d, dtBias)
 	if !ok || split <= 0 || split >= T {
 		return nil, nil, nil, false
 	}
 
-	outs, ok := mamba2ScanSnapshot.applyMetal(gpuLaunch{
+	launch := gpuLaunch{
 		ints: mamba2ScanTemplateArgs(B, H, G, D, S),
 		outputs: []gpuOutputSpec{
 			{"MAMBA2_SCAN_SNAPSHOT_Y", []int32{int32(B), int32(T), int32(H), int32(D)}, DTypeFloat32},
@@ -208,7 +302,9 @@ func mamba2ScanSnapshotMetalKernelApply(hidden, bState, cState, dt, state, a, d,
 		grid:        [3]int{32, D, B * H},
 		threadGroup: [3]int{32, min(D, 4), 1},
 		inputs:      []*Array{hidden, bState, cState, dt, state, a, d, dtBias, FromValue(T), FromValue(split)},
-	})
+	}
+	kernel := mamba2ScanKernelForDT(dt.DType(), true)
+	outs, ok := kernel.applyMetal(launch)
 	if !ok {
 		return nil, nil, nil, false
 	}
@@ -228,25 +324,34 @@ func mamba2ScanSnapshotMetalKernelApply(hidden, bState, cState, dt, state, a, d,
 
 // FastMamba2Scan runs the Mamba2 recurrent scan as a fused custom kernel when
 // the backend and shapes are supported. It returns ok=false for unsupported
-// backends or shapes so callers can use a backend-neutral fallback. Inputs must
-// be float32 with shapes:
+// backends or shapes so callers can use a backend-neutral fallback. NVIDIA's
+// high-level libraries do not expose this stateful selective-scan recurrence.
+// Inputs use float32 state math, while dt may be float32 or bfloat16, with shapes:
 // hidden [B,T,H,D], bState/cState [B,T,G,S] where H%G==0, dt [B,T,H],
 // state [B,H,D,S], and a/d/dtBias [H].
 func FastMamba2Scan(hidden, bState, cState, dt, state, a, d, dtBias *Array) (y, nextState *Array, ok bool) {
-	if y, nextState, ok := mamba2ScanMetalKernelApply(hidden, bState, cState, dt, state, a, d, dtBias); ok {
+	if y, nextState, ok := mamba2ScanKernelApply(hidden, bState, cState, dt, state, a, d, dtBias); ok {
 		return y, nextState, true
 	}
 	return nil, nil, false
 }
 
 // FastMamba2ScanWithSnapshot runs one fused scan and also returns the recurrent
-// state after split tokens. It returns ok=false for unsupported backends or
-// shapes so callers can use a backend-neutral fallback. The helper preserves
-// the RecurrentCache snapshot contract without forcing the model to launch
-// separate prefix/suffix scans.
+// state after split tokens. CUDA deliberately falls back to segmented scan
+// calls: its single-launch capture produced invalid output after restoring a
+// recurrent prefix-cache snapshot. Metal retains its established fused path.
 func FastMamba2ScanWithSnapshot(hidden, bState, cState, dt, state, a, d, dtBias *Array, split int) (y, nextState, snapshotState *Array, ok bool) {
-	if y, nextState, snapshotState, ok := mamba2ScanSnapshotMetalKernelApply(hidden, bState, cState, dt, state, a, d, dtBias, split); ok {
+	if !SupportsFastMamba2ScanWithSnapshot() {
+		return nil, nil, nil, false
+	}
+	if y, nextState, snapshotState, ok := mamba2ScanSnapshotKernelApply(hidden, bState, cState, dt, state, a, d, dtBias, split); ok {
 		return y, nextState, snapshotState, true
 	}
 	return nil, nil, nil, false
+}
+
+// SupportsFastMamba2ScanWithSnapshot reports whether the backend can capture
+// an interior recurrent state in the same launch as the scan.
+func SupportsFastMamba2ScanWithSnapshot() bool {
+	return supportsFastMamba2ScanWithSnapshot()
 }

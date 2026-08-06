@@ -259,6 +259,10 @@ func mergeWithChild(node *trieNode, caches []cache.Cache, counter *int64) {
 		childSnaps := child.swapSnapshots(nil, counter)
 		merged := make([]cache.Snapshot, len(caches))
 		for i := range caches {
+			if caches[i] == nil {
+				continue
+			}
+
 			var ps, cs cache.Snapshot
 			if nodeSnaps != nil {
 				ps = nodeSnaps[i]

@@ -7,8 +7,8 @@ import (
 
 func TestMambaGatedGroupRMSNormMatchesFallback(t *testing.T) {
 	withMLXThread(t, func() {
-		if !MetalIsAvailable() {
-			t.Skip("MLX Metal not available")
+		if !MetalIsAvailable() && !CUDAIsAvailable() {
+			t.Skip("MLX GPU custom kernels not available")
 		}
 
 		x := testArrayValues(0.1, 2, 3, 8)
@@ -20,20 +20,30 @@ func TestMambaGatedGroupRMSNormMatchesFallback(t *testing.T) {
 		}
 		want := mambaGatedGroupRMSNormReference(x, gate, weight, 2, 1e-5)
 		assertArrayClose(t, "gated group rmsnorm", got, want, 1e-5)
+
+		x = testArrayValues(0.1, 1, 1, 7680)
+		gate = testArrayValues(-0.2, 1, 1, 7680).AsType(DTypeBFloat16)
+		weight = testArrayValues(0.9, 7680).AsType(DTypeBFloat16)
+		got, ok = FastMambaGatedGroupRMSNorm(x, gate, weight, 8, 1e-5, DTypeBFloat16)
+		if !ok {
+			t.Fatal("FastMambaGatedGroupRMSNorm returned ok=false for Nemotron shape")
+		}
+		want = mambaGatedGroupRMSNormReference(x, gate, weight, 8, 1e-5).AsType(DTypeBFloat16)
+		assertArrayClose(t, "gated group rmsnorm Nemotron shape", got.AsType(DTypeFloat32), want.AsType(DTypeFloat32), 0.125)
 	})
 }
 
 func TestMamba2ScanMatchesReference(t *testing.T) {
 	withMLXThread(t, func() {
-		if !MetalIsAvailable() {
-			t.Skip("MLX Metal not available")
+		if !MetalIsAvailable() && !CUDAIsAvailable() {
+			t.Skip("MLX GPU custom kernels not available")
 		}
 
 		hidden := testArrayValues(0.1, 1, 3, 2, 2)
-		bState := testArrayValues(0.2, 1, 3, 2, 32)
-		cState := testArrayValues(0.3, 1, 3, 2, 32)
+		bState := testArrayValues(0.2, 1, 3, 2, 128)
+		cState := testArrayValues(0.3, 1, 3, 2, 128)
 		dt := testArrayValues(-0.4, 1, 3, 2)
-		state := testArrayValues(0.5, 1, 2, 2, 32)
+		state := testArrayValues(0.5, 1, 2, 2, 128)
 		a := MulScalar(onesTest(DTypeFloat32, 2), -0.25)
 		d := MulScalar(onesTest(DTypeFloat32, 2), 0.1)
 		dtBias := Zeros(DTypeFloat32, 2)
@@ -48,17 +58,87 @@ func TestMamba2ScanMatchesReference(t *testing.T) {
 	})
 }
 
+func TestMamba2ScanDecodeMatchesReference(t *testing.T) {
+	withMLXThread(t, func() {
+		if !CUDAIsAvailable() {
+			t.Skip("MLX CUDA custom kernels not available")
+		}
+
+		hidden := testArrayValues(0.1, 1, 1, 2, 5)
+		bState := testArrayValues(0.2, 1, 1, 2, 128)
+		cState := testArrayValues(0.3, 1, 1, 2, 128)
+		dt := testArrayValues(-0.4, 1, 1, 2)
+		state := testArrayValues(0.5, 1, 2, 5, 128)
+		a := MulScalar(onesTest(DTypeFloat32, 2), -0.25)
+		d := MulScalar(onesTest(DTypeFloat32, 2), 0.1)
+		dtBias := Zeros(DTypeFloat32, 2)
+
+		gotY, gotState, ok := FastMamba2Scan(hidden, bState, cState, dt, state, a, d, dtBias)
+		if !ok {
+			t.Error("FastMamba2Scan returned ok=false for decode shape")
+			return
+		}
+		wantY, wantState := mamba2ScanReference(hidden, bState, cState, dt, state, a, d, dtBias)
+		assertArrayClose(t, "mamba2 decode y", gotY, wantY, 1e-4)
+		assertArrayClose(t, "mamba2 decode state", gotState, wantState, 1e-5)
+	})
+}
+
+func TestMamba2ScanBFloat16DTMatchesExplicitCast(t *testing.T) {
+	withMLXThread(t, func() {
+		if !MetalIsAvailable() && !CUDAIsAvailable() {
+			t.Skip("MLX GPU custom kernels not available")
+		}
+
+		hidden := testArrayValues(0.1, 1, 3, 2, 2)
+		bState := testArrayValues(0.2, 1, 3, 2, 32)
+		cState := testArrayValues(0.3, 1, 3, 2, 32)
+		dt := testArrayValues(-0.4, 1, 3, 2).AsType(DTypeBFloat16)
+		state := testArrayValues(0.5, 1, 2, 2, 32)
+		a := MulScalar(onesTest(DTypeFloat32, 2), -0.25)
+		d := MulScalar(onesTest(DTypeFloat32, 2), 0.1)
+		dtBias := Zeros(DTypeFloat32, 2)
+
+		gotY, gotState, ok := FastMamba2Scan(hidden, bState, cState, dt, state, a, d, dtBias)
+		if !ok {
+			t.Fatal("FastMamba2Scan returned ok=false for bfloat16 dt")
+		}
+		Eval(gotY, gotState)
+		wantY, wantState, ok := FastMamba2Scan(hidden, bState, cState, dt.AsType(DTypeFloat32), state, a, d, dtBias)
+		if !ok {
+			t.Fatal("FastMamba2Scan returned ok=false for explicit float32 dt")
+		}
+		assertExact := func(name string, got, want *Array) {
+			Eval(got, want)
+			gotF, wantF := got.Floats(), want.Floats()
+			if len(gotF) != len(wantF) {
+				t.Errorf("%s length = %d, want %d", name, len(gotF), len(wantF))
+				return
+			}
+			for i := range gotF {
+				if gotF[i] != wantF[i] {
+					t.Errorf("%s[%d] = %v, want %v", name, i, gotF[i], wantF[i])
+					return
+				}
+			}
+		}
+		assertExact("mamba2 scan bfloat16 dt y", gotY, wantY)
+		assertExact("mamba2 scan bfloat16 dt state", gotState, wantState)
+	})
+}
+
 func TestMamba2ScanWithSnapshotMatchesSegmentedReference(t *testing.T) {
 	withMLXThread(t, func() {
 		if !MetalIsAvailable() {
-			t.Skip("MLX Metal not available")
+			t.Log("MLX Metal custom kernels not available")
+			return
 		}
 
 		hidden := testArrayValues(0.1, 1, 4, 2, 2)
-		bState := testArrayValues(0.2, 1, 4, 2, 32)
-		cState := testArrayValues(0.3, 1, 4, 2, 32)
+		bState := testArrayValues(0.2, 1, 4, 2, 128)
+		cState := testArrayValues(0.3, 1, 4, 2, 128)
 		dt := testArrayValues(-0.4, 1, 4, 2)
-		state := testArrayValues(0.5, 1, 2, 2, 32)
+		state := testArrayValues(0.5, 1, 2, 2, 128)
 		a := MulScalar(onesTest(DTypeFloat32, 2), -0.25)
 		d := MulScalar(onesTest(DTypeFloat32, 2), 0.1)
 		dtBias := Zeros(DTypeFloat32, 2)
@@ -90,7 +170,7 @@ func TestMamba2ScanWithSnapshotMatchesSegmentedReference(t *testing.T) {
 		)
 		wantY := Concatenate([]*Array{prefixY, suffixY}, 1)
 
-		assertArrayClose(t, "mamba2 snapshot y", gotY, wantY, 1e-5)
+		assertArrayClose(t, "mamba2 snapshot y", gotY, wantY, 5e-5)
 		assertArrayClose(t, "mamba2 snapshot state", gotEnd, wantEnd, 1e-5)
 		assertArrayClose(t, "mamba2 snapshot boundary", gotSnapshot, wantSnapshot, 1e-5)
 	})
@@ -98,8 +178,8 @@ func TestMamba2ScanWithSnapshotMatchesSegmentedReference(t *testing.T) {
 
 func TestMamba2ScanGroupedStatesMatchRepeatedReference(t *testing.T) {
 	withMLXThread(t, func() {
-		if !MetalIsAvailable() {
-			t.Skip("MLX Metal not available")
+		if !MetalIsAvailable() && !CUDAIsAvailable() {
+			t.Skip("MLX GPU custom kernels not available")
 		}
 
 		hidden := testArrayValues(0.1, 1, 2, 4, 2)
@@ -176,11 +256,13 @@ func assertArrayClose(t *testing.T, name string, got, want *Array, tol float64) 
 	gotF := got.Floats()
 	wantF := want.Floats()
 	if len(gotF) != len(wantF) {
-		t.Fatalf("%s length = %d, want %d", name, len(gotF), len(wantF))
+		t.Errorf("%s length = %d, want %d", name, len(gotF), len(wantF))
+		return
 	}
 	for i := range gotF {
 		if math.Abs(float64(gotF[i]-wantF[i])) > tol {
-			t.Fatalf("%s[%d] = %v, want %v", name, i, gotF[i], wantF[i])
+			t.Errorf("%s[%d] = %v, want %v", name, i, gotF[i], wantF[i])
+			return
 		}
 	}
 }

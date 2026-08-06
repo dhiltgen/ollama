@@ -26,13 +26,16 @@ func loadSafetensorsStream() C.mlx_stream {
 
 // LoadSafetensorsNative loads a safetensors file using MLX's native loader.
 func LoadSafetensorsNative(path string) (*SafetensorsFile, error) {
+	return loadSafetensorsNative(path, loadSafetensorsStream())
+}
+
+func loadSafetensorsNative(path string, stream C.mlx_stream) (*SafetensorsFile, error) {
 	var arrays C.mlx_map_string_to_array
 	var metadata C.mlx_map_string_to_string
 
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	stream := loadSafetensorsStream()
 	defer C.mlx_stream_free(stream)
 
 	if C.mlx_load_safetensors(&arrays, &metadata, cPath, stream) != 0 {
@@ -81,9 +84,36 @@ func (s *SafetensorsFile) Free() {
 	C.mlx_map_string_to_string_free(s.metadata)
 }
 
+// IntegratedDevice reports whether the current CUDA GPU is an integrated
+// (unified-memory) part such as Jetson/GB10/N1x. On these devices giant
+// weight shards are better held in shared system memory than in the much
+// smaller CUDA device memory pool.
+func IntegratedDevice() bool {
+	dev := C.mlx_device_new_type(C.MLX_GPU, 0)
+	defer C.mlx_device_free(dev)
+
+	info := C.mlx_device_info_new()
+	defer C.mlx_device_info_free(info)
+	if C.mlx_device_info_get(&info, dev) != 0 {
+		return false
+	}
+	integrated, ok := deviceInfoSize(info, "integrated")
+	return ok && integrated == 1
+}
+
+// LoadOnHost loads a safetensors file pinned in shared system memory (CPU
+// stream) instead of the device pool, for lazy materialization at use time.
+func LoadOnHost(path string) iter.Seq2[string, *Array] {
+	return loadWithStream(path, C.mlx_default_cpu_stream_new())
+}
+
 func Load(path string) iter.Seq2[string, *Array] {
+	return loadWithStream(path, loadSafetensorsStream())
+}
+
+func loadWithStream(path string, stream C.mlx_stream) iter.Seq2[string, *Array] {
 	return func(yield func(string, *Array) bool) {
-		sf, err := LoadSafetensorsNative(path)
+		sf, err := loadSafetensorsNative(path, stream)
 		if err != nil {
 			return
 		}

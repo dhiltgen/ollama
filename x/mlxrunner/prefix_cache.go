@@ -30,13 +30,17 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/model/base"
 )
 
-const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
+const defaultMaxPagedOutBytes int64 = 8 << 30
 
 type prefixCache struct {
 	root          *trieNode   // root of the prefix trie
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
 	caches        []cache.Cache
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
+
+	maxPagedOutBytes    int64
+	maxPagedOutBytesSet bool
+	cudaTotalMemory     int64
 
 	// draftLookahead is how far the draft caches' entries reference past
 	// their own slot; trie keys pack each token with its look-ahead (see key).
@@ -67,7 +71,10 @@ type cacheSession struct {
 }
 
 func newPrefixCache(m base.Model) *prefixCache {
-	c := &prefixCache{}
+	c := &prefixCache{
+		maxPagedOutBytes:    defaultMaxPagedOutBytes,
+		maxPagedOutBytesSet: true,
+	}
 	if cacheFactory, ok := m.(interface{ NewCaches() []cache.Cache }); ok {
 		c.caches = cacheFactory.NewCaches()
 		return c
@@ -77,6 +84,12 @@ func newPrefixCache(m base.Model) *prefixCache {
 		c.caches[i] = cache.NewKVCache()
 	}
 	return c
+}
+
+func (c *prefixCache) configureDeviceMemory() {
+	if total, _, ok := mlx.CUDADeviceMemory(); ok {
+		c.cudaTotalMemory = int64(total)
+	}
 }
 
 func (c *prefixCache) ensureRoot() {
@@ -499,6 +512,7 @@ func (s *cacheSession) close() {
 	// PrepareSnapshots would overwrite the schedule without closing them,
 	// leaking the pinned/lazy snapshots and their VRAM.
 	s.discardPrefillSnapshots()
+	defer s.cache.observeMemoryPressure()
 
 	offset := s.cache.minCacheOffset()
 	if offset <= 0 {
@@ -513,8 +527,10 @@ func (s *cacheSession) close() {
 		arrays = append(arrays, kv.State()...)
 	}
 
-	// Ensure that if we have run the forward pass and set the metadata
-	// that we also actually have the data.
+	// Keep cache materialization asynchronous. Synchronously evaluating every
+	// cache state at teardown can push otherwise viable near-capacity CUDA
+	// workloads over their memory limit. The completed forward pass has already
+	// contributed to the peak sampled by observeMemoryPressure below.
 	mlx.AsyncEval(arrays...)
 
 	// The caches never advance past the stored keys; anything more
@@ -536,9 +552,63 @@ func (s *cacheSession) close() {
 	}
 }
 
+func constrainedPagedOutLimit(total, peak, pagedOut, current int64) int64 {
+	if total <= 0 || peak < 0 || pagedOut < 0 || current < 0 || peak > total {
+		return current
+	}
+
+	reserve := max(int64(2<<30), total/8)
+	overage := peak - (total - reserve)
+	if overage <= 0 {
+		return current
+	}
+
+	// Keep enough budget for a handful of useful snapshots instead of
+	// repeatedly evicting and recreating the active conversation frontier.
+	floor := min(current, int64(512<<20))
+	return min(current, max(pagedOut-overage, floor))
+}
+
+func (c *prefixCache) pagedOutLimit() int64 {
+	if !c.maxPagedOutBytesSet {
+		return defaultMaxPagedOutBytes
+	}
+	return c.maxPagedOutBytes
+}
+
+func (c *prefixCache) observeMemoryPressure() {
+	if c.cudaTotalMemory <= 0 {
+		return
+	}
+
+	current := c.pagedOutLimit()
+	peak := mlx.PeakMemory()
+	next := constrainedPagedOutLimit(
+		c.cudaTotalMemory,
+		int64(peak),
+		c.pagedOutBytes,
+		current,
+	)
+	if next >= current {
+		return
+	}
+
+	slog.Debug(
+		"reducing prefix cache memory limit",
+		"from", mlx.PrettyBytes(int(current)),
+		"to", mlx.PrettyBytes(int(next)),
+		"peak", mlx.PrettyBytes(peak),
+		"device_total", mlx.PrettyBytes(int(c.cudaTotalMemory)),
+	)
+	c.maxPagedOutBytes = next
+	c.maxPagedOutBytesSet = true
+	c.enforceEvictionPolicy()
+}
+
 // enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
 func (c *prefixCache) enforceEvictionPolicy() {
-	if c.pagedOutBytes <= maxPagedOutBytes {
+	limit := c.pagedOutLimit()
+	if c.pagedOutBytes <= limit {
 		return
 	}
 
@@ -547,7 +617,7 @@ func (c *prefixCache) enforceEvictionPolicy() {
 		activeSet[n] = true
 	}
 
-	for c.pagedOutBytes > maxPagedOutBytes {
+	for c.pagedOutBytes > limit {
 		var best *trieNode
 		walkNodes(c.root, func(n *trieNode) bool {
 			if n == c.root || activeSet[n] || len(n.children) > 1 {

@@ -71,7 +71,7 @@ benchstat -col /name gemma.bench
 | -temperature	| Temperature parameter				| 0.0			|
 | -seed		| Random seed					| 0 (random)		|
 | -timeout	| Timeout in seconds				| 300			|
-| -p		| Prompt text					| (default story prompt)	|
+| -p		| Prompt text					| (default prompt)	|
 | -image	| Image file to include in prompt		| 			|
 | -k		| Keep-alive duration in seconds		| 0			|
 | -format	| Output format (benchstat, csv)		| benchstat		|

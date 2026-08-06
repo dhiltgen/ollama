@@ -1,0 +1,5 @@
+REMOTE_DIR=C:\Users\daniel\AppData\Local\Temp\ollama_test
+REMOTE_EXE=C:\Users\daniel\AppData\Local\Temp\ollama_test\ollama.exe
+REMOTE_LOG=C:\Users\daniel\tmp\server-ollama-windows-smoke-20260727-150153-25271.err.log
+STOP_ONLY_DONE=C:\Users\daniel\AppData\Local\Temp\ollama_test
+

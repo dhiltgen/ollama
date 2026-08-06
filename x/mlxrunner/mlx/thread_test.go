@@ -50,15 +50,22 @@ func stopMLXThread(t *testing.T, thread *mlxthread.Thread) {
 func withMLXThread(t *testing.T, fn func()) {
 	t.Helper()
 
-	thread := startMLXThread(t)
-	defer stopMLXThread(t, thread)
-
-	if err := thread.Do(context.Background(), func() error {
-		fn()
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	runtime.LockOSThread()
+	// Deliberately leave the test goroutine locked. It exits when the test
+	// returns, preventing MLX thread-local state from leaking to another test.
+	if err := CheckInit(); err != nil {
+		t.Skipf("MLX not available: %v", err)
 	}
+	if GPUIsAvailable() {
+		SetDefaultDeviceGPU()
+	}
+	defer func() {
+		Sweep()
+		ClearCache()
+		resetDefaultStreamCache()
+	}()
+
+	fn()
 }
 
 func TestThreadedMLXOperations(t *testing.T) {

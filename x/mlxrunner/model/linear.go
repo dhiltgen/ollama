@@ -81,13 +81,13 @@ func MakeLinearLayer(
 		if globalScale == nil {
 			globalScale = tensors[path+".weight_scale_2"]
 		}
-
 		return &nn.QuantizedLinear{
 			Weight:      w,
 			Scales:      scales,
 			QBiases:     qbiases,
 			Bias:        bias,
 			GlobalScale: globalScale,
+			NativeScale: mlx.NativeQuantizedGlobalScale(globalScale, mode),
 			GroupSize:   groupSize,
 			Bits:        bits,
 			Mode:        mode,

@@ -1,6 +1,17 @@
 package mlx
 
-import "math"
+import (
+	"math"
+	"runtime"
+	"sync"
+)
+
+var gatedDeltaCUDAVectorLoads = sync.OnceValue(func() int {
+	if !cudaPlatformSupportsGatedDeltaVectorLoads(runtime.GOOS, runtime.GOARCH) {
+		return 0
+	}
+	return 1
+})
 
 var gatedDeltaRecurrenceKernel = &gpuKernel{
 	name:    "gated_delta_recurrence",
@@ -97,6 +108,16 @@ auto hv_idx = n % Hv;
 auto hk_idx = hv_idx / (Hv / Hk);
 constexpr int n_per_t = Dk / 32;
 
+union alignas(8) InT4 {
+  uint2 packed;
+  InT values[4];
+};
+
+union alignas(16) StT4 {
+  uint4 packed;
+  StT values[4];
+};
+
 // q, k: [B, T, Hk, Dk]
 auto q_ = q + b_idx * T_val * Hk * Dk + hk_idx * Dk;
 auto k_ = k + b_idx * T_val * Hk * Dk + hk_idx * Dk;
@@ -113,9 +134,20 @@ auto i_state = state_in + (n * Dv + dv_idx) * Dk;
 auto o_state = state_out + (n * Dv + dv_idx) * Dk;
 
 float state[n_per_t];
-for (int i = 0; i < n_per_t; ++i) {
-  auto s_idx = n_per_t * dk_idx + i;
-  state[i] = static_cast<float>(i_state[s_idx]);
+if constexpr (VectorLoads != 0 && n_per_t == 4 && sizeof(StT) == 4) {
+  StT4 packed_state;
+  packed_state.packed =
+      *reinterpret_cast<const uint4*>(i_state + 4 * dk_idx);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    state[i] = static_cast<float>(packed_state.values[i]);
+  }
+} else {
+#pragma unroll
+  for (int i = 0; i < n_per_t; ++i) {
+    auto s_idx = n_per_t * dk_idx + i;
+    state[i] = static_cast<float>(i_state[s_idx]);
+  }
 }
 
 // g: [B, T, Hv]
@@ -123,24 +155,54 @@ auto g_ = g + b_idx * T_val * Hv;
 auto beta_ = beta + b_idx * T_val * Hv;
 
 for (int t = 0; t < T_val; ++t) {
+  InT4 q_values;
+  InT4 k_values;
+  if constexpr (VectorLoads != 0 && n_per_t == 4 && sizeof(InT) == 2) {
+    q_values.packed =
+        *reinterpret_cast<const uint2*>(q_ + 4 * dk_idx);
+    k_values.packed =
+        *reinterpret_cast<const uint2*>(k_ + 4 * dk_idx);
+  }
+
+  float decay = static_cast<float>(g_[hv_idx]);
   float kv_mem = 0.0f;
+#pragma unroll
   for (int i = 0; i < n_per_t; ++i) {
     auto s_idx = n_per_t * dk_idx + i;
-    state[i] = state[i] * static_cast<float>(g_[hv_idx]);
-    kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+    state[i] = state[i] * decay;
+    InT k_value;
+    if constexpr (VectorLoads != 0 && n_per_t == 4 && sizeof(InT) == 2) {
+      k_value = k_values.values[i];
+    } else {
+      k_value = k_[s_idx];
+    }
+    kv_mem += state[i] * static_cast<float>(k_value);
   }
   // Warp reduction (full warp, 32 threads in x)
   for (int offset = 16; offset > 0; offset >>= 1)
     kv_mem += __shfl_down_sync(0xffffffff, kv_mem, offset);
-  kv_mem = __shfl_sync(0xffffffff, kv_mem, 0);
-
-  auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+  float delta = 0.0f;
+  if (tid_x == 0) {
+    delta = (static_cast<float>(v_[dv_idx]) - kv_mem) *
+        static_cast<float>(beta_[hv_idx]);
+  }
+  delta = __shfl_sync(0xffffffff, delta, 0);
 
   float out = 0.0f;
+#pragma unroll
   for (int i = 0; i < n_per_t; ++i) {
     auto s_idx = n_per_t * dk_idx + i;
-    state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
-    out += state[i] * static_cast<float>(q_[s_idx]);
+    InT q_value;
+    InT k_value;
+    if constexpr (VectorLoads != 0 && n_per_t == 4 && sizeof(InT) == 2) {
+      q_value = q_values.values[i];
+      k_value = k_values.values[i];
+    } else {
+      q_value = q_[s_idx];
+      k_value = k_[s_idx];
+    }
+    state[i] = state[i] + static_cast<float>(k_value) * delta;
+    out += state[i] * static_cast<float>(q_value);
   }
   // Warp reduction
   for (int offset = 16; offset > 0; offset >>= 1)
@@ -157,9 +219,20 @@ for (int t = 0; t < T_val; ++t) {
   beta_ += Hv;
 }
 
-for (int i = 0; i < n_per_t; ++i) {
-  auto s_idx = n_per_t * dk_idx + i;
-  o_state[s_idx] = static_cast<StT>(state[i]);
+if constexpr (VectorLoads != 0 && n_per_t == 4 && sizeof(StT) == 4) {
+  StT4 packed_state;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    packed_state.values[i] = static_cast<StT>(state[i]);
+  }
+  *reinterpret_cast<uint4*>(o_state + 4 * dk_idx) =
+      packed_state.packed;
+} else {
+#pragma unroll
+  for (int i = 0; i < n_per_t; ++i) {
+    auto s_idx = n_per_t * dk_idx + i;
+    o_state[s_idx] = static_cast<StT>(state[i]);
+  }
 }
 `
 
@@ -300,7 +373,7 @@ func gatedDeltaRecurrence(q, k, v, g, beta, state *Array) (y, nextState *Array) 
 	if dims, ok := resolveGatedDeltaRecurrenceDims(q, k, v, g, beta, state); ok {
 		outs := gatedDeltaRecurrenceKernel.run(gpuLaunch{
 			dtypes: []gpuDTypeArg{{"InT", q.DType()}, {"StT", state.DType()}},
-			ints:   []gpuIntArg{{"Dk", dims.Dk}, {"Dv", dims.Dv}, {"Hk", dims.Hk}, {"Hv", dims.Hv}},
+			ints:   []gpuIntArg{{"VectorLoads", gatedDeltaCUDAVectorLoads()}, {"Dk", dims.Dk}, {"Dv", dims.Dv}, {"Hk", dims.Hk}, {"Hv", dims.Hv}},
 			outputs: []gpuOutputSpec{
 				{"GATED_DELTA_RECURRENCE_Y", []int32{int32(dims.B), int32(dims.T), int32(dims.Hv), int32(dims.Dv)}, q.DType()},
 				{"GATED_DELTA_RECURRENCE_STATE", []int32{int32(dims.B), int32(dims.Hv), int32(dims.Dv), int32(dims.Dk)}, state.DType()},
@@ -317,6 +390,18 @@ func gatedDeltaRecurrence(q, k, v, g, beta, state *Array) (y, nextState *Array) 
 		panic("mlx: gated-delta recurrence: invalid inputs or unsupported shapes")
 	}
 	return y, nextState
+}
+
+func cudaPlatformSupportsGatedDeltaVectorLoads(goos, goarch string) bool {
+	return goos != "windows" || goarch != "arm64"
+}
+
+// GatedDeltaRecurrence runs the recurrent scan after a caller has already
+// prepared normalized q/k, activated v, decay, and beta tensors. This is the
+// decode-only escape hatch used by fused CUDA preprocessing paths; NVIDIA's
+// high-level libraries do not expose this stateful recurrence.
+func GatedDeltaRecurrence(q, k, v, g, beta, state *Array) (y, nextState *Array) {
+	return gatedDeltaRecurrence(q, k, v, g, beta, state)
 }
 
 // gatedDeltaMaxTokens caps the fused scan length at the current token plus

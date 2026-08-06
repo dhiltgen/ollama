@@ -256,12 +256,12 @@ func TestMambaConvSharedHelperMatchesExplicitPath(t *testing.T) {
 		SeqQueryLens: []int32{L, 1},
 	}
 
-	conv := nn.NewConv1d(mlx.ExpandDims(weight, 2), nil, 1, 0, 1, C)
+	conv := nn.NewConv1d(mlx.ExpandDims(weight, 2), bias, 1, 0, 1, C)
 	got, gotStates := nn.CausalConv1D(b, xBC, conv, convTail,
 		nn.WithRecurrentState(convState, nil),
 		nn.WithSnapshotSplits([]int{1, 2}),
+		nn.WithConvSiLURoundTrip(mlx.DTypeBFloat16),
 	)
-	got = mlx.SiLU(mlx.Add(got, bias))
 
 	mask := nn.PaddingMask(b, L)
 	zero := mlx.FromValue(float32(0))
@@ -269,7 +269,7 @@ func TestMambaConvSharedHelperMatchesExplicitPath(t *testing.T) {
 
 	maskedXBC := mlx.Where(mlx.ExpandDims(mask, 2), xBC, zero.AsType(xBC.DType()))
 	convInput := mlx.Concatenate([]*mlx.Array{convState, maskedXBC}, 1)
-	want := mlx.SiLU(mlx.Add(conv.Forward(convInput), bias))
+	want := mlx.SiLU(conv.Forward(convInput)).AsType(mlx.DTypeBFloat16).AsType(mlx.DTypeFloat32)
 	want = mlx.Where(mlx.ExpandDims(mask, 2), want, zero.AsType(want.DType()))
 	wantStates := []*mlx.Array{
 		nn.CausalConvStateAt(convInput, b.SeqQueryLens, convTail, 1),

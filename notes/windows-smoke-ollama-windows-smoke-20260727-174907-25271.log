@@ -1,0 +1,5 @@
+REMOTE_DIR=C:\Users\daniel\.codex\dist\ollama-mlx-cuda13-sm121a
+REMOTE_EXE=C:\Users\daniel\.codex\dist\ollama-mlx-cuda13-sm121a\bin\ollama.exe
+REMOTE_LOG=C:\Users\daniel\tmp\server-ollama-windows-smoke-20260727-174907-25271.err.log
+STOP_ONLY_DONE=C:\Users\daniel\.codex\dist\ollama-mlx-cuda13-sm121a
+

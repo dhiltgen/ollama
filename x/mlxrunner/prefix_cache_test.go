@@ -9,6 +9,66 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
+func TestConstrainedPagedOutLimit(t *testing.T) {
+	const gib int64 = 1 << 30
+
+	tests := []struct {
+		name                           string
+		total, peak, pagedOut, current int64
+		want                           int64
+	}{
+		{
+			name:     "headroom remains",
+			total:    32 * gib,
+			peak:     27 * gib,
+			pagedOut: 1 * gib,
+			current:  8 * gib,
+			want:     8 * gib,
+		},
+		{
+			name:     "reduce by pressure overage",
+			total:    32 * gib,
+			peak:     31 * gib,
+			pagedOut: 1536 << 20,
+			current:  8 * gib,
+			want:     512 << 20,
+		},
+		{
+			name:     "pressure preserves useful cache floor",
+			total:    32 * gib,
+			peak:     32 * gib,
+			pagedOut: 1 * gib,
+			current:  8 * gib,
+			want:     512 << 20,
+		},
+		{
+			name:     "limit never grows",
+			total:    64 * gib,
+			peak:     61 * gib,
+			pagedOut: 8 * gib,
+			current:  2 * gib,
+			want:     2 * gib,
+		},
+		{
+			name:     "invalid sample is ignored",
+			total:    32 * gib,
+			peak:     33 * gib,
+			pagedOut: 1 * gib,
+			current:  8 * gib,
+			want:     8 * gib,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := constrainedPagedOutLimit(tc.total, tc.peak, tc.pagedOut, tc.current)
+			if got != tc.want {
+				t.Fatalf("constrainedPagedOutLimit() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // snapshotTracker records every fakeSnapshot created and every Close() call
 // so tests can detect leaked (created but never closed) or double-closed snapshots.
 type snapshotTracker struct {
@@ -842,8 +902,8 @@ func TestEvictionPreservesActiveConversations(t *testing.T) {
 		pc.enforceEvictionPolicy()
 
 		// Memory should be within limits.
-		if pc.pagedOutBytes > maxPagedOutBytes {
-			t.Fatalf("pagedOutBytes = %d, want <= %d", pc.pagedOutBytes, maxPagedOutBytes)
+		if pc.pagedOutBytes > defaultMaxPagedOutBytes {
+			t.Fatalf("pagedOutBytes = %d, want <= %d", pc.pagedOutBytes, defaultMaxPagedOutBytes)
 		}
 
 		// Active path should be untouched.

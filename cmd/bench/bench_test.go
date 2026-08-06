@@ -750,9 +750,10 @@ func TestBenchmarkModel_PromptTokens(t *testing.T) {
 		t.Errorf("Expected generated prompt with ~76 words, got %d words", wordCount)
 	}
 
-	// Prompt should not be the default prompt
-	if receivedPrompt == DefaultPrompt {
-		t.Error("Expected generated prompt, but got default prompt")
+	for _, want := range []string{"services/", "TTLCache", "if key in self.items:"} {
+		if !strings.Contains(receivedPrompt, want) {
+			t.Errorf("generated prompt missing %q:\n%s", want, receivedPrompt)
+		}
 	}
 }
 
@@ -1104,13 +1105,52 @@ func TestGeneratePromptForTokenCount(t *testing.T) {
 	if wordCount < 50 || wordCount > 100 {
 		t.Errorf("Expected ~76 words, got %d", wordCount)
 	}
+	if !strings.Contains(prompt, "if key in self.items:") {
+		t.Errorf("generated prompt should end with the Python continuation point:\n%s", prompt)
+	}
 }
 
 func TestGeneratePromptForTokenCount_Small(t *testing.T) {
 	prompt := generatePromptForTokenCount(1, 0)
 	wordCount := len(strings.Fields(prompt))
 	if wordCount != 1 {
-		t.Errorf("Expected 1 word, got %d", wordCount)
+		t.Errorf("Expected 1 generated prompt word, got %d:\n%s", wordCount, prompt)
+	}
+	if prompt != "Adef" {
+		t.Errorf("Expected Python-adjacent tiny prompt, got %q", prompt)
+	}
+}
+
+func TestGeneratePromptForTokenCount_SmallVariesWithoutRepeats(t *testing.T) {
+	seen := map[string]struct{}{}
+	for epoch := range 12 {
+		prompt := generatePromptForTokenCount(1, epoch)
+		if wordCount := len(strings.Fields(prompt)); wordCount != 1 {
+			t.Fatalf("Expected 1 generated prompt word, got %d:\n%s", wordCount, prompt)
+		}
+		if _, ok := seen[prompt]; ok {
+			t.Fatalf("Expected unique tiny prompt for epoch %d, got duplicate %q", epoch, prompt)
+		}
+		seen[prompt] = struct{}{}
+	}
+}
+
+func TestGeneratePromptForTokenCount_UsesCompactPatchWhenItFits(t *testing.T) {
+	oldTokensPerWord := tokensPerWord
+	tokensPerWord = 1
+	defer func() {
+		tokensPerWord = oldTokensPerWord
+	}()
+
+	targetWords := len(strings.Fields(rawPatchPromptCompact(0)))
+	prompt := generatePromptForTokenCount(targetWords, 0)
+	// The compact patch fills the target exactly, leaving no padding budget, so
+	// the prompt runs one word long to keep the cache-busting variation header.
+	if wordCount := len(strings.Fields(prompt)); wordCount != targetWords+1 {
+		t.Errorf("Expected compact patch prompt with %d words, got %d:\n%s", targetWords+1, wordCount, prompt)
+	}
+	if !strings.Contains(prompt, "if key in self.items:") {
+		t.Errorf("compact generated prompt missing Python continuation point:\n%s", prompt)
 	}
 }
 
@@ -1132,6 +1172,99 @@ func TestGeneratePromptForTokenCount_VariesByEpoch(t *testing.T) {
 	}
 }
 
+// sharedWordPrefix reports how many leading whitespace-separated words two
+// prompts have in common. It stands in for a tokenizer: any shared leading text
+// tokenizes to shared leading tokens, which is exactly what the runner's prefix
+// cache restores instead of prefilling.
+func sharedWordPrefix(a, b string) int {
+	aw, bw := strings.Fields(a), strings.Fields(b)
+	n := 0
+	for n < len(aw) && n < len(bw) && aw[n] == bw[n] {
+		n++
+	}
+	return n
+}
+
+// Whole-prompt uniqueness is not enough: the prefix cache keys on leading
+// tokens, so every pair of prompts must diverge at the very first word.
+func TestGeneratePromptForTokenCount_NoSharedPrefixAcrossEpochs(t *testing.T) {
+	compactWords := len(strings.Fields(rawPatchPromptCompact(0)))
+	continuationWords := len(strings.Fields(rawPatchPromptContinuation(0)))
+
+	// Cover the tiny-slice path, both continuation floors (where the padding
+	// budget is zero or nearly zero), and the padded sizes people benchmark.
+	targets := []int{1, 8, compactWords, compactWords + 1, continuationWords, continuationWords + 1, 100, 512, 2048, 4096, 10240}
+
+	for _, target := range targets {
+		prompts := make([]string, 0, 8)
+		for epoch := range 8 {
+			prompts = append(prompts, generatePromptForTokenCount(target, epoch))
+		}
+		for i, a := range prompts {
+			for _, b := range prompts[i+1:] {
+				if a[0] == b[0] {
+					t.Errorf("target=%d: prompts share leading byte %q", target, a[0])
+					break
+				}
+				if shared := sharedWordPrefix(a, b); shared > 0 {
+					t.Errorf("target=%d: prompts share a %d-word prefix, so the prefix cache would restore it instead of prefilling: %q",
+						target, shared, strings.Join(strings.Fields(a)[:shared], " "))
+					break
+				}
+			}
+		}
+	}
+}
+
+// Warmup uses negative variations and short-response retries offset by 1000, so
+// those prompts must not share a prefix with the timed epochs either.
+func TestGeneratePromptForTokenCount_NoSharedPrefixAcrossWarmupAndRetries(t *testing.T) {
+	variations := []int{-2, -1, 0, 1, 2, 1000, 1001, 1002, 2000, 2001}
+
+	for _, target := range []int{8, 100, 512, 4096} {
+		prompts := map[int]string{}
+		for _, variation := range variations {
+			prompts[variation] = generatePromptForTokenCount(target, variation)
+		}
+		for i, v := range variations {
+			for _, w := range variations[i+1:] {
+				if prompts[v][0] == prompts[w][0] {
+					t.Errorf("target=%d: variations %d and %d share leading byte %q", target, v, w, prompts[v][0])
+					break
+				}
+				if shared := sharedWordPrefix(prompts[v], prompts[w]); shared > 0 {
+					t.Errorf("target=%d: variations %d and %d share a %d-word prefix", target, v, w, shared)
+					break
+				}
+			}
+		}
+	}
+}
+
+func TestGeneratePromptForTokenCount_LargePromptVaryPastPadNameCycle(t *testing.T) {
+	p0 := generatePromptForTokenCount(10240, 0)
+	p7 := generatePromptForTokenCount(10240, 7)
+
+	if p0 == p7 {
+		t.Fatal("Expected large generated prompts to stay unique past the pad-name cycle")
+	}
+	if !strings.Contains(p0, "if key in self.items:") || !strings.Contains(p7, "if key in self.items:") {
+		t.Fatalf("Expected large generated prompts to keep the Python continuation point")
+	}
+}
+
+func TestGeneratePromptForTokenCount_OnlyVariesLeadingCacheBuster(t *testing.T) {
+	p0 := strings.Fields(generatePromptForTokenCount(2048, 0))
+	p1 := strings.Fields(generatePromptForTokenCount(2048, 1))
+
+	if p0[0] == p1[0] {
+		t.Fatalf("Expected different leading cache busters, got %q", p0[0])
+	}
+	if strings.Join(p0[1:], " ") != strings.Join(p1[1:], " ") {
+		t.Fatal("Expected benchmark prompt body to remain identical across variations")
+	}
+}
+
 func TestBuildGenerateRequest(t *testing.T) {
 	fOpt := createTestFlagOptions()
 	req := buildGenerateRequest("test-model", fOpt, nil, 0)
@@ -1147,6 +1280,22 @@ func TestBuildGenerateRequest(t *testing.T) {
 	}
 }
 
+func TestBuildGenerateRequest_DefaultPromptUsesPythonPatch(t *testing.T) {
+	fOpt := createTestFlagOptions()
+	prompt := ""
+	fOpt.prompt = &prompt
+
+	req := buildGenerateRequest("test-model", fOpt, nil, 0)
+	for _, want := range []string{"Continue this Python cache fix", "diff --git a/services/cache.py", "TTLCache"} {
+		if !strings.Contains(req.Prompt, want) {
+			t.Errorf("default prompt missing %q:\n%s", want, req.Prompt)
+		}
+	}
+	if !strings.HasSuffix(req.Prompt, "if key in self.items:\n") {
+		t.Errorf("default prompt does not end at the intended continuation point:\n%s", req.Prompt)
+	}
+}
+
 func TestBuildGenerateRequest_WithPromptTokens(t *testing.T) {
 	fOpt := createTestFlagOptions()
 	promptTokens := 200
@@ -1157,10 +1306,75 @@ func TestBuildGenerateRequest_WithPromptTokens(t *testing.T) {
 	if strings.Contains(req.Prompt, "test prompt") {
 		t.Error("Expected generated prompt when promptTokens is set")
 	}
+	if !strings.Contains(req.Prompt, "if key in self.items:") {
+		t.Errorf("generated prompt missing Python continuation point:\n%s", req.Prompt)
+	}
 
 	wordCount := len(strings.Fields(req.Prompt))
 	if wordCount < 100 || wordCount > 200 {
 		t.Errorf("Expected ~153 words for 200 tokens, got %d", wordCount)
+	}
+}
+
+func TestBuildGenerateRequest_WithTinyPromptTokens(t *testing.T) {
+	fOpt := createTestFlagOptions()
+	promptTokens := 1
+	maxTokens := 64
+	fOpt.promptTokens = &promptTokens
+	fOpt.maxTokens = &maxTokens
+
+	req := buildGenerateRequest("test-model", fOpt, nil, 0)
+	if strings.Contains(req.Prompt, "test prompt") {
+		t.Error("Expected generated prompt when promptTokens is set")
+	}
+	if strings.Contains(req.Prompt, "] ") {
+		t.Fatalf("prompt-token mode should not add an external cache-busting prefix:\n%s", req.Prompt)
+	}
+
+	if wordCount := len(strings.Fields(req.Prompt)); wordCount != 1 {
+		t.Errorf("Expected 1 generated prompt word, got %d:\n%s", wordCount, req.Prompt)
+	}
+	if req.Options["num_predict"] != maxTokens {
+		t.Errorf("Expected num_predict %d, got %v", maxTokens, req.Options["num_predict"])
+	}
+}
+
+func TestBuildUniqueGenerateRequest_AvoidsRepeatedPromptTokens(t *testing.T) {
+	fOpt := createTestFlagOptions()
+	promptTokens := 1
+	fOpt.promptTokens = &promptTokens
+
+	seenPrompts := map[string]struct{}{}
+	req0, err := buildUniqueGenerateRequest("test-model", fOpt, nil, 0, seenPrompts)
+	if err != nil {
+		t.Fatalf("buildUniqueGenerateRequest failed: %v", err)
+	}
+	req1, err := buildUniqueGenerateRequest("test-model", fOpt, nil, 0, seenPrompts)
+	if err != nil {
+		t.Fatalf("buildUniqueGenerateRequest failed: %v", err)
+	}
+
+	if req0.Prompt == req1.Prompt {
+		t.Fatalf("Expected repeated prompt-token variation to advance:\n%s", req0.Prompt)
+	}
+	if len(strings.Fields(req0.Prompt)) != 1 || len(strings.Fields(req1.Prompt)) != 1 {
+		t.Fatalf("Expected unique tiny prompts to preserve target size:\n%s\n%s", req0.Prompt, req1.Prompt)
+	}
+}
+
+func TestBuildGenerateRequest_WithTinyCustomPrompt(t *testing.T) {
+	fOpt := createTestFlagOptions()
+	prompt := "1"
+	maxTokens := 64
+	fOpt.prompt = &prompt
+	fOpt.maxTokens = &maxTokens
+
+	req := buildGenerateRequest("test-model", fOpt, nil, 0)
+	if !strings.HasSuffix(req.Prompt, "1") {
+		t.Errorf("cache-busting prefix should preserve custom tiny prompt body:\n%s", req.Prompt)
+	}
+	if req.Options["num_predict"] != maxTokens {
+		t.Errorf("Expected num_predict %d, got %v", maxTokens, req.Options["num_predict"])
 	}
 }
 
@@ -1182,6 +1396,20 @@ func TestBuildGenerateRequest_VariesByEpoch(t *testing.T) {
 
 	if req0.Prompt == req1.Prompt {
 		t.Error("Expected different prompts for different epochs")
+	}
+}
+
+func TestBuildGenerateRequest_BustsCacheForSameEpoch(t *testing.T) {
+	fOpt := createTestFlagOptions()
+
+	req0 := buildGenerateRequest("test-model", fOpt, nil, 0)
+	req1 := buildGenerateRequest("test-model", fOpt, nil, 0)
+
+	if req0.Prompt == req1.Prompt {
+		t.Error("Expected different cache-busting prefixes for repeated requests")
+	}
+	if !strings.HasSuffix(req0.Prompt, "test prompt") || !strings.HasSuffix(req1.Prompt, "test prompt") {
+		t.Fatalf("cache busting should preserve the custom prompt body:\n%s\n%s", req0.Prompt, req1.Prompt)
 	}
 }
 

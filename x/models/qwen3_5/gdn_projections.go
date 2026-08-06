@@ -106,6 +106,7 @@ func permuteProjectionRows(layer nn.LinearLayer, perm []int32) (nn.LinearLayer, 
 			QBiases:     takeRows(l.QBiases),
 			Bias:        takeRows(l.Bias),
 			GlobalScale: globalScale,
+			NativeScale: mlx.NativeQuantizedGlobalScale(globalScale, l.Mode),
 			GroupSize:   l.GroupSize,
 			Bits:        l.Bits,
 			Mode:        l.Mode,
@@ -145,12 +146,14 @@ func concatQuantizedPair(hi, lo *nn.QuantizedLinear) (nn.LinearLayer, error) {
 		}
 		qbiases = mlx.Concatenate([]*mlx.Array{hi.QBiases, lo.QBiases}, 0)
 	}
+	globalScale := concatGlobalScales(hi.GlobalScale, lo.GlobalScale, hi.Weight, lo.Weight)
 	return &nn.QuantizedLinear{
 		Weight:      mlx.Concatenate([]*mlx.Array{hi.Weight, lo.Weight}, 0),
 		Scales:      mlx.Concatenate([]*mlx.Array{hi.Scales, lo.Scales}, 0),
 		QBiases:     qbiases,
 		Bias:        concatOptionalRows(hi.Bias, lo.Bias, hi.Scales, lo.Scales),
-		GlobalScale: concatGlobalScales(hi.GlobalScale, lo.GlobalScale, hi.Weight, lo.Weight),
+		GlobalScale: globalScale,
+		NativeScale: mlx.NativeQuantizedGlobalScale(globalScale, hi.Mode),
 		GroupSize:   hi.GroupSize,
 		Bits:        hi.Bits,
 		Mode:        hi.Mode,

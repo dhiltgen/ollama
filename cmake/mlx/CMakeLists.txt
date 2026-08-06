@@ -56,7 +56,18 @@ add_subdirectory(${OLLAMA_SOURCE_DIR}/x/mlxrunner/mlx ${CMAKE_BINARY_DIR}/x/mlxr
 find_package(CUDAToolkit)
 
 # Build list of directories for runtime dependency resolution.
-set(MLX_RUNTIME_DIRS ${CUDAToolkit_BIN_DIR} ${CUDAToolkit_BIN_DIR}/x64 ${CUDAToolkit_LIBRARY_DIR})
+set(MLX_RUNTIME_DIRS ${CUDAToolkit_BIN_DIR} ${CUDAToolkit_LIBRARY_DIR})
+if(WIN32)
+    # Ninja cross-builds can retain the x64 host system processor even when
+    # MSVC is targeting ARM64, so prefer the compiler's detected architecture.
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(ARM64|arm64|aarch64)$"
+        OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+        set(_mlx_windows_arch arm64)
+    else()
+        set(_mlx_windows_arch x64)
+    endif()
+    list(APPEND MLX_RUNTIME_DIRS ${CUDAToolkit_BIN_DIR}/${_mlx_windows_arch})
+endif()
 # Add cuDNN bin paths for DLLs (Windows MLX CUDA builds).
 # CUDNN_ROOT_DIR is the standard CMake variable for cuDNN location.
 if(CUDNN_ROOT_DIR)
@@ -65,9 +76,27 @@ elseif(DEFINED ENV{CUDNN_ROOT_DIR})
     set(_cudnn_root "$ENV{CUDNN_ROOT_DIR}")
 endif()
 if(_cudnn_root)
-    # cuDNN 9.x has versioned subdirectories under bin/ (e.g., bin/13.0/).
+    file(TO_CMAKE_PATH "${_cudnn_root}" _cudnn_root)
+    set(_cudnn_runtime_dlls "")
+    # cuDNN 9.x may include version and architecture levels under bin/.
     file(GLOB CUDNN_BIN_SUBDIRS "${_cudnn_root}/bin/*")
-    list(APPEND MLX_RUNTIME_DIRS ${CUDNN_BIN_SUBDIRS})
+    foreach(_cudnn_bin_dir IN LISTS CUDNN_BIN_SUBDIRS)
+        if(IS_DIRECTORY "${_cudnn_bin_dir}")
+            list(APPEND MLX_RUNTIME_DIRS "${_cudnn_bin_dir}")
+            file(GLOB _cudnn_direct_dlls "${_cudnn_bin_dir}/cudnn*.dll")
+            list(APPEND _cudnn_runtime_dlls ${_cudnn_direct_dlls})
+            file(GLOB _cudnn_arch_dirs "${_cudnn_bin_dir}/*")
+            foreach(_cudnn_arch_dir IN LISTS _cudnn_arch_dirs)
+                get_filename_component(_cudnn_arch_name "${_cudnn_arch_dir}" NAME)
+                if(IS_DIRECTORY "${_cudnn_arch_dir}"
+                    AND (NOT WIN32 OR _cudnn_arch_name STREQUAL _mlx_windows_arch))
+                    list(APPEND MLX_RUNTIME_DIRS "${_cudnn_arch_dir}")
+                    file(GLOB _cudnn_arch_dlls "${_cudnn_arch_dir}/cudnn*.dll")
+                    list(APPEND _cudnn_runtime_dlls ${_cudnn_arch_dlls})
+                endif()
+            endforeach()
+        endif()
+    endforeach()
 endif()
 # Add build output directory and MLX dependency build directories.
 list(APPEND MLX_RUNTIME_DIRS ${OLLAMA_BUILD_DIR})
@@ -101,6 +130,14 @@ install(RUNTIME_DEPENDENCY_SET mlx_runtime_deps
     RUNTIME DESTINATION ${OLLAMA_INSTALL_DIR} COMPONENT MLX_VENDOR
     LIBRARY DESTINATION ${OLLAMA_INSTALL_DIR} COMPONENT MLX_VENDOR
 )
+# cuDNN 9 loads engine DLLs dynamically, so they do not appear in the PE
+# dependency graph. Package the complete architecture-matched runtime set.
+if(WIN32 AND _cudnn_runtime_dlls)
+    list(REMOVE_DUPLICATES _cudnn_runtime_dlls)
+    install(FILES ${_cudnn_runtime_dlls}
+        DESTINATION ${OLLAMA_INSTALL_DIR}
+        COMPONENT MLX_VENDOR)
+endif()
 
 get_target_property(_MLX_LINK_LIBRARIES mlx LINK_LIBRARIES)
 if(TARGET jaccl AND "jaccl" IN_LIST _MLX_LINK_LIBRARIES)

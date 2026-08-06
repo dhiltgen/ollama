@@ -19,6 +19,7 @@ type recurrentConfig struct {
 	deltaState *mlx.Array
 	splits     []int
 	convSiLU   bool
+	convRound  *mlx.DType
 }
 
 // WithRecurrentHistory supplies a cache's per-layer view of conv and
@@ -43,6 +44,15 @@ func WithRecurrentState(convState, deltaState *mlx.Array) RecurrentOption {
 // ignores it, so it can ride a shared option list.
 func WithConvSiLU() RecurrentOption {
 	return func(c *recurrentConfig) { c.convSiLU = true }
+}
+
+// WithConvSiLURoundTrip applies SiLU and rounds its result through dtype while
+// retaining the convolution input dtype for subsequent recurrent state math.
+func WithConvSiLURoundTrip(dtype mlx.DType) RecurrentOption {
+	return func(c *recurrentConfig) {
+		c.convSiLU = true
+		c.convRound = &dtype
+	}
 }
 
 // WithSnapshotSplits requests that the scan run in segments cut at the given
@@ -146,9 +156,16 @@ func CausalConv1D(b *batch.Batch, input *mlx.Array, conv *Conv1d, convTail int, 
 	concat := mlx.Concatenate([]*mlx.Array{prior, input}, 1)
 	if cfg.convSiLU {
 		if w := depthwiseConvWeight(conv); w != nil {
-			out = mlx.DepthwiseConvSiLU(concat, w, int(L))
+			if cfg.convRound != nil {
+				out = mlx.DepthwiseConvSiLURoundTrip(concat, w, conv.Bias, int(L), *cfg.convRound)
+			} else {
+				out = mlx.DepthwiseConvSiLU(concat, w, conv.Bias, int(L))
+			}
 		} else {
 			out = mlx.SiLU(conv.Forward(concat))
+			if cfg.convRound != nil && *cfg.convRound != out.DType() {
+				out = out.AsType(*cfg.convRound).AsType(out.DType())
+			}
 		}
 	} else {
 		out = conv.Forward(concat)
@@ -174,7 +191,7 @@ func CausalConv1D(b *batch.Batch, input *mlx.Array, conv *Conv1d, convTail int, 
 // depthwiseConvWeight returns the [C, K] weight view the fused conv kernel
 // takes, or nil when the conv is not a plain depthwise causal conv.
 func depthwiseConvWeight(c *Conv1d) *mlx.Array {
-	if c.Bias != nil || c.Stride != 1 || c.Padding != 0 || c.Dilation != 1 {
+	if c.Stride != 1 || c.Padding != 0 || c.Dilation != 1 {
 		return nil
 	}
 	if c.Weight.NumDims() != 3 || c.Weight.Dim(2) != 1 || int(c.Groups) != c.Weight.Dim(0) {

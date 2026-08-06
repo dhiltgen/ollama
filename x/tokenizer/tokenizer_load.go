@@ -183,6 +183,15 @@ type specialTokenConfigData struct {
 }
 
 func applySpecialTokenConfig(t *Tokenizer, config specialTokenConfigData) {
+	appendUniqueID := func(ids []int32, id int32) []int32 {
+		for _, existing := range ids {
+			if existing == id {
+				return ids
+			}
+		}
+		return append(ids, id)
+	}
+
 	parseTokenIDs := func(v interface{}) []int32 {
 		switch val := v.(type) {
 		case float64:
@@ -252,11 +261,9 @@ func applySpecialTokenConfig(t *Tokenizer, config specialTokenConfigData) {
 					}
 				}
 			}
-			if len(t.vocab.EOS) == 0 {
-				if eosStr := extractTokenString(tokConfig.EOSToken); eosStr != "" {
-					if id, ok := t.specialTokens[eosStr]; ok {
-						t.vocab.EOS = []int32{id}
-					}
+			if eosStr := extractTokenString(tokConfig.EOSToken); eosStr != "" {
+				if id, ok := t.specialTokens[eosStr]; ok {
+					t.vocab.EOS = appendUniqueID(t.vocab.EOS, id)
 				}
 			}
 			if t.vocab.PAD < 0 {
@@ -286,11 +293,9 @@ func applySpecialTokenConfig(t *Tokenizer, config specialTokenConfigData) {
 					}
 				}
 			}
-			if len(t.vocab.EOS) == 0 {
-				if eosStr := extractTokenString(tokensMap["eos_token"]); eosStr != "" {
-					if id, ok := t.specialTokens[eosStr]; ok {
-						t.vocab.EOS = []int32{id}
-					}
+			if eosStr := extractTokenString(tokensMap["eos_token"]); eosStr != "" {
+				if id, ok := t.specialTokens[eosStr]; ok {
+					t.vocab.EOS = appendUniqueID(t.vocab.EOS, id)
 				}
 			}
 			if t.vocab.PAD < 0 {

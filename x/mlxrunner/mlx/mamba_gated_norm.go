@@ -13,6 +13,7 @@ var mambaGatedGroupRMSNorm = &gpuKernel{
 		source: mambaGatedRMSNormMetalKernelSource,
 		header: mambaGatedRMSNormMetalKernelHeader,
 	},
+	cuda: gpuSource{source: mambaGatedRMSNormCUDAKernelSource},
 }
 
 const mambaGatedRMSNormMetalKernelSource = `
@@ -47,6 +48,43 @@ float inv = rsqrt(partial[0] / float(GroupSize) + eps_val);
 for (int i = tid; i < GroupSize; i += Threads) {
   float gate_val = static_cast<float>(gate[base + i]);
   float silu = gate_val / (1.0f + exp(-gate_val));
+  float v = static_cast<float>(x[base + i]) * silu;
+out[base + i] = static_cast<OutT>(v * inv * static_cast<float>(weight[g * GroupSize + i]));
+}
+`
+
+const mambaGatedRMSNormCUDAKernelSource = `
+constexpr int Threads = 256;
+
+auto group_idx = int(blockIdx.x);
+auto tid = int(threadIdx.x);
+auto g = group_idx % Groups;
+auto token = group_idx / Groups;
+auto base = token * Inner + g * GroupSize;
+constexpr float eps_val = float(EpsNano) * 1.0e-9f;
+
+__shared__ float partial[Threads];
+float sum = 0.0f;
+for (int i = tid; i < GroupSize; i += Threads) {
+  float gate_val = static_cast<float>(gate[base + i]);
+  float silu = gate_val / (1.0f + expf(-gate_val));
+  float v = static_cast<float>(x[base + i]) * silu;
+  sum += v * v;
+}
+partial[tid] = sum;
+__syncthreads();
+
+for (int offset = Threads / 2; offset > 0; offset >>= 1) {
+  if (tid < offset) {
+    partial[tid] += partial[tid + offset];
+  }
+  __syncthreads();
+}
+
+float inv = rsqrtf(partial[0] / float(GroupSize) + eps_val);
+for (int i = tid; i < GroupSize; i += Threads) {
+  float gate_val = static_cast<float>(gate[base + i]);
+  float silu = gate_val / (1.0f + expf(-gate_val));
   float v = static_cast<float>(x[base + i]) * silu;
   out[base + i] = static_cast<OutT>(v * inv * static_cast<float>(weight[g * GroupSize + i]));
 }
@@ -94,8 +132,9 @@ func mambaGatedRMSNormTemplateArgs(groups, inner, groupSize int, eps float32) []
 }
 
 // FastMambaGatedGroupRMSNorm computes RMSNorm(y * SiLU(gate), groups) * weight
-// for Nemotron-H Mamba2. It returns ok=false for unsupported backends or shapes
-// so callers can use the backend-neutral MLX expression.
+// for Nemotron-H Mamba2. cuDNN has no grouped RMSNorm operation with the
+// independent SiLU gate fused before normalization. Unsupported inputs retain
+// the backend-neutral MLX expression.
 func FastMambaGatedGroupRMSNorm(x, gate, weight *Array, groups int, eps float32, outDType DType) (out *Array, ok bool) {
 	B, L, inner, groupSize, ok := mambaGatedRMSNormValidate(x, gate, weight, groups, eps, outDType)
 	if !ok {
@@ -103,7 +142,7 @@ func FastMambaGatedGroupRMSNorm(x, gate, weight *Array, groups int, eps float32,
 	}
 
 	const threads = 256
-	outs, ok := mambaGatedGroupRMSNorm.applyMetal(gpuLaunch{
+	launch := gpuLaunch{
 		dtypes: []gpuDTypeArg{{"OutT", outDType}},
 		ints:   mambaGatedRMSNormTemplateArgs(groups, inner, groupSize, eps),
 		outputs: []gpuOutputSpec{
@@ -112,7 +151,11 @@ func FastMambaGatedGroupRMSNorm(x, gate, weight *Array, groups int, eps float32,
 		grid:        [3]int{B * L * groups * threads, 1, 1},
 		threadGroup: [3]int{threads, 1, 1},
 		inputs:      []*Array{x, gate, weight},
-	})
+	}
+	outs, ok := mambaGatedGroupRMSNorm.applyCUDA(launch)
+	if !ok {
+		outs, ok = mambaGatedGroupRMSNorm.applyMetal(launch)
+	}
 	if !ok {
 		return nil, false
 	}

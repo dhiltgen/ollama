@@ -39,7 +39,16 @@ func Execute(args []string) error {
 			return fmt.Errorf("MLX not available: %w", err)
 		}
 
-		if mlx.GPUIsAvailable() {
+		// Some CUDA drivers transiently report the GPU unavailable right after
+		// a previous runner exits. Committing to the CPU path then silently
+		// misloads GPU-quantized manifests (e.g. missing embedding weights), so
+		// retry briefly before accepting the CPU fallback.
+		gpu := mlx.GPUIsAvailable()
+		for attempt := 0; !gpu && attempt < 5; attempt++ {
+			time.Sleep(500 * time.Millisecond)
+			gpu = mlx.GPUIsAvailable()
+		}
+		if gpu {
 			mlx.SetDefaultDeviceGPU()
 			slog.Info("MLX engine initialized", "MLX version", mlx.Version(), "device", "gpu")
 		} else {

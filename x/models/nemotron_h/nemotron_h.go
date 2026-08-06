@@ -95,7 +95,6 @@ type Mamba2 struct {
 	OutProj nn.LinearLayer
 
 	Conv1D     *nn.Conv1d
-	ConvBias   *mlx.Array
 	DtBias     *mlx.Array
 	A          *mlx.Array
 	D          *mlx.Array
@@ -773,13 +772,19 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			mamba.InProj = linears.Make(mixerPrefix + ".in_proj")
 			mamba.OutProj = linears.Make(mixerPrefix + ".out_proj")
 			convWeight := sanitizeConvWeight(tensors[mixerPrefix+".conv1d.weight"])
-			mamba.ConvBias = tensors[mixerPrefix+".conv1d.bias"]
+			convBias := tensors[mixerPrefix+".conv1d.bias"]
 			mamba.DtBias = tensors[mixerPrefix+".dt_bias"]
+			if mamba.DtBias != nil {
+				mamba.DtBias = mamba.DtBias.AsType(mlx.DTypeFloat32)
+			}
 			aLog := tensors[mixerPrefix+".A_log"]
 			if aLog != nil {
 				mamba.A = mlx.Neg(mlx.Exp(aLog.AsType(mlx.DTypeFloat32)))
 			}
 			mamba.D = tensors[mixerPrefix+".D"]
+			if mamba.D != nil {
+				mamba.D = mamba.D.AsType(mlx.DTypeFloat32)
+			}
 			mamba.NormWeight = tensors[mixerPrefix+".norm.weight"]
 			if mamba.InProj == nil || mamba.OutProj == nil || convWeight == nil || mamba.DtBias == nil || mamba.A == nil || mamba.D == nil || mamba.NormWeight == nil {
 				return fmt.Errorf("layer %d: missing mamba2 tensors", i)
@@ -787,7 +792,10 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			if convWeight.NumDims() != 2 {
 				return fmt.Errorf("layer %d: conv1d weight must be 2D after sanitization, got %dD", i, convWeight.NumDims())
 			}
-			mamba.Conv1D = nn.NewConv1d(mlx.ExpandDims(convWeight, 2), nil, 1, 0, 1, int32(convWeight.Dim(0)))
+			if convBias != nil {
+				convBias = convBias.AsType(mlx.DTypeFloat32)
+			}
+			mamba.Conv1D = nn.NewConv1d(mlx.ExpandDims(convWeight, 2), convBias, 1, 0, 1, int32(convWeight.Dim(0)))
 			layer.Mamba = mamba
 		case '*', 'A':
 			mixerPrefix := layerPrefix + ".mixer"
@@ -813,10 +821,18 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			layer.Dense = dense
 		case 'E':
 			mixerPrefix := layerPrefix + ".mixer"
+			routerWeight := tensors[mixerPrefix+".gate.weight"]
+			if routerWeight != nil {
+				routerWeight = routerWeight.AsType(mlx.DTypeFloat32)
+			}
+			correctionBias := tensors[mixerPrefix+".gate.e_score_correction_bias"]
+			if correctionBias != nil {
+				correctionBias = correctionBias.AsType(mlx.DTypeFloat32)
+			}
 			moe := &SparseMoE{
 				Router:         linears.Make(mixerPrefix + ".gate"),
-				RouterWeight:   tensors[mixerPrefix+".gate.weight"],
-				CorrectionBias: tensors[mixerPrefix+".gate.e_score_correction_bias"],
+				RouterWeight:   routerWeight,
+				CorrectionBias: correctionBias,
 				SharedUp:       linears.Make(mixerPrefix + ".shared_experts.up_proj"),
 				SharedDown:     linears.Make(mixerPrefix + ".shared_experts.down_proj"),
 			}
@@ -943,7 +959,7 @@ func mamba2ScanWithSnapshots(hidden, bState, cState, dt, state, a, d, dtBias, ma
 	if mask != nil {
 		return nil, nil, nil, false
 	}
-	if len(splits) == 1 && splits[0] > 0 && splits[0] < int(L) {
+	if mlx.SupportsFastMamba2ScanWithSnapshot() && len(splits) == 1 && splits[0] > 0 && splits[0] < int(L) {
 		y, nextState, snapshotState, ok := mlx.FastMamba2ScanWithSnapshot(hidden, bState, cState, dt, state, a, d, dtBias, splits[0])
 		if ok {
 			return y, nextState, []*mlx.Array{snapshotState}, true
@@ -963,7 +979,7 @@ func mamba2ScanWithSnapshots(hidden, bState, cState, dt, state, a, d, dtBias, ma
 		segHidden := mlx.SliceStartStop(hidden, []int32{0, start, 0, 0}, []int32{B, end, cfg.MambaNumHeads, cfg.MambaHeadDim}).AsType(mlx.DTypeFloat32)
 		segB := mlx.SliceStartStop(bState, []int32{0, start, 0, 0}, []int32{B, end, groups, cfg.SSMStateSize}).AsType(mlx.DTypeFloat32)
 		segC := mlx.SliceStartStop(cState, []int32{0, start, 0, 0}, []int32{B, end, groups, cfg.SSMStateSize}).AsType(mlx.DTypeFloat32)
-		segDt := mlx.SliceStartStop(dt, []int32{0, start, 0}, []int32{B, end, cfg.MambaNumHeads}).AsType(mlx.DTypeFloat32)
+		segDt := mlx.SliceStartStop(dt, []int32{0, start, 0}, []int32{B, end, cfg.MambaNumHeads})
 
 		y, nextState, ok := mlx.FastMamba2Scan(segHidden, segB, segC, segDt, scanState, a, d, dtBias)
 		if !ok {
@@ -1023,7 +1039,6 @@ func (m *Mamba2) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, L int32
 
 	var convOut *mlx.Array
 	var convStates []*mlx.Array
-	convSiLUInHelper := m.ConvBias == nil
 	opts := make([]nn.RecurrentOption, 0, 3)
 	if history != nil {
 		opts = append(opts, nn.WithRecurrentHistory(history))
@@ -1034,19 +1049,8 @@ func (m *Mamba2) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, L int32
 	if len(splits) > 0 {
 		opts = append(opts, nn.WithSnapshotSplits(splits))
 	}
-	if convSiLUInHelper {
-		opts = append(opts, nn.WithConvSiLU())
-	}
+	opts = append(opts, nn.WithConvSiLURoundTrip(dtype))
 	convOut, convStates = nn.CausalConv1D(b, xBC, m.Conv1D, int(convTail), opts...)
-	if !convSiLUInHelper {
-		if m.ConvBias != nil {
-			convOut = mlx.Add(convOut, m.ConvBias.AsType(mlx.DTypeFloat32))
-		}
-		convOut = mlx.SiLU(convOut)
-	}
-	if dtype != mlx.DTypeFloat32 {
-		convOut = convOut.AsType(dtype).AsType(mlx.DTypeFloat32)
-	}
 	if mask != nil {
 		zero := mlx.FromValue(float32(0)).AsType(convOut.DType())
 		convOut = mlx.Where(mlx.ExpandDims(mask, 2), convOut, zero)
@@ -1066,11 +1070,11 @@ func (m *Mamba2) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, L int32
 		hidden,
 		bState,
 		cState,
-		dt.AsType(mlx.DTypeFloat32),
+		dt,
 		state,
-		mlx.Reshape(m.A.AsType(mlx.DTypeFloat32), cfg.MambaNumHeads),
-		mlx.Reshape(m.D.AsType(mlx.DTypeFloat32), cfg.MambaNumHeads),
-		mlx.Reshape(m.DtBias.AsType(mlx.DTypeFloat32), cfg.MambaNumHeads),
+		mlx.Reshape(m.A, cfg.MambaNumHeads),
+		mlx.Reshape(m.D, cfg.MambaNumHeads),
+		mlx.Reshape(m.DtBias, cfg.MambaNumHeads),
 		mask,
 		B,
 		L,
@@ -1085,8 +1089,8 @@ func (m *Mamba2) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, L int32
 		bState = repeatGroups(bState, repeats)
 		cState = repeatGroups(cState, repeats)
 		a := mlx.Reshape(m.A, 1, cfg.MambaNumHeads, 1, 1)
-		d := mlx.Reshape(m.D.AsType(mlx.DTypeFloat32), 1, cfg.MambaNumHeads, 1)
-		dtBias := mlx.Tile(mlx.Reshape(m.DtBias.AsType(mlx.DTypeFloat32), 1, cfg.MambaNumHeads), []int32{B, 1})
+		d := mlx.Reshape(m.D, 1, cfg.MambaNumHeads, 1)
+		dtBias := mlx.Tile(mlx.Reshape(m.DtBias, 1, cfg.MambaNumHeads), []int32{B, 1})
 		y, state, deltaStates = mamba2LoopScan(hidden, bState, cState, dt, state, a, d, dtBias, mask, B, L, cfg, splits)
 	}
 	y = mlx.Reshape(y, B, L, inner)
@@ -1290,14 +1294,14 @@ func moeWeightedSum(expertOut, scores *mlx.Array, dtype mlx.DType) *mlx.Array {
 func (m *SparseMoE) route(x *mlx.Array, cfg *Config, B, L int32) (*mlx.Array, *mlx.Array) {
 	routeDType := mlx.DTypeFloat32
 
-	routerWeight := mlx.Transpose(m.RouterWeight.AsType(routeDType), 1, 0)
+	routerWeight := mlx.Transpose(m.RouterWeight, 1, 0)
 	logits := mlx.Matmul(x.AsType(routeDType), routerWeight)
 
 	var probs, selection, negSelection *mlx.Array
 	if m.CorrectionBias != nil {
 		// The fused helper returns both the unbiased sigmoid probabilities
 		// used for scores and the negated bias-corrected values used for top-k.
-		probs, negSelection = mlx.SigmoidRouter(logits, m.CorrectionBias.AsType(routeDType))
+		probs, negSelection = mlx.SigmoidRouter(logits, m.CorrectionBias)
 	} else {
 		probs = mlx.Sigmoid(logits)
 		selection = probs

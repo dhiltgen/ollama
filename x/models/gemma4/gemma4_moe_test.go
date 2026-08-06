@@ -80,7 +80,7 @@ func TestMoERouterForward(t *testing.T) {
 	x := onesLike(int(B), int(L), int(cfg.HiddenSize))
 	router := newRouter(cfg)
 
-	scores, inds := router.Forward(x, cfg)
+	scores, inds, _ := router.Forward(x, cfg)
 	mlx.Eval(scores, inds)
 
 	sDims := scores.Dims()
@@ -104,10 +104,10 @@ func TestMoEBlockForward(t *testing.T) {
 	router := newRouter(cfg)
 	moe := newMoEBlock(cfg)
 
-	scores, inds := router.Forward(x, cfg)
+	scores, inds, scoresIncludeExpertScale := router.Forward(x, cfg)
 	mlx.Eval(scores, inds)
 
-	out := moe.Forward(x, scores, inds, cfg)
+	out := moe.Forward(x, scores, inds, scoresIncludeExpertScale, cfg)
 	mlx.Eval(out)
 
 	outDims := out.Dims()
@@ -127,10 +127,10 @@ func TestMoEBlockSortedForward(t *testing.T) {
 	router := newRouter(cfg)
 	moe := newMoEBlock(cfg)
 
-	scores, inds := router.Forward(x, cfg)
+	scores, inds, scoresIncludeExpertScale := router.Forward(x, cfg)
 	mlx.Eval(scores, inds)
 
-	out := moe.Forward(x, scores, inds, cfg)
+	out := moe.Forward(x, scores, inds, scoresIncludeExpertScale, cfg)
 	mlx.Eval(out)
 
 	outDims := out.Dims()
@@ -138,6 +138,454 @@ func TestMoEBlockSortedForward(t *testing.T) {
 
 	if len(outDims) != 3 || outDims[0] != int(B) || outDims[1] != int(L) || outDims[2] != int(cfg.HiddenSize) {
 		t.Errorf("output shape = %v, want [%d, %d, %d]", outDims, B, L, cfg.HiddenSize)
+	}
+}
+
+func TestMoEWeightedSumCompiledMatchesEager(t *testing.T) {
+	useMLXTestThread(t)
+
+	const tokens, topK, hidden = 3, 4, 16
+	downValues := make([]float32, tokens*topK*hidden)
+	for i := range downValues {
+		downValues[i] = float32((i%23)-11) * 0.025
+	}
+	scoreValues := []float32{
+		0.1, 0.2, 0.3, 0.4,
+		0.4, 0.3, 0.2, 0.1,
+		0.15, 0.25, 0.35, 0.25,
+	}
+	scaleValues := []float32{
+		0.75, 1.0, 1.25, 1.5,
+		1.5, 1.25, 1.0, 0.75,
+		0.8, 1.1, 1.4, 0.9,
+	}
+
+	down := mlx.FromValues(downValues, tokens, topK, hidden).AsType(mlx.DTypeBFloat16)
+	scores := mlx.FromValues(scoreValues, tokens, topK)
+	scales := mlx.FromValues(scaleValues, tokens, topK).AsType(mlx.DTypeBFloat16)
+
+	want := gemma4MoEWeightedSumEager(down, scores, scales)
+	got := gemma4MoEWeightedSumCompiled(down, scores, scales)
+	mlx.Eval(want, got)
+
+	if gotValues, wantValues := got.Floats(), want.Floats(); !floatSlicesClose(gotValues, wantValues, 1e-5) {
+		t.Fatalf("compiled weighted sum mismatch:\n  got  %v\n  want %v", gotValues, wantValues)
+	}
+}
+
+func TestSortedMoEDispatchCUDAKernelMatchesMLX(t *testing.T) {
+	useMLXTestThread(t)
+
+	const rows, topK, hidden = 64, 8, 2816
+	assignments := rows * topK
+
+	xValues := make([]float32, rows*hidden)
+	for i := range xValues {
+		xValues[i] = float32((i%97)-48) * 0.00390625
+	}
+	x := mlx.FromValues(xValues, rows, 1, 1, hidden).
+		AsType(mlx.DTypeBFloat16)
+
+	orderValues := make([]uint32, assignments)
+	for sorted := range assignments {
+		orderValues[sorted] = uint32((sorted * 37) % assignments)
+	}
+	order := mlx.FromValues(orderValues, assignments)
+
+	want := mlx.ExpandDims(
+		mlx.Take(
+			mlx.Squeeze(x, 1),
+			mlx.FloorDivideScalar(order, topK),
+			0,
+		),
+		1,
+	)
+	got, ok := mlx.FastSortedMoEDispatch(x, order)
+	if !ok {
+		t.Skip("MLX CUDA custom kernels unavailable")
+	}
+
+	want = want.AsType(mlx.DTypeFloat32)
+	got = got.AsType(mlx.DTypeFloat32)
+	mlx.Eval(want, got)
+
+	if gotValues, wantValues := got.Floats(), want.Floats(); !floatSlicesClose(gotValues, wantValues, 0) {
+		t.Fatal("sorted MoE dispatch output does not match MLX gather")
+	}
+}
+
+func TestSortedMoECombineCUDAKernelMatchesMLX(t *testing.T) {
+	useMLXTestThread(t)
+
+	const rows, topK, hidden = 64, 8, 2816
+	assignments := rows * topK
+
+	downValues := make([]float32, assignments*hidden)
+	for i := range downValues {
+		downValues[i] = float32((i%37)-18) * 0.00625
+	}
+	downOriginal := mlx.FromValues(downValues, assignments, hidden).
+		AsType(mlx.DTypeBFloat16)
+
+	orderValues := make([]uint32, assignments)
+	invOrderValues := make([]uint32, assignments)
+	for sorted := range assignments {
+		original := (sorted * 37) % assignments
+		orderValues[sorted] = uint32(original)
+		invOrderValues[original] = uint32(sorted)
+	}
+	order := mlx.FromValues(orderValues, assignments)
+	downSorted := mlx.Take(downOriginal, order, 0).
+		Reshape(assignments, 1, 1, hidden)
+	invOrder := mlx.FromValues(invOrderValues, assignments)
+
+	scoreValues := make([]float32, assignments)
+	indexValues := make([]uint32, assignments)
+	for token := range rows {
+		for expert := range topK {
+			offset := token*topK + expert
+			scoreValues[offset] = float32(expert+1) / 36
+			indexValues[offset] = uint32((token*11 + expert*17) % 128)
+		}
+	}
+	scores := mlx.FromValues(scoreValues, rows, topK).
+		AsType(mlx.DTypeBFloat16)
+	indices := mlx.FromValues(indexValues, rows, topK)
+
+	scaleValues := make([]float32, 128)
+	for i := range scaleValues {
+		scaleValues[i] = 0.75 + float32(i%13)*0.03125
+	}
+	expertScales := mlx.FromValues(scaleValues, 128).
+		AsType(mlx.DTypeBFloat16)
+
+	down := mlx.Take(
+		downSorted.Reshape(assignments, hidden),
+		invOrder,
+		0,
+	).Reshape(rows, topK, hidden)
+	selectedScales := mlx.Take(
+		expertScales,
+		mlx.Flatten(indices),
+		0,
+	).Reshape(rows, topK)
+
+	tests := []struct {
+		name             string
+		scores           *mlx.Array
+		applyExpertScale bool
+		want             *mlx.Array
+	}{
+		{
+			name:             "raw_scores",
+			scores:           scores,
+			applyExpertScale: true,
+			want:             gemma4MoEWeightedSumEager(down, scores, selectedScales),
+		},
+		{
+			name:             "scaled_scores",
+			scores:           mlx.Mul(scores, selectedScales),
+			applyExpertScale: false,
+			want: gemma4MoEScaledWeightedSumCompiled(
+				down,
+				mlx.Mul(scores, selectedScales),
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		got, ok := mlx.FastSortedMoECombine(
+			downSorted,
+			invOrder,
+			tt.scores,
+			indices,
+			expertScales,
+			tt.applyExpertScale,
+		)
+		if !ok {
+			t.Skip("MLX CUDA custom kernels unavailable")
+		}
+
+		want := tt.want.AsType(mlx.DTypeFloat32)
+		got = got.AsType(mlx.DTypeFloat32)
+		mlx.Eval(want, got)
+
+		if gotValues, wantValues := got.Floats(), want.Floats(); !floatSlicesClose(gotValues, wantValues, 1e-5) {
+			firstMismatch := -1
+			var maxDiff float32
+			gotNaNs, wantNaNs := 0, 0
+			for i := range gotValues {
+				if gotValues[i] != gotValues[i] {
+					gotNaNs++
+				}
+				if wantValues[i] != wantValues[i] {
+					wantNaNs++
+				}
+				diff := gotValues[i] - wantValues[i]
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > maxDiff {
+					maxDiff = diff
+				}
+				if firstMismatch < 0 && diff > 1e-5 {
+					firstMismatch = i
+				}
+			}
+			t.Fatalf(
+				"%s sorted MoE combine mismatch: first=%d got=%g want=%g max_diff=%g got_nans=%d want_nans=%d",
+				tt.name,
+				firstMismatch,
+				gotValues[firstMismatch],
+				wantValues[firstMismatch],
+				maxDiff,
+				gotNaNs,
+				wantNaNs,
+			)
+		}
+	}
+}
+
+func TestResidualScaleCompiledMatchesEager(t *testing.T) {
+	useMLXTestThread(t)
+
+	residual := mlx.FromValues([]float32{
+		0.25, -0.5, 0.75, 1.0,
+		-1.25, 1.5, -1.75, 2.0,
+	}, 1, 2, 4).AsType(mlx.DTypeBFloat16)
+	update := mlx.FromValues([]float32{
+		0.125, 0.25, -0.375, 0.5,
+		0.625, -0.75, 0.875, -1.0,
+	}, 1, 2, 4).AsType(mlx.DTypeBFloat16)
+	scale := mlx.FromValues([]float32{0.75}, 1).AsType(mlx.DTypeBFloat16)
+
+	want := mlx.Mul(mlx.Add(residual, update), scale).AsType(mlx.DTypeFloat32)
+	got := gemma4ResidualScaleCompiled(residual, update, scale).AsType(mlx.DTypeFloat32)
+	mlx.Eval(want, got)
+
+	if gotValues, wantValues := got.Floats(), want.Floats(); !floatSlicesClose(gotValues, wantValues, 1e-5) {
+		t.Fatalf("compiled residual scale mismatch:\n  got  %v\n  want %v", gotValues, wantValues)
+	}
+}
+
+func TestMoEFinalCUDAKernelMatchesMLX(t *testing.T) {
+	useMLXTestThread(t)
+
+	const rows, hiddenSize = 2, 2816
+	values := func(period int, scale float32) []float32 {
+		out := make([]float32, rows*hiddenSize)
+		for i := range out {
+			out[i] = float32(i%period-period/2) * scale
+		}
+		return out
+	}
+
+	residual := mlx.FromValues(values(41, 0.0125), 1, rows, hiddenSize).AsType(mlx.DTypeBFloat16)
+	mlpOut := mlx.FromValues(values(31, 0.00625), 1, rows, hiddenSize).AsType(mlx.DTypeBFloat16)
+	moeOut := mlx.FromValues(values(23, 0.003125), 1, rows, hiddenSize).AsType(mlx.DTypeBFloat16)
+	normScale := mlx.FromValues(func() []float32 {
+		out := make([]float32, hiddenSize)
+		for i := range out {
+			out[i] = 0.75 + float32(i%7)*0.03125
+		}
+		return out
+	}(), hiddenSize).AsType(mlx.DTypeBFloat16)
+	layerScale := mlx.FromValue(float32(0.875)).AsType(mlx.DTypeBFloat16)
+
+	got, ok := mlx.FastMoEFinalResidual(
+		residual,
+		mlpOut,
+		moeOut,
+		normScale,
+		layerScale,
+		1e-6,
+	)
+	if !ok {
+		t.Skip("MLX CUDA custom kernels unavailable")
+	}
+
+	combined := mlx.RMSNormFn(mlx.Add(mlpOut, moeOut), normScale, 1e-6)
+	want := gemma4ResidualScaleCompiled(residual, combined, layerScale).AsType(mlx.DTypeFloat32)
+	got = got.AsType(mlx.DTypeFloat32)
+	mlx.Eval(want, got)
+
+	gotValues, wantValues := got.Floats(), want.Floats()
+	if !floatSlicesClose(gotValues, wantValues, 1e-5) {
+		var maxDiff float32
+		first := -1
+		for i := range gotValues {
+			diff := gotValues[i] - wantValues[i]
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+			if first < 0 && diff > 1e-5 {
+				first = i
+			}
+		}
+		t.Fatalf(
+			"fused MoE tail mismatch: max diff %v, first %d: got %v, want %v",
+			maxDiff,
+			first,
+			gotValues[first],
+			wantValues[first],
+		)
+	}
+}
+
+func TestGatherQMMDecodeIdentityIndicesMatchDefault(t *testing.T) {
+	useMLXTestThread(t)
+
+	const experts, topK, inputSize, outputSize = 4, 2, 32, 16
+	weightValues := make([]float32, experts*outputSize*inputSize)
+	for i := range weightValues {
+		weightValues[i] = float32((i%29)-14) * 0.0125
+	}
+	weight := mlx.FromValues(weightValues, experts, outputSize, inputSize)
+	qweight, scales, biases := mlx.Quantize(weight, 32, 4, "affine")
+
+	rhsIndices := mlx.FromValues([]uint32{1, 3}, 1, topK)
+	gateUpLHSIndices := mlx.FromValues([]uint32{0}, 1, 1)
+	downLHSIndices := mlx.FromValues([]uint32{0, 1}, 1, topK)
+
+	for _, tt := range []struct {
+		name       string
+		input      *mlx.Array
+		lhsIndices *mlx.Array
+	}{
+		{
+			name: "gate-up",
+			input: mlx.FromValues(func() []float32 {
+				values := make([]float32, inputSize)
+				for i := range values {
+					values[i] = float32(i-16) * 0.025
+				}
+				return values
+			}(), 1, 1, 1, inputSize),
+			lhsIndices: gateUpLHSIndices,
+		},
+		{
+			name: "down",
+			input: mlx.FromValues(func() []float32 {
+				values := make([]float32, topK*inputSize)
+				for i := range values {
+					values[i] = float32((i%23)-11) * 0.03125
+				}
+				return values
+			}(), 1, topK, 1, inputSize),
+			lhsIndices: downLHSIndices,
+		},
+	} {
+		t.Log(tt.name)
+		want := mlx.GatherQMM(
+			tt.input, qweight, scales, biases,
+			nil, rhsIndices, true, 32, 4, "affine", false,
+		).AsType(mlx.DTypeFloat32)
+		got := mlx.GatherQMM(
+			tt.input, qweight, scales, biases,
+			tt.lhsIndices, rhsIndices, true, 32, 4, "affine", false,
+		).AsType(mlx.DTypeFloat32)
+		mlx.Eval(want, got)
+
+		if gotValues, wantValues := got.Floats(), want.Floats(); !floatSlicesClose(gotValues, wantValues, 1e-5) {
+			t.Fatalf("%s explicit identity indices mismatch:\n  got  %v\n  want %v", tt.name, gotValues, wantValues)
+		}
+	}
+}
+
+func TestMoERouterCUDAMatchesMLX(t *testing.T) {
+	useMLXTestThread(t)
+
+	for _, tt := range []struct {
+		name   string
+		rows   int
+		values []float32
+	}{
+		{
+			name: "unique",
+			rows: 3,
+			values: func() []float32 {
+				values := make([]float32, 3*128)
+				for row := range 3 {
+					for i := range 128 {
+						values[row*128+i] = float32((i*37+row*13)%128 - 64)
+					}
+				}
+				return values
+			}(),
+		},
+		{name: "ties", rows: 2, values: make([]float32, 2*128)},
+	} {
+		t.Log(tt.name)
+		logits := mlx.FromValues(tt.values, tt.rows, 128).AsType(mlx.DTypeBFloat16)
+		expertScales := mlx.FromValues(func() []float32 {
+			values := make([]float32, 128)
+			for i := range values {
+				values[i] = 0.75 + float32(i%11)*0.03125
+			}
+			return values
+		}(), 128).AsType(mlx.DTypeBFloat16)
+		gotWeights, gotIndices, ok := mlx.FastMoERouter(logits, expertScales)
+		if !ok {
+			t.Skip("MLX CUDA custom kernels unavailable")
+		}
+
+		wantIndices := mlx.Argpartition(mlx.Neg(logits), 7, -1)
+		wantIndices = mlx.SliceStartStop(
+			wantIndices,
+			[]int32{0, 0},
+			[]int32{int32(tt.rows), 8},
+		)
+		wantWeights := mlx.SoftmaxAxis(
+			mlx.TakeAlongAxis(logits, wantIndices, -1),
+			-1,
+			true,
+		)
+		wantWeights = mlx.Mul(
+			wantWeights,
+			mlx.Take(expertScales, mlx.Flatten(wantIndices), 0).Reshape(tt.rows, 8),
+		)
+
+		gotWeightsF32 := gotWeights.AsType(mlx.DTypeFloat32)
+		wantWeightsF32 := wantWeights.AsType(mlx.DTypeFloat32)
+		gotIndicesI32 := gotIndices.AsType(mlx.DTypeInt32)
+		wantIndicesI32 := wantIndices.AsType(mlx.DTypeInt32)
+		mlx.Eval(gotWeightsF32, wantWeightsF32, gotIndicesI32, wantIndicesI32)
+
+		gotWeightValues := gotWeightsF32.Floats()
+		wantWeightValues := wantWeightsF32.Floats()
+		gotIndexValues := gotIndicesI32.Ints()
+		wantIndexValues := wantIndicesI32.Ints()
+		for row := range tt.rows {
+			got := make(map[int]float32, 8)
+			want := make(map[int]float32, 8)
+			for i := range 8 {
+				offset := row*8 + i
+				got[gotIndexValues[offset]] = gotWeightValues[offset]
+				want[wantIndexValues[offset]] = wantWeightValues[offset]
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%s row %d: selected experts = %v, want %v", tt.name, row, got, want)
+			}
+			for index, wantWeight := range want {
+				gotWeight, exists := got[index]
+				if !exists {
+					t.Fatalf("%s row %d: selected experts = %v, want %v", tt.name, row, got, want)
+				}
+				diff := gotWeight - wantWeight
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > 1e-3 {
+					t.Fatalf(
+						"%s row %d expert %d: weight = %v, want %v",
+						tt.name, row, index, gotWeight, wantWeight,
+					)
+				}
+			}
+		}
 	}
 }
 
@@ -257,6 +705,8 @@ func TestRouterForwardMatchesLegacy(t *testing.T) {
 		Proj:  linearFromWeight(projWeight),
 		Scale: scale,
 	}
+	r.NormScale = mlx.MulScalar(scale, cfg.RouterScale)
+	mlx.Eval(r.NormScale)
 
 	// Varied x so different positions potentially hit different top-k.
 	x := mlx.FromValues([]float32{
@@ -265,7 +715,7 @@ func TestRouterForwardMatchesLegacy(t *testing.T) {
 		0.5, 0.4, -0.2, 0.1, -0.3, 0.0, 0.3, -0.1,
 	}, 1, 3, int(cfg.HiddenSize))
 
-	gotScores, gotInds := r.Forward(x, cfg)
+	gotScores, gotInds, _ := r.Forward(x, cfg)
 	wantScores, wantInds := legacyRouterForward(r, x, cfg)
 	gotInds = gotInds.AsType(mlx.DTypeInt32)
 	wantInds = wantInds.AsType(mlx.DTypeInt32)
