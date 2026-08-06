@@ -4,9 +4,12 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	_ "embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"slices"
@@ -18,23 +21,22 @@ import (
 )
 
 type flagOptions struct {
-	models              *string
-	epochs              *int
-	maxTokens           *int
-	temperature         *float64
-	seed                *int
-	timeout             *int
-	prompt              *string
-	imageFile           *string
-	keepAlive           *float64
-	format              *string
-	outputFile          *string
-	debug               *bool
-	verbose             *bool
-	warmup              *int
-	promptTokens        *int
-	promptTokensPerWord *float64
-	numCtx              *int
+	models       *string
+	epochs       *int
+	maxTokens    *int
+	temperature  *float64
+	seed         *int
+	timeout      *int
+	prompt       *string
+	imageFile    *string
+	keepAlive    *float64
+	format       *string
+	outputFile   *string
+	debug        *bool
+	verbose      *bool
+	warmup       *int
+	promptTokens *int
+	numCtx       *int
 }
 
 type Metrics struct {
@@ -54,227 +56,103 @@ type ModelInfo struct {
 	NumCtx            int64
 }
 
-const (
-	DefaultPrompt = `Continue this Python cache fix.
+const DefaultPrompt = `Please write a descriptive story about a llama named Alonso who grows up to be President of the Land of Llamas. Include details about Alonso's childhood, adolescent years, and how he grew up to be a political mover and shaker. Write the story with a sense of whimsy.`
 
-diff --git a/services/cache.py b/services/cache.py
-@@ -8,8 +8,14 @@ class TTLCache:
-+        if key in self.items:
-`
+// Generated prompts come from the MIT-licensed HumanEval problem set
+// (openai/human-eval, see prompts/LICENSE). Real code avoids the repetition
+// loops that synthetic filler triggers in speculative decoding drafts
+// (MTP/dFlash), which inflate throughput and acceptance measurements.
+//
+//go:embed prompts/HumanEval.jsonl
+var humanEvalJSONL []byte
 
-	// Tiny prompt fallback below the compact patch floor (varies by model, e.g. ~<58 for Gemma4).
-	patchPromptSliceCorpus = `def put self key value bytes now if in items old current del payload expires while limit removed return diff git services cache py class method ttl store update entry size hit miss evict lookup write read`
-
-	// Per-variation header prepended to every padded prompt. The runner's prefix
-	// cache keys on leading tokens, so the cache-busting byte and varying name
-	// have to come first: front padding is what gets trimmed to hit a token
-	// target, and shared text ahead of them would be restored instead of prefilled.
-	patchPromptVariationHeader = "%s%s patch benchmark context.\n\n"
-
-	// Large-prompt repeated padding diff used above the full continuation floor (varies by model, e.g. ~191+ for Gemma4).
-	patchPromptPadTemplate = `diff --git a/services/%s_cache.py b/services/%s_cache.py
-index 2c4aa31..9b7e021 100644
---- a/services/%s_cache.py
-+++ b/services/%s_cache.py
-@@ -8,8 +8,14 @@ class TTLCache:
-     def put(self, key: str, value: bytes, ttl: float, now: float) -> None:
--        self.items[key] = (value, now + ttl)
--        self.current_bytes += len(value)
-+        payload = bytes(value)
-+        expires_at = now + ttl
-+        if key in self.items:
-+            old = self.items[key]
-+            self.current_bytes -= len(old[0])
-+            del self.items[key]
-+        self.items[key] = (payload, expires_at)
-+        self.current_bytes += len(payload)
-         while self.current_bytes > self.byte_limit:
-             _, removed = self.items.popitem(last=True)
-             self.current_bytes -= len(removed[0])
-
-`
-
-	// Full continuation kept intact for larger targets (varies by model, e.g. ~191+ for Gemma4).
-	patchPromptContinuationTemplate = `Continue the same Python cache replacement fix for the final file.
-
-diff --git a/services/%s_cache.py b/services/%s_cache.py
-index 2c4aa31..9b7e021 100644
---- a/services/%s_cache.py
-+++ b/services/%s_cache.py
-@@ -8,8 +8,14 @@ class TTLCache:
-     def put(self, key: str, value: bytes, ttl: float, now: float) -> None:
--        self.items[key] = (value, now + ttl)
--        self.current_bytes += len(value)
-+        payload = bytes(value)
-+        expires_at = now + ttl
-+        if key in self.items:
-`
-
-	// Compact continuation keeps medium-short targets coherent (varies by model, e.g. ~58-190 for Gemma4).
-	patchPromptCompactTemplate = `Continue this Python cache fix.
-
-diff --git a/services/%s_cache.py b/services/%s_cache.py
-@@ -8,8 +8,14 @@ class TTLCache:
-+        if key in self.items:
-`
-)
-
-// Each generated benchmark prompt starts with a different byte. This is
-// stronger than varying the first word: tokenizer vocabularies can split
-// memory_0 and memory_1 into the same leading token.
-const patchPromptCacheBusterAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,-./:;<=>?@[]^_{|}~"
-
-var patchPadNames = []string{
-	"memory",
-	"disk",
-	"tenant",
-	"project",
-	"request",
-	"worker",
-	"session",
+type evalProblem struct {
+	TaskID string `json:"task_id"`
+	Prompt string `json:"prompt"`
 }
 
-func patchPadName(index int) string {
-	n := len(patchPadNames)
-	name := patchPadNames[((index%n)+n)%n]
-	if index < 0 {
-		return fmt.Sprintf("%s_m%d", name, -index)
-	}
-	return fmt.Sprintf("%s_%d", name, index)
-}
-
-func patchPromptCacheBuster(variation int) string {
-	n := len(patchPromptCacheBusterAlphabet)
-	index := ((variation % n) + n) % n
-	return patchPromptCacheBusterAlphabet[index : index+1]
-}
-
-// tokensPerWord is the calibrated ratio of tokens to words for the current model.
-// Initialized with a heuristic, then updated during warmup based on actual tokenization.
-var tokensPerWord = 1.3
-
-// generatePromptForTokenCount builds a Python patch-continuation prompt near
-// targetTokens. The continuation body stays at the end; prompt sizing trims or
-// extends only front padding. Targets below the compact patch floor use a
-// moving slice from a normalized Python/diff vocabulary instead.
-func generatePromptForTokenCount(targetTokens int, variation int) string {
-	targetWords := int(float64(targetTokens) / tokensPerWord)
-	if targetWords < 1 {
-		targetWords = 1
-	}
-
-	if targetWords < minPatchPromptWords() {
-		return rawPatchPromptSlice(variation, targetWords)
-	}
-
-	continuation := rawPatchPromptContinuation(0)
-	if targetWords < len(strings.Fields(continuation)) {
-		continuation = rawPatchPromptCompact(0)
-	}
-	continuationWords := strings.Fields(continuation)
-
-	// Lead with the variation header so no two prompts share a token prefix, then
-	// spend whatever budget is left on front padding. When the continuation alone
-	// already fills the target, the header still goes in and the prompt runs one
-	// word long: a cache hit would corrupt the prefill measurement outright.
-	budget := targetWords - len(continuationWords)
-	words := patchPromptHeaderWords(variation)
-	if budget < len(words) {
-		words = words[:max(budget, 1)]
-	}
-
-	if padWords := budget - len(words); padWords > 0 {
-		pad := strings.Fields(rawPatchPromptPad(0, padWords))
-		if len(pad) > padWords {
-			pad = pad[len(pad)-padWords:]
+var humanEvalProblems = sync.OnceValue(func() []evalProblem {
+	var problems []evalProblem
+	for line := range strings.Lines(string(humanEvalJSONL)) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-		words = append(words, pad...)
-	}
-	return strings.Join(words, " ") + "\n\n" + continuation
-}
-
-// patchPromptHeaderWords returns the unique leading words for a variation. The
-// pad name embeds the variation index, so consecutive variations differ in the
-// very first character and cannot share a leading token.
-func patchPromptHeaderWords(variation int) []string {
-	return strings.Fields(fmt.Sprintf(
-		patchPromptVariationHeader,
-		patchPromptCacheBuster(variation),
-		patchPadName(variation),
-	))
-}
-
-func minPatchPromptWords() int {
-	return len(strings.Fields(rawPatchPromptCompact(0)))
-}
-
-func rawPatchPromptSlice(variation int, targetWords int) string {
-	words := strings.Fields(patchPromptSliceCorpus)
-	if targetWords < len(words) {
-		maxStart := len(words) - targetWords + 1
-		start := ((variation % maxStart) + maxStart) % maxStart
-		words = words[start : start+targetWords]
-	}
-	words[0] = patchPromptCacheBuster(variation) + words[0]
-	return strings.Join(words, " ")
-}
-
-func buildUniqueGenerateRequest(model string, fOpt flagOptions, imgData api.ImageData, variation int, seenPrompts map[string]struct{}) (*api.GenerateRequest, error) {
-	maxAttempts := len(patchPromptCacheBusterAlphabet)
-
-	if *fOpt.promptTokens == 0 || seenPrompts == nil {
-		return buildGenerateRequest(model, fOpt, imgData, variation), nil
-	}
-
-	for attempt := range maxAttempts {
-		req := buildGenerateRequest(model, fOpt, imgData, variation+attempt)
-		prefixKey := "\x00prefix:" + req.Prompt[:1]
-		_, promptSeen := seenPrompts[req.Prompt]
-		_, prefixSeen := seenPrompts[prefixKey]
-		if !promptSeen && !prefixSeen {
-			seenPrompts[req.Prompt] = struct{}{}
-			seenPrompts[prefixKey] = struct{}{}
-			return req, nil
+		var p evalProblem
+		if err := json.Unmarshal([]byte(line), &p); err == nil && p.Prompt != "" {
+			problems = append(problems, p)
 		}
 	}
+	return problems
+})
 
-	return nil, fmt.Errorf("could not generate a unique prompt for --prompt-tokens=%d after %d attempts", *fOpt.promptTokens, maxAttempts)
-}
-
-func rawPatchPromptPad(variation int, targetWords int) string {
-	var prompt strings.Builder
-	wordCount := 0
-	for i := 0; wordCount < targetWords; i++ {
-		name := patchPadName(i + variation)
-		hunk := fmt.Sprintf(patchPromptPadTemplate, name, name, name, name)
-		prompt.WriteString(hunk)
-		wordCount += len(strings.Fields(hunk))
+// humanEvalWordBounds returns the smallest single problem's word count and the
+// word count of the full problem set.
+func humanEvalWordBounds() (small, total int) {
+	small = math.MaxInt
+	for _, p := range humanEvalProblems() {
+		w := len(strings.Fields(strings.TrimSpace(p.Prompt)))
+		small = min(small, w)
+		total += w
 	}
-	return prompt.String()
+	return small, total
 }
 
-func rawPatchPromptContinuation(variation int) string {
-	name := patchPadName(variation + 3)
-	return fmt.Sprintf(patchPromptContinuationTemplate, name, name, name, name)
+// tokensPerWordHeuristic seeds the prompt calibration loop; the exact ratio
+// varies per model and is resolved against the live model's tokenizer.
+const tokensPerWordHeuristic = 1.3
+
+func estimatePromptWords(targetTokens int) int {
+	words := int(float64(targetTokens) / tokensPerWordHeuristic)
+	return max(words, 1)
 }
 
-func rawPatchPromptCompact(variation int) string {
-	name := patchPadName(variation + 3)
-	return fmt.Sprintf(patchPromptCompactTemplate, name, name)
+// nonceHeader is the per-request cache-busting prefix. It reads like a
+// vendored-file header rather than benchmark scaffolding, which reasoning
+// models take as a cue to analyze the harness instead of writing code.
+func nonceHeader(cacheBuster string) string {
+	return "# -*- coding: utf-8 -*-\n# checksum: " + cacheBuster + "\n\n\n"
 }
 
-// calibratePromptTokens adjusts tokensPerWord based on actual tokenization from a warmup run.
-func calibratePromptTokens(targetTokens, actualTokens, wordCount int) {
-	if actualTokens <= 0 || wordCount <= 0 {
-		return
+// generateCodePrompt packs whole problems (signature + docstring — the model
+// completes the body), never truncated or repeated, up to wordCount words.
+// cacheBuster defeats prefix caches; variation rotates the window for retries.
+// Deterministic for a given (wordCount, variation).
+func generateCodePrompt(wordCount, variation int, cacheBuster string) string {
+	problems := humanEvalProblems()
+	header := nonceHeader(cacheBuster)
+	used := len(strings.Fields(header))
+
+	var parts []string
+	included := make([]bool, len(problems))
+	for i := variation * 23 % len(problems); !included[i]; i = (i + 1) % len(problems) {
+		body := strings.TrimSpace(problems[i].Prompt)
+		if used+len(strings.Fields(body)) > wordCount {
+			break
+		}
+		parts = append(parts, body)
+		included[i] = true
+		used += len(strings.Fields(body))
 	}
-	tokensPerWord = float64(actualTokens) / float64(wordCount)
-	newWords := int(float64(targetTokens) / tokensPerWord)
-	fmt.Fprintf(os.Stderr, "bench: calibrated %.2f tokens/word (target=%d, got=%d, words=%d → %d)\n",
-		tokensPerWord, targetTokens, actualTokens, wordCount, newWords)
+
+	// Best-fit the remaining slack: the largest unused problem that fits.
+	best, bestWords := -1, 0
+	for j, p := range problems {
+		if included[j] {
+			continue
+		}
+		if w := len(strings.Fields(strings.TrimSpace(p.Prompt))); w > bestWords && used+w <= wordCount {
+			best, bestWords = j, w
+		}
+	}
+	if best >= 0 {
+		parts = append(parts, strings.TrimSpace(problems[best].Prompt))
+	}
+
+	return header + strings.Join(parts, "\n\n\n")
 }
 
-func buildGenerateRequest(model string, fOpt flagOptions, imgData api.ImageData, epoch int) *api.GenerateRequest {
+func benchmarkOptions(fOpt flagOptions) map[string]any {
 	options := make(map[string]interface{})
 	if *fOpt.maxTokens > 0 {
 		options["num_predict"] = *fOpt.maxTokens
@@ -286,38 +164,93 @@ func buildGenerateRequest(model string, fOpt flagOptions, imgData api.ImageData,
 	if fOpt.numCtx != nil && *fOpt.numCtx > 0 {
 		options["num_ctx"] = *fOpt.numCtx
 	}
+	return options
+}
 
-	var keepAliveDuration *api.Duration
+func benchmarkKeepAlive(fOpt flagOptions) *api.Duration {
 	if *fOpt.keepAlive > 0 {
-		duration := api.Duration{Duration: time.Duration(*fOpt.keepAlive * float64(time.Second))}
-		keepAliveDuration = &duration
+		return &api.Duration{Duration: time.Duration(*fOpt.keepAlive * float64(time.Second))}
 	}
+	return nil
+}
 
-	prompt := *fOpt.prompt
+// buildChatRequest builds a single-message benchmark request through the
+// model's chat template. promptWords is the calibrated word count for
+// generated prompts; ignored for -p prompts.
+func buildChatRequest(model string, fOpt flagOptions, imgData api.ImageData, cacheBuster string, variation, promptWords int) *api.ChatRequest {
+	var content string
 	if *fOpt.promptTokens > 0 {
-		prompt = generatePromptForTokenCount(*fOpt.promptTokens, epoch)
-	} else if prompt == "" {
-		prompt = DefaultPrompt
+		content = generateCodePrompt(promptWords, variation, cacheBuster)
 	} else {
-		prompt = strings.TrimSpace(prompt)
-	}
-	if *fOpt.promptTokens == 0 {
-		prompt = fmt.Sprintf("%s [%d] %s", rand.Text(), epoch, prompt)
+		// A leading unique nonce defeats prefix cache reuse across runs.
+		content = nonceHeader(cacheBuster) + *fOpt.prompt
 	}
 
-	req := &api.GenerateRequest{
-		Model:     model,
-		Prompt:    prompt,
-		Raw:       true,
-		Options:   options,
-		KeepAlive: keepAliveDuration,
-	}
-
+	msg := api.Message{Role: "user", Content: content}
 	if imgData != nil {
-		req.Images = []api.ImageData{imgData}
+		msg.Images = []api.ImageData{imgData}
 	}
 
-	return req
+	return &api.ChatRequest{
+		Model:     model,
+		Messages:  []api.Message{msg},
+		Options:   benchmarkOptions(fOpt),
+		KeepAlive: benchmarkKeepAlive(fOpt),
+	}
+}
+
+// promptTargetBounds is the acceptable rendered-token window: 1% under, 2% over.
+func promptTargetBounds(targetTokens int) (int, int) {
+	return targetTokens * 99 / 100, targetTokens * 102 / 100
+}
+
+// smallestCodePromptWords is the word budget for the smallest well-formed
+// prompt: header plus the smallest problem.
+func smallestCodePromptWords() int {
+	small, _ := humanEvalWordBounds()
+	const headerWords = 8 // "# -*- coding: utf-8 -*-" + "# checksum: <nonce>"
+	return headerWords + small
+}
+
+// resolvePromptWords calibrates the prompt against the model's rendered token
+// count (template included). Targets below the model-measured minimum are
+// rejected (use -p); targets beyond the full problem set warn and use it.
+// Errors when the server cannot count tokens.
+func resolvePromptWords(ctx context.Context, client *api.Client, model string, fOpt flagOptions) (int, error) {
+	targetTokens := *fOpt.promptTokens
+
+	floorReq := buildChatRequest(model, fOpt, nil, rand.Text(), 0, smallestCodePromptWords())
+	floorResp, err := client.ChatInputTokens(ctx, floorReq)
+	if err != nil {
+		return 0, fmt.Errorf("cannot count prompt tokens with model '%s': %w", model, err)
+	}
+	if targetTokens < floorResp.InputTokens {
+		return 0, fmt.Errorf("prompt target %d tokens is below the minimum coding prompt size ~%d tokens for model %q; use -p for smaller prompts", targetTokens, floorResp.InputTokens, model)
+	}
+
+	_, total := humanEvalWordBounds()
+	ceiling := total * 2
+	if targetTokens > ceiling {
+		fmt.Fprintf(os.Stderr, "WARNING: prompt target %d tokens exceeds the problem set (~%d tokens); the prompt will use the full set\n", targetTokens, ceiling)
+	}
+
+	minTokens, maxTokens := promptTargetBounds(targetTokens)
+	words := estimatePromptWords(targetTokens)
+	lastCount := 0
+	for range 4 {
+		req := buildChatRequest(model, fOpt, nil, rand.Text(), 0, words)
+		resp, err := client.ChatInputTokens(ctx, req)
+		if err != nil {
+			return 0, fmt.Errorf("cannot count prompt tokens with model '%s': %w", model, err)
+		}
+		lastCount = resp.InputTokens
+		if lastCount >= minTokens && lastCount <= maxTokens {
+			return words, nil
+		}
+		words = words * targetTokens / max(lastCount, 1)
+	}
+	fmt.Fprintf(os.Stderr, "WARNING: prompt resolved to %d rendered tokens against target %d (tolerance -1%%/+2%%); results use the actual count\n", lastCount, targetTokens)
+	return words, nil
 }
 
 func fetchModelInfo(ctx context.Context, client *api.Client, model string) ModelInfo {
@@ -440,9 +373,6 @@ func OutputMetrics(w io.Writer, format string, metrics []Metrics, verbose bool) 
 
 func BenchmarkModel(fOpt flagOptions) error {
 	models := strings.Split(*fOpt.models, ",")
-	if fOpt.promptTokensPerWord != nil && *fOpt.promptTokensPerWord > 0 {
-		tokensPerWord = *fOpt.promptTokensPerWord
-	}
 
 	var imgData api.ImageData
 	var err error
@@ -479,47 +409,42 @@ func BenchmarkModel(fOpt flagOptions) error {
 
 	// Log prompt-tokens info in debug mode
 	if *fOpt.debug && *fOpt.promptTokens > 0 {
-		prompt := generatePromptForTokenCount(*fOpt.promptTokens, 0)
-		wordCount := len(strings.Fields(prompt))
-		fmt.Fprintf(os.Stderr, "Generated prompt targeting ~%d tokens (%d words, varied per epoch)\n", *fOpt.promptTokens, wordCount)
+		fmt.Fprintf(os.Stderr, "Generated code prompt targeting ~%d tokens (unique per request)\n", *fOpt.promptTokens)
 	}
 
 	for _, model := range models {
-		seenPrompts := map[string]struct{}{}
-
 		// Fetch model info
 		infoCtx, infoCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		info := fetchModelInfo(infoCtx, client, model)
 		infoCancel()
 
-		// Warmup phase (uses negative epoch numbers to avoid colliding with timed epochs)
-		for i := range *fOpt.warmup {
-			req, buildErr := buildUniqueGenerateRequest(model, fOpt, imgData, -(i + 1), seenPrompts)
-			if buildErr != nil {
-				fmt.Fprintf(os.Stderr, "WARNING: Warmup %d/%d for %s skipped: %v\n", i+1, *fOpt.warmup, model, buildErr)
-				continue
+		// Resolve the generated prompt to the target token count against the
+		// live model (count includes the chat template).
+		promptWords := 0
+		if *fOpt.promptTokens > 0 {
+			calCtx, calCancel := context.WithTimeout(context.Background(), time.Duration(*fOpt.timeout)*time.Second)
+			promptWords, err = resolvePromptWords(calCtx, client, model, fOpt)
+			calCancel()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v (server needs input token counting support)\n", err)
+				return err
 			}
+		}
+
+		// Warmup phase
+		for i := range *fOpt.warmup {
+			req := buildChatRequest(model, fOpt, imgData, rand.Text(), i, promptWords)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*fOpt.timeout)*time.Second)
 
-			var warmupMetrics *api.Metrics
-			err = client.Generate(ctx, req, func(resp api.GenerateResponse) error {
-				if resp.Done {
-					warmupMetrics = &resp.Metrics
-				}
+			err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
 				return nil
 			})
 			cancel()
 
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "WARNING: Warmup %d/%d for %s failed: %v\n", i+1, *fOpt.warmup, model, err)
-			} else {
-				if *fOpt.debug {
-					fmt.Fprintf(os.Stderr, "Warmup %d/%d for %s complete\n", i+1, *fOpt.warmup, model)
-				}
-				// Calibrate prompt token count on last warmup run
-				if i == *fOpt.warmup-1 && *fOpt.promptTokens > 0 && warmupMetrics != nil {
-					calibratePromptTokens(*fOpt.promptTokens, warmupMetrics.PromptEvalCount, len(strings.Fields(req.Prompt)))
-				}
+			} else if *fOpt.debug {
+				fmt.Fprintf(os.Stderr, "Warmup %d/%d for %s complete\n", i+1, *fOpt.warmup, model)
 			}
 		}
 
@@ -550,24 +475,19 @@ func BenchmarkModel(fOpt flagOptions) error {
 				ttft = 0
 				var ttftOnce sync.Once
 
-				req, buildErr := buildUniqueGenerateRequest(model, fOpt, imgData, epoch+attempt*1000, seenPrompts)
-				if buildErr != nil {
-					err = buildErr
-					fmt.Fprintf(os.Stderr, "ERROR: Couldn't generate unique prompt for model '%s': %v\n", model, buildErr)
-					break
-				}
+				req := buildChatRequest(model, fOpt, imgData, rand.Text(), attempt, promptWords)
 				requestStart := time.Now()
 
 				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*fOpt.timeout)*time.Second)
 
-				err = client.Generate(ctx, req, func(resp api.GenerateResponse) error {
+				err = client.Chat(ctx, req, func(resp api.ChatResponse) error {
 					if *fOpt.debug {
-						fmt.Fprintf(os.Stderr, "%s", cmp.Or(resp.Thinking, resp.Response))
+						fmt.Fprintf(os.Stderr, "%s", cmp.Or(resp.Message.Thinking, resp.Message.Content))
 					}
 
 					// Capture TTFT on first content
 					ttftOnce.Do(func() {
-						if resp.Response != "" || resp.Thinking != "" {
+						if resp.Message.Content != "" || resp.Message.Thinking != "" {
 							ttft = time.Since(requestStart)
 						}
 					})
@@ -709,23 +629,22 @@ func readImage(filePath string) (api.ImageData, error) {
 
 func main() {
 	fOpt := flagOptions{
-		models:              flag.String("model", "", "Model to benchmark"),
-		epochs:              flag.Int("epochs", 6, "Number of epochs (iterations) per model"),
-		maxTokens:           flag.Int("max-tokens", 200, "Maximum tokens for model response"),
-		temperature:         flag.Float64("temperature", 0, "Temperature parameter"),
-		seed:                flag.Int("seed", 0, "Random seed"),
-		timeout:             flag.Int("timeout", 60*5, "Timeout in seconds (default 300s)"),
-		prompt:              flag.String("p", DefaultPrompt, "Prompt to use"),
-		imageFile:           flag.String("image", "", "Filename for an image to include"),
-		keepAlive:           flag.Float64("k", 0, "Keep alive duration in seconds"),
-		format:              flag.String("format", "benchstat", "Output format [benchstat|csv]"),
-		outputFile:          flag.String("output", "", "Output file for results (stdout if empty)"),
-		verbose:             flag.Bool("v", false, "Show system information"),
-		debug:               flag.Bool("debug", false, "Show debug information"),
-		warmup:              flag.Int("warmup", 1, "Number of warmup requests before timing"),
-		promptTokens:        flag.Int("prompt-tokens", 0, "Generate prompt targeting ~N tokens (0 = use -p prompt)"),
-		promptTokensPerWord: flag.Float64("prompt-tokens-per-word", 0, "Initial token-to-word ratio for generated prompts (0 = heuristic)"),
-		numCtx:              flag.Int("num-ctx", 0, "Context size (0 = server default)"),
+		models:       flag.String("model", "", "Model to benchmark"),
+		epochs:       flag.Int("epochs", 6, "Number of epochs (iterations) per model"),
+		maxTokens:    flag.Int("max-tokens", 200, "Maximum tokens for model response"),
+		temperature:  flag.Float64("temperature", 0, "Temperature parameter"),
+		seed:         flag.Int("seed", 0, "Random seed"),
+		timeout:      flag.Int("timeout", 60*5, "Timeout in seconds (default 300s)"),
+		prompt:       flag.String("p", DefaultPrompt, "Prompt to use"),
+		imageFile:    flag.String("image", "", "Filename for an image to include"),
+		keepAlive:    flag.Float64("k", 0, "Keep alive duration in seconds"),
+		format:       flag.String("format", "benchstat", "Output format [benchstat|csv]"),
+		outputFile:   flag.String("output", "", "Output file for results (stdout if empty)"),
+		verbose:      flag.Bool("v", false, "Show system information"),
+		debug:        flag.Bool("debug", false, "Show debug information"),
+		warmup:       flag.Int("warmup", 1, "Number of warmup requests before timing"),
+		promptTokens: flag.Int("prompt-tokens", 0, "Generate prompt targeting ~N tokens (0 = use -p prompt)"),
+		numCtx:       flag.Int("num-ctx", 0, "Context size (0 = server default)"),
 	}
 
 	flag.Usage = func() {
