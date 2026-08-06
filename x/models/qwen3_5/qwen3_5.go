@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"runtime"
 	"strings"
 
@@ -921,6 +922,19 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		m.LMHead = lmHead
 	} else {
 		m.LMHead = m.EmbedTokens.AsLinear()
+	}
+
+	// Quantized-body artifacts keep lm_head dense, which costs a full bf16
+	// vocabulary scan every decode step (on qwen3.6-35b: 1.0GB/token versus
+	// ~0.5GB for a quantized head — the dominant decode-side gap to llama's
+	// q8 output rows). Repack to the model's quant mode so decode takes the
+	// fast fp_qmv path. Gated: MLX_MX_MODEL_QUANTIZED_LMHEAD=1.
+	if dense, ok := m.LMHead.(*nn.Linear); ok && dense != nil &&
+	    supportsGatherQMM(cfg.QuantMode, cfg.QuantBits) &&
+	    os.Getenv("MLX_MX_MODEL_QUANTIZED_LMHEAD") == "1" {
+		m.LMHead = nn.NewQuantizedLinear(
+			dense.Weight, dense.Bias,
+			cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode)
 	}
 	useQuantizedExperts := supportsGatherQMM(cfg.QuantMode, cfg.QuantBits)
 	if !useQuantizedExperts && cfg.TensorQuant != nil {

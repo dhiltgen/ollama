@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 
 	"github.com/ollama/ollama/x/mlxrunner/batch"
@@ -750,6 +751,17 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		m.LMHead = head
 	} else {
 		m.LMHead = m.EmbedTokens.AsLinear()
+	}
+
+	// Quantized-body artifacts keep lm_head dense; see the qwen3_5 comment
+	// for the decode-bandwidth rationale. Gated: MLX_MX_MODEL_QUANTIZED_LMHEAD=1.
+	if dense, ok := m.LMHead.(*nn.Linear); ok && dense != nil &&
+	    os.Getenv("MLX_MX_MODEL_QUANTIZED_LMHEAD") == "1" &&
+	    ((cfg.QuantMode == "mxfp8" && cfg.QuantBits == 8) ||
+	        (cfg.QuantMode == "nvfp4" && cfg.QuantBits == 4)) {
+		m.LMHead = nn.NewQuantizedLinear(
+			dense.Weight, dense.Bias,
+			cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode)
 	}
 
 	for i := range cfg.NumHiddenLayers {
