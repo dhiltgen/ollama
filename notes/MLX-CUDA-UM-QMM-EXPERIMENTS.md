@@ -6989,6 +6989,37 @@ QUIRK 2: llama-side laguna GGUF row failed ollama's TestBasic
 ("raw protocol tag </assistant>" leaked) on the freshly built
 llama-server; bench numbers still valid via -DirectCorrectness path.
 
+### Roadmap: bench-prompt adoption + MLX upstream rebase (2026-08-06)
+
+bench-prompt (ollama tree): branch was already current with
+upstream/main (8d8c701d6); cherry-picked the two bench commits:
+- 9905edfe8 (-> 52ee44709) "api: add input token count routes"
+  (ChatInputTokens on our server build needed by BOTH backends')
+- 56a3008e3 (-> a32d1a93e) HumanEval code-continuation prompts,
+  replacing the word-salad generator (calibration flag
+  -prompt-tokens-per-word removed; exact counts via the API).
+  Conflict resolution: took bench-prompt's cmd/bench wholesale; our
+  parity-protocol bits live in the scripts, not the bench tool.
+MTP/fairness refresh matrix (mlx-qwen27b-nvfp4, mlx-qwen35b-mxfp8,
+mlx-gemma4-12b-nvfp4 + llama GGUF counterparts through OUR server
+binary driving official llama backend) running at
+.cache/bench/mtp-fairness-20260806.
+
+MLX (mlx-nvidia-um): upstream/main @39d9a8ac2 is very active this week:
+- gather_qqmm landed (Cheng, #3757, 2026-08-05): CUDA naive gather-qmm
+  + big metal quantized overhaul. Our fp_gather_qmv fast path is AHEAD
+  of it; coexist fine.
+- "Fix CUDA batched GEMV grid overflow" (#3929, 2026-08-06, gemv.cu +
+  matmul.cpp) — decode GEMV area; course-check rows queued.
+- Cheng's other branches frozen since Dec 2025 (cuda-cudnn-norms,
+  cublas-grouped-mm, cuda-sdpa-reuse-graph WIP) — the foundational line
+  fully merged; his newest is free-threaded (May 2026).
+Rebased cuda-unified-memory-kernels on upstream/main: only 3 local
+commits (win seeks, UM hints, fvec/fmma), ZERO conflicts
+(d03d3fb3d/4455d3abd/53608940d; backup ref backup/pre-rebase-20260806).
+Rebuilt libmlx on tater50 with the rebased tree -> dist
+ollama-ab-rebase-v1 for the decode-skew course-check.
+
 
 
 
