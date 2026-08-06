@@ -6935,5 +6935,60 @@ nemotron3-33b-mxfp8 A/B (same protocol, new binary):
   Remaining nemotron3-33b-bf16 gen 97.8% is a bf16-vs-bf16 gap (dense
   heads on both sides) — GEMV efficiency territory, not bytes.
 
+### tater62 bring-up (2026-08-06): native WoA build + first matrix
+
+tater62 returned as Windows ARM64 (GB10 sm_121a, driver **615.83**,
+vs tater50's 580.82.07). No admin needed: CUDA 13.4 + cuDNN v9.25 +
+VS18(ARM64 tools) preinstalled by user; git via winget(user); Go 1.26.5
+(user); zig 0.14.0 (user-local, cgo CC — MSVC is rejected by the Go
+toolchain; CGO_CFLAGS needs -Wno-error=date-time for MLX_ERROR's
+__DATE__ and -O2 or zig Debug defaults emit ubsan); llvm-mingw aarch64
+(user-local — CI's WoA toolchain, .github/workflows/release.yaml
+cpuArm64 step; ggml refuses MSVC for ARM CPU backend);
+LLVM 20.1.2 woa64 (per-user NSIS /S /CurrentUser) for clang-cl.
+
+Builds (production presets, scripts/build_windows.ps1 mirrored):
+- ollama.exe 0.32.4 + mlx.dll/mlxc.dll (preset Default, MLX_CUDA_ARCH=121a)
+- llama-server.exe + ggml-cpu (cpu_arm64 preset + llvm-mingw) +
+  ggml-cuda.dll (llama_cuda_v13_windows_arm64 preset, MSVC cl + nvcc)
+  -> integrated into dist ollama-mlx-cuda13-sm121a/lib/ollama.
+
+OpenSSH session job cleanup kills Start-Process children on disconnect;
+run everything over held-open ssh sessions or one-shot schtasks.
+
+OpenSSH sshd key note: tater50<->tater62 direct scp needs key
+authorization (not done; bridged via workstation instead, then switched
+to registry pulls: all 6 test models pulled from ollama registry on
+tater62).
+
+First parity matrix (bench protocol via tater62_run_bench.ps1 +
+cmd/bench.exe, GGUF llama through the same ollama serve):
+
+row                    mlx_pf  llama_pf   pf%   mlx_gn  llama_gn   gn%
+nemotron3-nano-4b      4846.6    3693.4  131%   80.32    81.41(*) 99%
+laguna-xs2-nvfp4       2624.4    2198.3  119%   53.75    49.34    109%
+gemma4-12b-nvfp4       1929.0    1565.1  123%   26.92    25.89    104%
+
+  (*) llama nemotron generated 7-token responses; treat gn as sketchy.
+  gemma4 row requires fvec routing (see quirk below); without SDPA
+  gates the box measures 43% prefill (1pass) — same defaults-off trap
+  as tater50.
+
+QUIRK 1 (driver differential): kernel_sdpav_fmma produces DEGENERATE
+output on tater62 (driver 615.83) while passing the 13-case harness and
+all gates on tater50 (driver 580.82.07) — gemma4-12b long-prompt under
+fmma: "canvases/ DAP???..." garbage; fvec alone: topical sky-blue,
+correct. This is exhibit B for the fmma/dh512 codegen anomaly (task
+#11): driver-dependent codegen outcome on an AOT sm_121a binary. FVEC
+is safe on both drivers; fmma should be default-ON only on 580.x, or
+held entirely until the root cause is understood. A differential
+harness run on tater62 (same .tmp/fmma_full_test binary, native nvcc)is
+the next leverage for task #11.
+
+QUIRK 2: llama-side laguna GGUF row failed ollama's TestBasic
+("raw protocol tag </assistant>" leaked) on the freshly built
+llama-server; bench numbers still valid via -DirectCorrectness path.
+
+
 
 
