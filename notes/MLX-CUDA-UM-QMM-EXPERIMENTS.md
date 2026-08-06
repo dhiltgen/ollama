@@ -6906,5 +6906,34 @@ glue/wall), gemma4-31b-bf16 gn 98.2% (bf16 decode GEMV), qwen36-35b gn
 89.9% (decode fp_qmv/gemv/gather + honest format-byte gap), nemotron
 mxfp8/bf16 gn 95.6/97.8%.
 
+### Dense lm_head decode fix (2026-08-06, qwen row crossed)
+
+qwen36-35b decode root cause is NOT the MoE qmv/gather budget — it is
+the lm_head tensor. Quantized-body artifacts store lm_head densely: for
+qwen3.6-35b-a3b-mxfp8 that is 1.017GB bf16 (248320x2048) scanned every
+decode step, while the dtype-matched llama q8_0 GGUF stores
+output.weight q8_0 (0.52GB). MLX's gemv_single runs at ~235GB/s
+(near-optimal), so the entire ~2ms/token gen gap (19.97 vs 17.96) is
+extra bytes. Fix: runtime-repack LMHead to the model's quant mode at
+load in qwen3_5 (nemotron_h same, dense 363MB head) via
+nn.NewQuantizedLinear, gated MLX_MX_MODEL_QUANTIZED_LMHEAD=1.
+
+A/B (dist ollama-ab-lmhead-q1, cublas 13.1 + SDPA gates, same protocol):
+  gate OFF: gen 50.52/50.52/50.75 t/s (median 50.52)
+  gate ON:  gen 56.32/56.27/56.21 t/s (median 56.27) = +11.4%
+  llama q8_0 target 55.69 -> 101.0% PARITY CROSSED. prefill unchanged
+  (2020-2027 vs 2049-2065, noise). TestBasic + long-prompt topical
+  content both pass with the quantized head.
+
+nemotron3-33b-mxfp8 A/B (same protocol, new binary):
+  gate OFF control: gen 57.09/56.91/57.12 (median 57.09) = 100.3% of
+  llama q8 (56.91). gate ON: 55.66 median = 97.8%. Conclusion: the
+  quantized-head path is neutral-to-slightly-negative for nemotron-h
+  (363MB head; mxfp8 fp_qmv efficiency at this shape does not beat
+  235GB/s bf16 gemv by enough), and its matrix-era 54.42 (95.6%) was
+  mostly run-order variance. Gate stays OFF, qwen-specific win only.
+  Remaining nemotron3-33b-bf16 gen 97.8% is a bf16-vs-bf16 gap (dense
+  heads on both sides) — GEMV efficiency territory, not bytes.
+
 
 
