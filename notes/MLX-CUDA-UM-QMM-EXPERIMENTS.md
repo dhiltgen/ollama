@@ -7020,6 +7020,42 @@ commits (win seeks, UM hints, fvec/fmma), ZERO conflicts
 Rebuilt libmlx on tater50 with the rebased tree -> dist
 ollama-ab-rebase-v1 for the decode-skew course-check.
 
+### Self-review vs MLX-conventions.md (2026-08-06)
+
+Pass against the checklist for the CUDA sdpa work
+(scaled_dot_product_attention.cu):
+- kernels in `cu` namespace (profiler-readable) ✓; host helpers in the
+  anonymous namespace ✓; includes outside namespaces ✓.
+- env gating via `env::get_var` in function-local statics (the blessed
+  one-time-discovery pattern) ✓.
+- preserved sibling dispatch style (dispatch_bool/dispatch_float_types,
+  cu::AttnParams pattern) ✓.
+- barrier discipline: tile-skip votes via `__syncthreads_or` (barrier +
+  reduction, no shared flag) after the write/read race the racecheck
+  caught; K/V staging separated by `__syncthreads()` ✓.
+- runtime capability/arch checks only (route conditions + one-time
+  cudaFuncSetAttribute for dynamic smem) ✓; int32 indices are sized for
+  the kernel domain (kvL <= 2^31 rows) ✓.
+- no macro backend dispatch; backend-local file only ✓.
+
+Known deviations a maintainer will flag (documented, by design or open):
+1. Inline PTX (`mma.sync.m16n8k16` bf16, `ldmatrix`) — the doc says
+   "prefer library intrinsics"; no intrinsic exposes this shape (wmma
+   bf16 is 16x16x16, wrong tile; cutlass mma headers were the
+   alternative at higher integration cost). Flag for maintainer
+   conversation; do not "fix" unilaterally.
+2. The dh512 `dbg_out` forensics hook (kernel changes behavior with a
+   dead runtime path — minimalism would strip it; root cause is task
+   #11, now with a cross-driver reproducer on tater62).
+3. Gate defaults OFF (fvec/fmma) — production decision, not code
+   style; flip only after the review + driver-differential resolution.
+4. fp_gather_qmv vs upstream's new gather_qqmm (Cheng #3757, naive):
+   sibling-variant semantics will be reviewed — align naming/interface
+   or justify divergence in a comment before PR.
+5. Go-runner-side gates (MLX_MX_MODEL_QUANTIZED_LMHEAD) are ollama-
+   side, not MLX — out of MLX-reviewer scope but follow the same "gate
+   then default-on after proven" arc.
+
 
 
 
