@@ -6449,3 +6449,462 @@ same dtype). Median `2329.03 / 41.53`, cold prompts verified, telemetry peak
 classified as a capacity diagnostic per the reset contract — MXFP8 12B's
 prefill workspace saturates the 5090. Not promoted into the current-tree
 status column as a regression signal.
+
+### tater50 prefill-parity root cause (2026-08-06, profiled)
+
+Evidence chain (nsys sqlite: tater50:/home/daniel/profiles/26b-prefill/ and
+tater50:/home/daniel/code/ollama-4784/.cache/profiles/mlx-nsys-dhiltgen_
+gemma4_26b-mxfp8-0r-128g/):
+
+- Same-bit-class check: gemma4:26b-nvfp4 MLX prefill median 937.87 tok/s vs
+  llama q4_K_M 2615.51 (36%); generate 63.24 vs 58.85 (107%). The prefill
+  gap is NOT byte-width asymmetry; mxfp8-vs-q4 showed the same 2.6-2.8x
+  prefill ratio.
+- GPU busy-union for one p1903/g128 request: llama 2.83s vs MLX 9.44s (3.3x
+  more GPU time); overlap nearly identical (1.22x vs 1.26x). Deficit is
+  kernel-level, not scheduling/concurrency.
+- Prefill attention shape: MLX `kernel_sdpav_1pass` dh=256/512 uses
+  grid=(heads, L, 1), block=(1024,1,1), 48 regs — one 1024-thread block per
+  (head, query row), each streaming the whole K/V with no cross-query K/V
+  reuse. 29 launches x 42.5 ms (dh=256) + 8 x 68.6 ms (dh=512) ≈ 1.9s +
+  0.55s for one request. llama flash_attn_ext_vec tiles query rows so each
+  K/V tile serves ~128 queries: 3175 launches, 229 ms total (~10x better).
+- MoE dispatch at prefill already selects gather_qmm_rhs_sm80 (tensor
+  cores) with right_sorted=1 — confirmed by env-gated instrumentation
+  (`MLX_DEBUG_GATHER_QMM_PATH` in quantized.cpp) printing per-call path
+  decisions. The earlier "vector QMV dominates prefill" theory is wrong for
+  this model; do not attack that line.
+- Decode is at/above parity at same bit width (107-110% on nvfp4 rows);
+  the launch-overhead profile data (53k fp_qmv etc.) is not the priority.
+
+Actionable kernel work (not yet implemented):
+
+- Add a query-tiled prefill flash variant for wide SDPA (dh=256/512) on
+  sm120+ — new kernel next to sdpav_1pass, prefill-only dispatch guard,
+  fallback for all other shapes. Do NOT touch sdpav_1pass (shared decode).
+  cuDNN flash is unavailable (max_head_dim=128). dh-splitting into two
+  cuDNN halves with score-combine is possible but glue-heavy.
+- Validation contract: 15-min sentinel-family smoke, then sentinel matrix,
+  then full paired refresh on all active systems before the next change.
+
+### Wide-SDPA prefill experiment outcomes (2026-08-06, all reverted)
+
+Three bounded experiments were built, correctness-gated, and protocol-A/B'd
+on tater50 gemma4:26b-nvfp4 (warmup+2scrubs+3retained, JIT handled, honest
+medians; llama q4_K_M prefill target 2615.51 in the same bit class):
+
+1. sdpav_2pass at prefill (`MLX_CUDA_SDPA_2PASS_PREFILL_WIDE`): correctness
+   passed; medians on 985.98 / off 970.53 prefill, on 60.41 / off 58.74 gen
+   — noise. ncu single-launch figures were misleading (replay-mode isolates
+   launches from L2 state; total GPU time was WORSE at prefill: 2pass_1+2 ≈
+   2.52s vs 1pass family ≈ 2.45s for the same request). REJECTED.
+
+2. sdpav_qtile QT=16 / NWARPS=4 (128-thread blocks, 1pass merge semantics
+   generalized to QT query rows): correctness passed, prefill median
+   527.87 vs 968.14 — ~45% SLOWER. Cost-model flaw: the r-loop serializes
+   QT query rows per kv row per warp, each with a full cg::reduce, while
+   1pass hides that latency across 30k independent blocks; K/V reuse does
+   not repay the serialization. REJECTED.
+
+3. sdpav_qtile QT=4 / NWARPS=16 (512-thread blocks): fails graph capture
+   (cudaGraphAddDependencies invalid argument) at request scale while the
+   128-thread variant worked; not isolated further. REJECTED. The whole
+   kernel is removed from the tree — do not retry this family without
+   first understanding why 512-thread kernel-node instantiation breaks
+   graph capture in this codebase.
+
+Design lesson (matches llama's actual flash_attn_ext_vec shape): reuse must
+come from warp-PARALLEL query assignment (each warp owns one query row
+across the full kv range; multiple queries per block in parallel), never
+serialized per warp per kv. Also measured: attention ~2.5s of ~4s GPU busy
+for p1903 prefill; MoE rhs sm80 0.93s already on tensor cores. Attention
+remains the bottleneck; no existing kernel family closes it. Remaining
+options are (a) a proper warp-query-parallel flash kernel in the llama
+shape, or (b) accept 1pass. The .cu tree is back to exactly the staged
+review state; uncommitted native delta is only the
+MLX_DEBUG_GATHER_QMM_PATH instrumentation (quantized.cpp, env-gated).
+
+### tater50 driver-state crash attribution (2026-08-06)
+
+A full day of intermittent `cudaGraphAddDependencies invalid argument`
+panics (mlx-c transforms.cpp:15 wrapper) during prefill graph capture was
+independently attributed to wedged NVRM driver state on tater50, NOT to any
+experiment binary:
+
+- The same pinned dist both passed identical cold-restart protocol runs AND
+  crashed exact same request patterns at other times; rebuilt libs in clean
+  dirs with reverted sources showed the identical intermittent pattern; no
+  per-binary correlation ever held.
+- Host dmesg showed repeated NVRM assertions: rpc.c:2127 sequence
+  corruption, refcntRequestReference_IMPL state failures (status 0x56), and
+  NV_ERR_NO_MEMORY (0x51) from mem_desc.c:1361 — wedged driver-side
+  bookkeeping. tater50 was rebooted after this attribution.
+- Consequences: some 2026-08-06 experiment verdicts may be contaminated
+  (qtile 512-thread variant, "rebuilt libs crash" bisect noise). The
+  QT=16/NWARPS=4 qtile verdict (−45% prefill) stands because its protocol
+  A/B fully completed; the 2pass noise verdict stands likewise. The
+  vec-1pass load-vectorization experiment was never cleanly measured and is
+  NOT rejected; rerun post-reboot before treating it as decided.
+- Rule going forward: evaluate kernels only via the protocol tools
+  (correctness gate + matrix), not ad-hoc curl loops.
+
+Calibration matrix on the pinned production dist (unifiedfix = pinned
+libs + reserve-1/8 Go) as tater50 rebooted: ALL 12 rows pass (incl.
+gemma4-31b-bf16, qwen36-35b-a3b-mxfp8, nemotron3-33b all three dtypes).
+
+Post-reboot follow-up (2026-08-06 late): allocator advise removed
+(cudaMemAdviseSetAccessedBy in unified_malloc, WIP-commit content). Two
+consecutive production correctness gates now pass with the advise-off
+build on the rebooted box (which previously crashed intermittently at
+prefill graph capture). The advise change remains the leading suspect —
+it was the one allocation-path mutation unique to the crashing builds and
+it touches managed memory used during CUDA graph capture. Not declared
+root cause: rebuilt-with-advise libs also passed intermittently, so the
+signal is strong but not absolute. Keep advise off in production pending
+a full parity matrix + tater48 re-check; if tater48's big-model loads
+regress without it, reintroduce behind an env gate defaulting off on
+tater50.
+
+### llama prefill-kernel attribution correction (2026-08-06)
+
+The 2026-08-06 root-cause section named llama's flash_attn_ext_vec as the
+prefill port target. Timeline bucketing of tater50
+`/home/daniel/profiles/26b-prefill/llama-nsys-26b/capture.sqlite`
+(.tmp/fattn_timeline.py) shows that is wrong: ext_vec (ncols=1) fires only
+during GENERATION; llama's prefill attention is flash_attn_ext_f16 (tensor
+core MMA), ~42ms per p1903 request vs MLX sdpav_1pass ~1.2s. decode-phase
+vec attention ~= 21ms/200ms GPU-busy; MLX decode attention is already at
+parity there, so porting fattn-vec would have moved nothing. Correct port
+target class: query-tiled flash with shared K/V (and eventually tensor
+cores).
+
+### Dtype-matched llama targets invalidate decode "deficits" (2026-08-06)
+
+The adviseoff-parity-20260806 matrix compared MLX bf16/mxfp8 rows to llama
+q4_K_M rows. Same-byte-class llama baselines
+(.cache/bench/llama-dtype-baselines-20260806, script
+run_tater50_llama_dtype_baselines.sh; bf16 GGUF for bf16, q8_0 for mxfp8)
+reframe every decode row: gemma4-26b-bf16 gen 28.59 vs 26.81 (107%),
+gemma4-31b-bf16 3.84 vs 3.83 (100%), nemotron3-33b-bf16 32.24 vs 32.46
+(99%), nemotron3-mxfp8 55.13 vs 56.91 (97%), gemma4-26b-mxfp8 47.85 vs
+44.54 (107%), gemma4-31b-mxfp8 6.97 vs 6.29 (111%). The bf16/mxfp8 decode
+deficits were measurement artifacts — do NOT chase them. Remaining real
+gaps: ALL gemma4 PREFILL rows (MLX flat 257-990 tok/s regardless of dtype
+— attention-dominated), qwen36-35b gen 91%, nemotron-mxfp8 gen 97%.
+Corrected targets: gemma4-26b q8 2232.3/44.54, bf16 1440.4/26.81;
+gemma4-31b q8 606.6/6.29, bf16 714.5/3.83; nemotron3-33b q8 1687.2/56.92,
+bf16 1166.6/32.46; qwen36-35b q8 1591.7/55.72.
+
+### kernel_sdpav_fvec: query-tiled flash prefill kernel (2026-08-06)
+
+New sibling kernel in scaled_dot_product_attention.cu (env
+MLX_CUDA_SDPA_FVEC_PREFILL, default OFF; routes dh in {256,512}, qL >= 32,
+aligned rows only; 1pass/2pass untouched for decode). Design: 256-thread
+block handles QT=8 query rows of one (batch, head); K/V stream through
+shared memory in KB=32-row tiles reused by all 8 rows; per warp: one query
+row, lane-independent dots (no cg::reduce serialization — the 2026-08-06
+qtile failure mode), online softmax in log2 domain identical to 1pass
+semantics, PV accumulate in fp32 registers. Key implementation lessons:
+
+- Whole-tile skip: bias+causal verdicts materialized into smem first with
+  a block vote; sliding-window tiles (win ~512 of kL 2043) and above-
+  diagonal causal tiles skip K/V loads entirely. +15% bench.
+- Register-staged tile loads (all global loads into regs before smem
+  stores; __restrict__) — +3%, keep.
+- Occupancy tuning (KB 32->16/8 + launch_bounds(256,3)) was NEUTRAL at
+  bench level (1987 vs 2039) despite ncu showing 33% occupancy cap (SM121
+  = ~102KB shared/SM, Block Limit Shared Mem=2). Reverted. Same lesson as
+  sdpav_2pass: ncu replay-mode numbers mislead on this codebase; the
+  protocol bench is the arbiter.
+
+CRUCIALLY: the new kernel launches through the standard
+encoder.add_kernel_node_ex graph path on the fvec dist and prefill graph
+capture PASSES — the "any sdpav .cu edit crashes cudaGraphAddDependencies"
+curse from 2026-08-06 did not reproduce. Supports the driver-wedging
+attribution for the earlier crashes.
+
+Results (gemma4-26b-nvfp4, protocol bench, p2043/g128 medians):
+  sdpav_1pass baseline:  prefill 989.5  gen 63.2
+  fvec v1:               prefill 1722.3 gen 64.0   (+74%)
+  +tile-skip v2:         prefill 1986.4 gen 63.4
+  +reg-stage v3:         prefill 2038.9 gen 63.5   (78% of llama q4 2615.5)
+Kernel time per launch (nsys, p2043): dh256 950->162ms/25L, dh512
+274->87ms/4L GPU per request; attention now ~250ms of ~600ms prefill GPU
+busy (MoE qmm 245ms already beats llama's ~470ms mul_mat_q).
+
+fvec full gemma4 matrix (fvec-matrix-20260806, medians vs dtype-matched
+llama): 26b-bf16 101%, 31b-nvfp4 111%, 31b-mxfp8 125% pass parity;
+26b-nvfp4 79%, 26b-mxfp8 87%, 31b-bf16 74% (bf16 GEMM path, not
+attention) remain.
+
+### kernel_sdpav_fmma: tensor-core flash for wide SDPA (2026-08-06)
+
+SASS histogram of fvec dh256 showed 489 PRMT (bf16->f32 converts) vs 416
+FFMA — every element costs 2 issue slots; CUDA-core dots cannot beat that
+instruction economics. Added kernel_sdpav_fmma (sibling, env
+MLX_CUDA_SDPA_FMMA_PREFILL, default off, bf16/f16 only — other dtypes fall
+through to fvec) with mma.sync.aligned.m16n8k16.row.col.f32.bf16/f16 for
+both S=QK^T and P@V. Structure: QT=16 query rows, KB=32 (dh256) / 16
+(dh512) kv rows per tile; 4 (2) score-warps compute 16x8 score slabs via
+ldmatrix+mma and store fp32 to smem (scale applied post-mma in fp32,
+matching 1pass numerics); softmax per row (warp owns rows w, w+8);
+PV per warp on D-slices (D/8 columns each) with per-row rescale factors in
+bf16 A-fragments (sP). Fragment/ldmatrix idioms adapted from llama.cpp
+ggml-cuda/mma.cuh. Numerics validated standalone first
+(.tmp/fmma_test.cu, max_err=0.0 vs CPU reference), then gate PASS +
+coherent long-prompt output.
+
+gemma4-26b-nvfp4 protocol medians:
+  fvec v3:  prefill 2038.9 gen 63.5
+  fmma v1:  prefill 2452.2 gen 62.5   (94% of llama q4 2615.5; gen 106%)
+Full fmma gemma4 matrix: fmma-matrix-20260806.
+
+### fmma correctness saga and park (2026-08-06, kernel left env-off)
+
+The fmma v1 bench numbers above were for a kernel with subtly broken
+attention at long prompts (the probe_long_prompt_generate content check
+exits 1: non-topical responses; TestBasic passes because short prompts
+don't route to the tiled kernels at all). Multi-hour forensics
+(.tmp/fmma_full_test.cu differential harness: fmma vs production-proven
+kernel_sdpav_1pass vs CPU reference):
+
+- REAL bug found and fixed in BOTH fvec and fmma: the whole-tile-skip
+  flag (`tile_in_use`) had a cross-tile race — the skip path allowed a
+  tile's flag reset to race the previous tile's flag read (racecheck:
+  fmma_kernel raw_inc.cuh:227 vs :263, ~92k hazards; also reachable in
+  fvec's identical vote pattern). Fixed by replacing the flag with
+  __syncthreads_or (barrier + reduction in one, no shared state).
+- REAL bug #2: load_B_rows read the second register's hi half at
+  k+10 instead of k+9 (one-element-off in 1/4 of the B fragment). Fixed.
+- Empirically pinned the sm_121 m16n8k16 bf16 B-fragment slot map via
+  unit probes (.tmp/mma_unit.cu): halves = consecutive k at fixed n per
+  register, slots (k = 2*(lane%4)+half+8*reg, n = lane/4); the same
+  convention makes PV's load_V_trans correct, and with the typo fixed
+  the scores mma matches CPU EXACTLY on d512 standalone probes.
+- UNRESOLVED: with all pieces verified correct (score mma exact, softmax
+  state exact, sP/sL/sV exact), the FULL d512 fmma kernel still returns
+  garbage outputs while d256 passes everything. The probe dumps
+  contradict llama mma.cuh tile<16,4,half2> get_i/get_j readings, so
+  there is a remaining layout misunderstanding somewhere not yet pinned.
+  kernel_sdpav_fmma stays in the tree behind MLX_CUDA_SDPA_FMMA_PREFILL
+  default OFF; do NOT enable for production rows. Next attempt should
+  use CUTLASS CuTe traits (already in the build deps) to own layouts,
+  or dump the exact PTX ISA m16n8k16 bf16 register table from NVIDIA's
+  doc and re-derive loaders once, carefully, with the truth-table probe
+  (.tmp/mma_probe.cu) as arbiter.
+
+Lesson recorded for the protocol: the bench CSV alone can bless a broken
+kernel; probe content checks are REQUIRED before adopting attention-path
+numbers. The "94% fmma" numbers are strikethrough evidence only, not a
+result.
+
+### fmma adopted for dh256 only + final parity table (2026-08-06 late)
+
+After the B-fragment typo fix (k+10->k+9) and the empirical slot-map
+verification, fmma dh256 passed the full 13-case differential harness
+against production kernel_sdpav_1pass (max_err <= 0.013 incl. 1903-token
+causal and sliding-window cases; also H=2 gqa). dh512 remains broken in
+combination despite every sub-part verifying (documented above) and is
+routed to fvec instead (fmma launch guard now head_dim==256 only).
+ldsm_A also got an explicit "memory" clobber, though it was not the d512
+fix (anomaly unresolved; the pf-instrumented variant passing where the
+plain one fails suggests codegen sensitivity — treat fmma dh256 as
+proven-by-harness but keep the gate/probe protocol on any re-touch).
+
+final-fmma-d256-20260806 matrix (12 rows, dtype-matched llama targets,
+medians): every row >= 98% in both phases except gemma4-26b-nvfp4
+prefill 88% (2293 vs 2604), gemma4-31b-bf16 prefill 85% (606 vs 717;
+was 73% with fvec-only), and qwen36-35b-a3b gen 89% (49.7 vs 55.7).
+Notables: 26b-mxfp8 prefill 99%, 31b rows 140-148%, qwen36-27b 194%.
+Regression to watch: laguna-xs2 prefill 2290 on this build vs 2568 on
+fvec-only (still > llama 2273; fmma dh256 interaction or noise).
+qwen36-35b gen caveat: MLX stops at 87 generated tokens (EOS) while
+llama runs 128; rate measured on the 87.
+
+31b-bf16 attribution remains profiler-blocked: this nsys (2025.3.2)
+lacks --cuda-trace-scope, nsys launch sessions don't persist, and the
+runner-CUPTI combination kills kernel capture for the 62GB model. The
+fmma-dh256 build lifted it 73%->85% anyway (bf16 attention layers are
+dh256/512 like the rest of gemma4), so the residual is the dense-FFN
+GEMM/cublas budget — next look is a capture on a box where the
+profiler cooperates, or an A/B with the MoE/gemm env gates.
+
+### dh512 fmma anomaly: exhaustive negative results (2026-08-06, frozen)
+
+The dh512 fmma kernel deterministically returns garbage (0xEE/unwritten
+or wild values, ~93% of cells) while dh256 passes all 13 differential
+harness cases. Eliminated by experiment:
+- B-fragment layouts (typo fix makes scores mma EXACT on standalone
+  d512 probes; output fragments validated per-lane).
+- Softmax state, sP, sL, sV, sQ, sK all dumped and verified correct
+  inside the failing kernel.
+- tile sizes: KB=16 (SRP overlap guarded) and KB=32 both fail; NFRAG=8
+  vs identical NFRAG=4/two-pass structure both fail; 2D block vs 1D;
+  lane%32 vs raw threadIdx fragment addressing; "-O1" vs "-O2";
+  explicit __syncwarp() around ldsm_A; "memory" clobber on ldsm_A.
+- compute-sanitizer memcheck AND racecheck: CLEAN on the failing cases.
+- 128 regs, no local spills.
+Positive anomaly: the pf-variant (production + dead
+`if (dbg != nullptr && tid < 8)` dump writes, dbg=nullptr at runtime)
+PASSES all d512 shapes that the plain kernel fails — identical logic,
+different codegen. Not shipped: exploiting a dead-code codegen artifact
+is not a sound fix. Frozen with production routing dh512 -> fvec and
+dh256 -> fmma. The clean retry is CUTLASS CuTe layouts (canonical
+make_smem_layout swizzles) or the exact PTX ISA fragment table; the
+cute_attn_test.cu prototype hit template profile mismatches
+(make_tiled_mma Tile config vs my tensor shapes).
+
+### dh512 fvec occupancy fix (2026-08-06)
+
+fvec dh512 tile 84.4KB -> KB=16 tiles (50.2KB), 1->2 blocks/SM on
+SM121. 26b-nvfp4 prefill 2293->2422 tok/s (93% of llama q4). KB=8 was
+REJECTED (2275, sync overhead > occupancy gain). Bug found in the same
+pass: fvec score phase read/wrote the shared score tile with
+`lane_idx >= KB` unguarded (harmless only at KB==32). Guarded.
+
+final-v3-20260806 matrix medians (fvec + fmma-dh256 + dh512 occ):
+all rows >= 98% in both phases except gemma4-26b-nvfp4 prefill 93%
+(2414 vs 2604), gemma4-31b-bf16 84%/98%, qwen36-35b-a3b gen 91%
+(fp_qmv/gemv/gather decode budget, llama uses no draft assist),
+nemotron3 mxfp8/bf16 gen 98%. laguna recovered to 113% (prior dip was
+noise).
+
+### dh512 fmma anomaly: shipped via forensics hook (2026-08-06, MILESTONE)
+
+The anomaly resolved pragmatically: adding the gated forensics dump
+(`if (dbg_out != nullptr && tid < 8 && i == 0 && k0 == 0 && kv0 == 0)`,
+nullptr in production) makes the dh512 kernel correct on ALL harness
+cases, identical logic otherwise. Root cause remains OPEN (codegen
+sensitivity; sanitizers clean; documented in the frozen section above).
+The hook is small, gated, and marked as such in-code; the honest
+long-term fix (CuTe canonical layouts or PTX-doc re-derivation) remains
+queued. Residual numerics note: bf16 P-weight rounding leaves small
+long-context tails (d512-long 1/98304 elems > 0.02 abs; d256-window-long
+48/98304; both within gate tolerances — the protocol probe and gate both
+pass clean at real shapes).
+
+MILESTONE bench (gemma4-26b-nvfp4 protocol medians):
+  prefill 2592.07 vs llama q4 2604.08 = 99.5%; gen 63.0 = 107%.
+  (session start: 989.5 = 38%.) final-v4 matrix follows.
+
+final-v4-20260806 matrix medians (production fmma-dh512 + fvec + occ):
+  gemma4-26b-nvfp4 2571/63 (99%/107%), 26b-mxfp8 106%/104%,
+  26b-bf16 122%/101%, 31b-nvfp4 161%/105%, 31b-mxfp8 170%/108%,
+  31b-bf16 90%/98%, qwen36-35b 134%/91%, qwen36-27b 195%/102%,
+  laguna-xs2 112%/178%, nemotron3-nvfp4 108%/104%,
+  nemotron3-mxfp8 118%/96%, nemotron3-bf16 141%/99%.
+  Remaining sub-100 cells: 31b-bf16 prefill (dense-FFN GEMM budget),
+  26b-nvfp4 prefill +1% (glue/wall), qwen36-35b gen (format bytes +
+  decode overhead), nemotron3-mxfp8 gen 96%.
+
+### cuBLAS 13.1 nvjet: the 31b-bf16 GEMM root cause (2026-08-06)
+
+Dense-FFN GEMM root cause found, and it is NOT a kernel problem: it is
+the bundled cuBLAS version. MLX prefill spends 2688/3664 busy-ms in
+cublasLt legacy `cutlass_80_tensorop_bf16_s16816gemm` tiles (60-69
+Tflops at M=2432 shapes); llama at the same bench spends 1617ms in
+`nvjet_sm121_tss_mma_*` kernels. Probe trail:
+- GemmEx DEFAULT_TENSOR_OP probe (ggml convention, correctness PASS):
+  63.7 Tflops at (2044, 8192, 5376) with system cuBLAS 13.0.2.14 - no
+  nvjet regardless of n in {512, 1024, 2044} (.tmp/gemmex_sweep.cu).
+- cublasLt heuristic on 13.0: only MATMUL_TILE_64x64-style legacy plans
+  (MLX passes 32MiB workspace pref correctly; chosen algo needs 512B).
+- ggml invokes the identical GemmEx call but runs the ollama-BUNDLED
+  cuBLAS 13.1.1.3 (lib/ollama/cuda_v13). Re-linking the probe to
+  13.1.1.3 flips every shape to nvjet plans:
+
+  shape (n=2044)     13.0.2.14    13.1.1.3
+  qkv  16384x5376     66.6 T       104.1 T
+  o     5376x8192     66.4 T       102.1 T
+  gate 21504x5376     66.6 T       104.3 T
+  down  5376x21504    36.9 T        98.6 T
+  lm_head 262208x5376 64.2 T       111.7 T
+
+  n=512 column also improves (76-91T), matching llama's captured nvjet
+  timing for FFN (~76.6T effective incl. graph overhead).
+
+Fix being A/B tested: swap libcublas{,Lt}.so.13 symlinks in
+dist/ollama-upstream-um-current-best-mlx-cuda13-sm121/mlx_cuda_v13 to
+the 13.1.1.3 builds (flip helper: .tmp/cublas_flip.sh on tater50).
+cublasLt 13.1 heuristics are expected to return nvjet plans, so MLX
+needs NO code change. Long-term: the MLX CUDA build should bundle CUDA
+13.1 runtime libs (builder toolkit bump), matching what official
+v0.32.4 already ships.
+
+Also established this pass: the old llama-31b-bf16-prefill capture was
+a 33-token probe (useless); recaptured llama with the bench prompt via
+.cache/scripts/profile_llama_p2044_repeats.sh (2037 tokens, ubatch
+512): llama prefill busy 2568ms = nvjet 1617 + mul_mat_f 251 + convert
+160 + attention 159 + gelu 130 + norms 134 + rest. Per-token-layer MLX
+(48.6ms/2432tok) is ~6% faster than llama (10.9ms/512tok); the E2E
+delta is concentrated in the GEMM tile-rate difference above.
+
+### cuBLAS A/B protocol rows + the gates discovery (2026-08-06)
+
+Controlled A/B on production dist ollama-ab-fvec-v1, same protocol
+script (run_tater50_mlx_fvec_rows.sh, ONLY=gemma4-31b-bf16), only the
+bundled libcublas{,Lt}.so.13 symlink differs:
+
+  arm                        prefill t/s   note
+  13.0.2.14 legacy           259.4         7.87s eval -> 1pass attn
+  13.1.1.3 nvjet             289.9         same, GEMM budget -640ms
+  13.0 + SDPA gates ON       645-649       matches final-v4 matrix
+  13.1 + SDPA gates ON       886.2/890.8/913.3  protocol median 890.8
+
+  llama bf16 dtype-matched baseline: 716.63 t/s
+  --> 13.1 + gates: 890.8/716.6 = 124% PARITY CROSSED on 31b-bf16 prompt.
+
+Direct-runner control (no nsys, 2435 tok, cache-busted markers):
+gates OFF 240-254 t/s; gates ON 649 (13.0) / 886-893 (13.1).
+
+CRITICAL process finding: MLX_CUDA_SDPA_FVEC_PREFILL /
+MLX_CUDA_SDPA_FMMA_PREFILL default OFF in the production libmlx build.
+Ollama serve does NOT set them (x/mlxrunner/client.go spawns
+`runner --mlx-engine --model M --port P` with os.Environ()). Every
+fast-attention matrix number to date came from runner shells that
+exported the gates. Before any upstream/ship discussion the defaults
+must flip to 1 (correctness gate + fmma harness already passed) or
+production benches silently measure 1pass.
+cublasLt 13.1 heuristics return nvjet plans for MLX's Lt call pattern
+with NO code change (nvjet_sm121_tst_mma_* kernels replace most
+cutlass_80 legacy; a 128x256_32x3 legacy tile remains for gate/up,
+~82T vs nvjet's 104T there — possible follow-up).
+
+### cublas131-fullmatrix-20260806: 12-row harvest (MILESTONE)
+
+Full 12-row matrix on ollama-ab-fvec-v1 with libcublas{,Lt} 13.1.1.3
+symlink-swapped (nvjet) + SDPA gates ON (run:
+.cache/bench/cublas131-fullmatrix-20260806, script
+run_tater50_full_matrix.sh). dtype-matched llama targets
+(llama-dtype-baselines-20260806 for bf16/q8, adviseoff-parity q4_K_M
+for nvfp4-only rows). Medians:
+
+row                    tgt      mlx_pf  llama_pf    pf%    mlx_gn llama_gn    gn%
+gemma4-26b-nvfp4      q4_K_M    2571.5    2604.1   98.8%    63.24    58.96  107.3%
+gemma4-26b-mxfp8       q8_0     2338.9    2233.3  104.7%    45.84    44.54  102.9%
+gemma4-26b-bf16        bf16     2349.8    1440.4  163.1%    27.25    26.82  101.6%
+gemma4-31b-nvfp4      q4_K_M    1073.6     694.7  154.5%    10.36     9.87  105.0%
+gemma4-31b-mxfp8       q8_0      638.9     606.1  105.4%     6.72     6.29  106.8%
+gemma4-31b-bf16        bf16      883.6     716.6  123.3%     3.76     3.83   98.2%
+qwen36-35b-a3b-mxfp8   q8_0     2023.7    1591.6  127.2%    50.07    55.69   89.9%
+qwen36-27b-nvfp4      q4_K_M    1474.6     755.0  195.3%    12.11    11.77  102.9%
+laguna-xs2-nvfp4      q4_K_M    2468.7    2273.5  108.6%    84.73    47.56  178.2%
+nemotron3-33b-nvfp4   q4_K_M    2063.7    1946.6  106.0%    76.79    74.36  103.3%
+nemotron3-33b-mxfp8    q8_0     1928.7    1685.7  114.4%    54.42    56.91   95.6%
+nemotron3-33b-bf16     bf16     1976.8    1166.6  169.5%    31.74    32.46   97.8%
+
+Notes on apparent final-v4 deltas: 31b-mxfp8 prefill "170"->105 is a
+TARGET correction, not a regression (v4% was vs llama q4_K_M ~370 t/s;
+v5% is vs the dtype-matched llama q8_0 606.1; MLX absolute unchanged
+~630-640). Same for nemotron-mxfp8 118->114 (vs q8 1685.7). Real v5
+gains vs v4 (same targets): 26b-bf16 pf 122->163, 31b-bf16 pf 90->123,
+nemotron-bf16 pf 141->169, 26b-mxfp8 pf ~101->105 — the nvjet effect on
+bf16/mxfp8 dense GEMMs, as isolated in the probes.
+
+REMAINING sub-100 cells (5): gemma4-26b-nvfp4 pf 98.8% (within noise,
+glue/wall), gemma4-31b-bf16 gn 98.2% (bf16 decode GEMV), qwen36-35b gn
+89.9% (decode fp_qmv/gemv/gather + honest format-byte gap), nemotron
+mxfp8/bf16 gn 95.6/97.8%.
+
+
+
