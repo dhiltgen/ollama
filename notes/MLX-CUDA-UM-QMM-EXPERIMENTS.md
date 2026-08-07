@@ -7131,6 +7131,19 @@ layouts) or engaging NVIDIA with the reproducer
 (.tmp/fmma_full_test native on both boxes, micro 16x16 d256:
 correct on driver 580.82, deterministic garbage on 615.83).
 
+### N1x driver memory cap (2026-08-07, workaround policy)
+
+The pre-release N1x (RTX Spark) Windows driver exposes only ~49.3GB
+to CUDA: cudaMalloc fails at 48GiB+ and cudaMallocManaged likewise
+(no oversubscription spill). A 51GB bf16 model load dies at
+cudaMallocAsync OOM (verified dhiltgen/gemma4:26b-mlx-bf16). Linux
+GB10 exposes the full 128GB. POLICY: bf16-class rows (~53-66GB) are
+DGX Spark-only until the driver exposes more; the N1x matrix covers
+the nvfp4/mxfp8/q8/q4_K_M rows plus the small-model set (tater62_run_
+staged_regression_matrix list: qwen3.5 2b/4b nvfp4+mxfp8, gemma4-e2b
+nvfp4+mxfp8, nemotron nano). Platform naming convention for tables:
+DGX Spark (tater50), RTX Spark (tater62/N1x), 5090 (workstation).
+
 ### Self-review vs MLX-conventions.md (2026-08-06)
 
 Pass against the checklist for the CUDA sdpa work
