@@ -7020,6 +7020,28 @@ commits (win seeks, UM hints, fvec/fmma), ZERO conflicts
 Rebuilt libmlx on tater50 with the rebased tree -> dist
 ollama-ab-rebase-v1 for the decode-skew course-check.
 
+### MTP/DFlash fairness refresh under HumanEval harness (2026-08-06)
+
+mtp-fairness-20260806 medians (warmup+2scrubs+3retained, exact token
+counts via ChatInputTokens; llama = vendored-tree llama-server build
+with ggml-cuda sm_121a, same spawn contract as the new server binary —
+official v0.32.4 llama payload REFUSED by the new server's spawn args
+(CLIP translation path), so llama rows now run our tree's llama-server;
+GGML_CPU_ALL_VARIANTS=OFF on this gcc (no +sme support)):
+
+row pair                          mlx_pf  llama_pf   pf%    mlx_gn  llama_gn   gn%
+qwen36-27b nvfp4 vs q4_K_M        1490.6     766.8  194%    11.99    11.93  100.5%
+qwen36-35b-a3b mxfp8 vs q8_0      1925.9    1646.5  117%    49.71    55.50   89.6%
+gemma4-12b-nvfp4 vs 12b-q4_K_M    2437.2    1749.7  139%    22.07    24.02   91.9%
+
+Harness effect: MLX decode rates (esp. DFlash gemma4-12b 26.9->22.1)
+drop with realistic code prompts vs word-salad — the acceptance-rate
+inflate-on-filler problem bench-prompt was built for; llama is stable
+across harnesses. Note: qwen35b here ran WITHOUT the lm_head gate
+(MLX_MX_MODEL_QUANTIZED_LMHEAD) — with it (production candidate) the
+old-harness gen was 56.3; rerun under the new harness queued.
+gemma4-12b MLX rows used SDPA gates ON.
+
 ### Self-review vs MLX-conventions.md (2026-08-06)
 
 Pass against the checklist for the CUDA sdpa work
