@@ -21,23 +21,22 @@ import (
 )
 
 type flagOptions struct {
-	models          *string
-	epochs          *int
-	maxTokens       *int
-	temperature     *float64
-	seed            *int
-	timeout         *int
-	prompt          *string
-	imageFile       *string
-	keepAlive       *float64
-	format          *string
-	outputFile      *string
-	debug           *bool
-	verbose         *bool
-	warmup          *int
-	promptTokens    *int
-	numCtx          *int
-	draftNumPredict *int
+	models       *string
+	epochs       *int
+	maxTokens    *int
+	temperature  *float64
+	seed         *int
+	timeout      *int
+	prompt       *string
+	imageFile    *string
+	keepAlive    *float64
+	format       *string
+	outputFile   *string
+	debug        *bool
+	verbose      *bool
+	warmup       *int
+	promptTokens *int
+	numCtx       *int
 }
 
 type Metrics struct {
@@ -164,9 +163,6 @@ func benchmarkOptions(fOpt flagOptions) map[string]any {
 	}
 	if fOpt.numCtx != nil && *fOpt.numCtx > 0 {
 		options["num_ctx"] = *fOpt.numCtx
-	}
-	if fOpt.draftNumPredict != nil && *fOpt.draftNumPredict > 0 {
-		options["draft_num_predict"] = *fOpt.draftNumPredict
 	}
 	return options
 }
@@ -633,23 +629,22 @@ func readImage(filePath string) (api.ImageData, error) {
 
 func main() {
 	fOpt := flagOptions{
-		models:          flag.String("model", "", "Model to benchmark"),
-		epochs:          flag.Int("epochs", 6, "Number of epochs (iterations) per model"),
-		maxTokens:       flag.Int("max-tokens", 200, "Maximum tokens for model response"),
-		temperature:     flag.Float64("temperature", 0, "Temperature parameter"),
-		seed:            flag.Int("seed", 0, "Random seed"),
-		timeout:         flag.Int("timeout", 60*5, "Timeout in seconds (default 300s)"),
-		prompt:          flag.String("p", DefaultPrompt, "Prompt to use"),
-		imageFile:       flag.String("image", "", "Filename for an image to include"),
-		keepAlive:       flag.Float64("k", 0, "Keep alive duration in seconds"),
-		format:          flag.String("format", "benchstat", "Output format [benchstat|csv]"),
-		outputFile:      flag.String("output", "", "Output file for results (stdout if empty)"),
-		verbose:         flag.Bool("v", false, "Show system information"),
-		debug:           flag.Bool("debug", false, "Show debug information"),
-		warmup:          flag.Int("warmup", 1, "Number of warmup requests before timing"),
-		promptTokens:    flag.Int("prompt-tokens", 0, "Generate prompt targeting ~N tokens (0 = use -p prompt)"),
-		numCtx:          flag.Int("num-ctx", 0, "Context size (0 = server default)"),
-		draftNumPredict: flag.Int("draft-num-predict", 0, "Draft token count for speculative decoding (0 = server default)"),
+		models:       flag.String("model", "", "Model to benchmark"),
+		epochs:       flag.Int("epochs", 6, "Number of epochs (iterations) per model"),
+		maxTokens:    flag.Int("max-tokens", 200, "Maximum tokens for model response"),
+		temperature:  flag.Float64("temperature", 0, "Temperature parameter"),
+		seed:         flag.Int("seed", 0, "Random seed"),
+		timeout:      flag.Int("timeout", 60*5, "Timeout in seconds (default 300s)"),
+		prompt:       flag.String("p", DefaultPrompt, "Prompt to use"),
+		imageFile:    flag.String("image", "", "Filename for an image to include"),
+		keepAlive:    flag.Float64("k", 0, "Keep alive duration in seconds"),
+		format:       flag.String("format", "benchstat", "Output format [benchstat|csv]"),
+		outputFile:   flag.String("output", "", "Output file for results (stdout if empty)"),
+		verbose:      flag.Bool("v", false, "Show system information"),
+		debug:        flag.Bool("debug", false, "Show debug information"),
+		warmup:       flag.Int("warmup", 1, "Number of warmup requests before timing"),
+		promptTokens: flag.Int("prompt-tokens", 0, "Generate prompt targeting ~N tokens (0 = use -p prompt)"),
+		numCtx:       flag.Int("num-ctx", 0, "Context size (0 = server default)"),
 	}
 
 	flag.Usage = func() {
