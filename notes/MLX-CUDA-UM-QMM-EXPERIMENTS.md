@@ -7042,6 +7042,95 @@ across harnesses. Note: qwen35b here ran WITHOUT the lm_head gate
 old-harness gen was 56.3; rerun under the new harness queued.
 gemma4-12b MLX rows used SDPA gates ON.
 
+### Draft-enabled fairness + llama-side MTP enablement details (FINAL, 2026-08-06)
+
+llama embedded-MTP is opt-in PER REQUEST: routes zero DraftNumPredict
+unless set; embedded qwen GGUFs (arch qwen35/qwen35moe) all carry
+mtp.* tensors. Enabled via Modelfile `PARAMETER draft_num_predict 4`
+(verified spawn --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-backend-sampling).
+LLAMA DRAFT RESULTS: qwen27b-q4 11.93 -> 22.6 (+90%, MTP acceptance
+real even on code prompts); qwen35b-a3b-q8 55.5 -> 53.5-58.2 (~neutral).
+MLX artifacts: NO mtp.* tensors anywhere (qwen3.6 conversion predates
+Jesse's loader, 4f9d09ef5) -> MLX qwen rows are NOT drafting; gemma4
+12b-mlx DOES carry draft.* (gemma MTP landed earlier, #15980).
+llama gemma GGUFs have no DFlash weights; llama-side DFlash is PR-stage.
+
+FINAL draft fairness (HumanEval harness, dtype-paired):
+row                    llama(+draft)   MLX                ratio
+qwen36-27b-q4          22.6 mtp        11.99 no-draft     53% (artifact gap)
+qwen36-35b-a3b-q8      55.5 mtp        55.69 lm_head-gate ~100% CLOSED
+gemma4-12b-q4          24.02 no-draft  22.07 DFlash       92% (llama-PR gap)
+
+Rebase course-check (ab-rebase-v1, upstream/main + our 3 commits):
+26b-nvfp4 pf 2532-2572 (baseline 2571), qwen36-27b 12.06 (matches),
+nemotron-mxfp8 56.4 (matches) — no skew. NOTE 31b-bf16 prefill drift:
+883 earlier -> 760-770 same-day control on BOTH dists (thermal-day
+drift; llama 716.6 -> 107% currently; revalidate on a cold box).
+
+### llama fattn-mma code inspection for the N1x-fmma insight (2026-08-06)
+
+ggml's flash_attn_ext_f16 mma path (fattn-mma-f16.cuh + mma.cuh)
+works fast and correct on the N1x/615 driver stack where our
+kernel_sdpav_fmma fails. Differences vs my kernel worth stealing:
+1. Fragment addressing is encapsulated in tile<T,I,J,dl> types
+   (mma.cuh: load_ldmatrix(...) generic pointer math, .x2 asm per
+   8x8) — the "canonical layouts" recipe my forensics notes prescribe
+   (raw asm + hand-pinned slot map in fmma_detail is the fragile part).
+2. Tile staging is cp_async + cp_async_wait_all + __syncthreads per
+   tile iteration — stricter staging visibility than my
+   register-staged cooperative loads + syncthreads.
+3. Operands swapped for QK under NVIDIA (mma(KQ_C, Q_B, K_A) — Q as
+   B operand); mine keeps K as B. No claim of causation, but the exact
+   operand/fragment idiom pair of ggml's mma<> wrappers is the
+   reference implementation for the fmma rewrite (CuTe atoms + cp.async
+   staging discipline).
+
+### fmma anomaly — kernel-level cross-driver reproducer (2026-08-06)
+
+Built .tmp/fmma_full_test natively on BOTH boxes from identical sources
+(nvcc 13.0-era Linux on tater50, nvcc 13.4 + MSVC cl on tater62):
+
+- tater50 (build nvcc old, driver 580.82.07): d256 ALL 13-case PASS;
+  d512 production-garbage-only (masked by forensics hook).
+- tater62 (build nvcc 13.4, driver 615.83): EVERY case FAIL — micro
+  16x16 through 1903-long, d256 AND d512, incl. the isolated ldsm_A
+  per-warp fragment probe (2048 bad lanes).
+- AND production fmma (the tater50-built nvcc-old SASS binary) is also
+  garbage on tater62 when executed under 615.83 (gemma4-12b fmma run).
+
+So BOTH variables matter: (a) same SASS binary is correct on 580.82 but
+garbage on 615.83 (driver differential, production-level), and (b) the
+nvcc-13.4-built harness is wrong on 615 too — with even the plain
+fragment-address probe broken. Working hypothesis: latent UB/synchro
+that both the newer nvcc codegen and the newer driver's scheduling
+expose (ldmatrix/smem timing is the fragile site; the ldsm_A probe
+targets exactly that). Differential SASS dump (cuobjdump/nvdisasm of
+kernel_sdpav_fmma from the tater50 Linux .so vs the tater62 .exe) is
+the next bisect, plus a tater62 racecheck on the deterministic micro
+16x16 case (sanitizers are clean on tater50).
+
+Narrowing pass on tater62 (deterministic-micro forensics, 2026-08-06):
+- Identical failure values at -O0/-O1/-O2 → NOT codegen/scheduling
+  (compiler sensitivity is ruled OUT for the t62 manifestation).
+- PTX JIT ruled out (CUDA_DISABLE_PTX_JIT=1: kernel loads+runs sm_121a
+  SASS, same failure).
+- Device query identical to tater50 (48 SM, 12.1, 101376B optin, 64K
+  regs; only totalGlobalMem differs 46.7GB vs 128 — driver exposure).
+- 1pass sibling kernel CORRECT on the same box/driver; MoE qmm_sm80
+  mma kernels CORRECT in production content checks.
+- ldsm_A probe: ldmatrix reads return 0.00 where STS-staged values
+  live; other cells show wild 2.4e34 uninit garbage. Sanitizer output:
+  no race report on the failing cases.
+CONCLUSION: the failure belongs to the 615.83 Windows-RTX driver line
+executing our mma.sync+ldmatrix+barriered-smem kernel incorrectly on
+GB10-family silicon where the Linux 580.82 branch is correct. fmma
+(the whole approach) is SHIP-BLOCKED for consumers on that driver
+branch regardless of the t50 forensics hook — the durable fix is
+removing the fragile inline-PTX surface (canonical CuTe/cutlass mma
+layouts) or engaging NVIDIA with the reproducer
+(.tmp/fmma_full_test native on both boxes, micro 16x16 d256:
+correct on driver 580.82, deterministic garbage on 615.83).
+
 ### Self-review vs MLX-conventions.md (2026-08-06)
 
 Pass against the checklist for the CUDA sdpa work
