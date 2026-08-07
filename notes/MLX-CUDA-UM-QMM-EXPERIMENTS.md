@@ -7144,6 +7144,41 @@ staged_regression_matrix list: qwen3.5 2b/4b nvfp4+mxfp8, gemma4-e2b
 nvfp4+mxfp8, nemotron nano). Platform naming convention for tables:
 DGX Spark (tater50), RTX Spark (tater62/N1x), 5090 (workstation).
 
+### N1x parity table (2026-08-07, finalized after verification pass)
+
+Every row verified architecture-matched at the GGUF tensor level and
+quant-class paired (nvfp4<->q4_K_M, mxfp8<->q8_0). No drafting on
+either side anywhere on this table (all MLX artifacts carry no mtp.*
+or draft.*; llama ran plain GGUFs, no draft_num_predict).
+
++----------------------+------------+------------------------+------------------------+
+| Model                | Platform   | Prompt % Target        | Generate % Target      |
++----------------------+------------+------------------------+------------------------+
+| Gemma4 E2B NVFP4     | N1x        | 231.1% (15,949/6,900)  | 125.7% (127.6/101.5)   |
+| Gemma4 12B NVFP4     | N1x        | 123.3% (1,929/1,565)   | 112.1% (26.9/24.0)     |
+| Gemma4 26B NVFP4     | N1x        | 93.1%  (2,368/2,545)   | 117.6% (71.1/60.5)     |
+| Gemma4 31B NVFP4     | N1x        | 66.7%  (395/592)       | 103.9% (11.5/11.1)     |
+| Gemma4 26B MXFP8     | N1x        | 58.4%  (1,291/2,212)   | 113.8% (50.9/44.7)     |
+| Gemma4 31B MXFP8     | N1x        | 90.3%  (479/531)       | 107.4% (7.4/6.9)       |
+| Qwen3.5 2B MXFP8     | N1x        | 140.5% (11,177/7,955)  | 91.9%  (90.1/98.0)     |
+| Qwen3.5 4B NVFP4     | N1x        | 151.5% (5,449/3,596)   | 97.2%  (67.1/69.0)     |
+| Qwen3.5 4B MXFP8     | N1x        | TBD (llama q8 pending) | TBD                    |
+| Qwen3.6 27B NVFP4    | N1x        | 128.1% (770/601)       | 102.5% (14.1/13.8)     |
+| Qwen3.6 35B-A3B MXFP8| N1x        | 94.7%  (1,354/1,429)   | 68.5%  (38.5/56.3)     |
+| Laguna XS.2 NVFP4    | N1x        | 119.4% (2,624/2,198)   | 109.0% (53.8/49.3)     |
+| Nemotron 4B NVFP4    | N1x        | 131.2% (4,847/3,693)   | 98.7%  (80.3/81.4)     |
+| Nemotron 33B NVFP4   | N1x        | 139.5% (2,587/1,855)   | 82.6%  (63.7/77.1)     |
++----------------------+------------+------------------------+------------------------+
+
+Dropped without table rows (cannot compare): all bf16-class (53-66GB,
+cap), nemotron-33b-mxfp8 (KV/scratch past cap), qwen3.5-2b (junk at
+q4_K_M - user decision, also removed from matrices), qwen3.5-4b-mxfp8
+until its q8_0 GGUF was found (now pulled; bench in flight - row
+becomes TBD->filled), e2b-mxfp8 (no q8_0 GGUF), laguna GGUF-q8
+(template tag-leak on the N1x llama build - user known).
+MTP/DFlash: deferred by request. On MLX-side re-enable later, then re-
+record llama's draft-mtp numbers as the fairer side-by-side.
+
 ### Self-review vs MLX-conventions.md (2026-08-06)
 
 Pass against the checklist for the CUDA sdpa work
