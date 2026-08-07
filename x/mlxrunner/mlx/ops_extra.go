@@ -12,11 +12,14 @@ import (
 	"unsafe"
 )
 
-// qmmDequantDenseGate, when MLX_CUDA_QMM_DEQUANT_DENSE=1, routes dense
-// quantized GEMMs through the generic dequantize+matmul path instead of the
-// native qqmm kernels. Diagnostic A/B for the N1x (615.x) dense-prefill
-// regression: qqmm prefill rates collapsed box-side while dequant+nvjet stays
-// healthy (gemmex-verified). Decode paths (fp_qmv etc.) are unaffected.
+// qmmDequantDenseGate, when MLX_CUDA_QMM_DEQUANT_DENSE=1, routes
+// non-double-scaled dense quantized GEMMs through the generic
+// dequantize+matmul path instead of the native qqmm kernels. N1x (615.x)
+// driver workaround: the globalScale==nil qqmm branch collapses on this
+// driver (26b-nvfp4 decode 34.8 t/s ungated vs 66.9 dequant+nvjet; llama
+// 43.9), while the double-scale fastNVFP4ScaledQMV branch is healthy and is
+// intentionally left on the fast path. See notes/MLX-CUDA-UM-QMM-
+// EXPERIMENTS.md (2026-08-07 "Gate A/B results"). Off by default.
 var qmmDequantDenseGate = sync.OnceValue(func() bool {
 	return os.Getenv("MLX_CUDA_QMM_DEQUANT_DENSE") == "1"
 })
@@ -120,7 +123,7 @@ func FastQuantizedMatmul(x, w, scales, biases, globalScale, nativeGlobalScale *A
 		if out, ok := fastNVFP4ScaledQMV(x, w, scales, globalScale); ok {
 			return out
 		}
-		if !qmmDequantDenseGate() && supportsQQMatmul(x, mode) {
+		if supportsQQMatmul(x, mode) {
 			identityGlobalScale := NewScalarArray(nvfp4GlobalScaleDenominator)
 			return qqMatmul(
 				x,
