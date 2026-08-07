@@ -7179,6 +7179,34 @@ becomes TBD->filled), e2b-mxfp8 (no q8_0 GGUF), laguna GGUF-q8
 MTP/DFlash: deferred by request. On MLX-side re-enable later, then re-
 record llama's draft-mtp numbers as the fairer side-by-side.
 
+### ROOT CAUSE (2026-08-07): bundled-cccl JIT header hole → all MoE fast paths dead
+
+The N1x prompt deficits were NOT driver or memory-pool behavior. Every
+custom-kernel JIT built the sorted-MoE dispatch/unsort sources with an
+include of cuda/std/complex that NO include-path arg covered when CCCL
+is bundled as <toolkit>/include/cccl (our cuda_v13 dist layout; pip
+nvidia cccl sibling-path installs have it too). The fast path silently
+self-disabled (sortedMoERowCopyCUDADisabled) and every MoE prefill/
+decode fell back to the generic gather+QMM path on BOTH boxes.
+Diagnosis trail: ldsm probe garbage red herring; cudaMalloc/MemAdvise
+bw probes fine (device 272-286GB/s > GB10's 237 !); the failing JIT
+build surfaced via TestFastSortedMoEDispatch panic (strace showed the
+single -I CUDA_PATH probe). Fix: jit_module.cpp appends include/cccl
+when present (mlx commit e14…); verification: TestFastSortedMoE* PASS,
+then rows:
+  row                    prefill before -> after   llama target -> pct
+  26b-nvfp4 prefill      2368 -> 2394 (+1%)        2545 -> 94%
+  26b-mxfp8 prefill      1291 -> 1859 (+44%)       2212 -> 84%
+  31b-nvfp4 prefill      395  -> 464  (+17%)       592  -> 78%
+  31b-mxfp8 prefill      479  -> 480  (≈)          531  -> 90%
+  qwen36-27b prefill     770  -> 859  (+12%)       601  -> 143% CROSSED
+  qwen36-35b prefill     1354 -> 1692 (+25%)       1429 -> 118% CROSSED
+  qwen36-35b gen         38.5 -> 42.7 (+11%)       56.3 -> 76%
+  26b-nvfp4 gen          71.1 -> 64.3 (-10%)       60.5 -> 106%
+Upstream note: this is a general NVRTC bundled-toolkit fragility, not
+N1x-specific — the same latent fallback existed in every production
+bench to date (sorted-MoE kernels never actually launched).
+
 ### Self-review vs MLX-conventions.md (2026-08-06)
 
 Pass against the checklist for the CUDA sdpa work
