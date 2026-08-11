@@ -9,13 +9,11 @@ import (
 )
 
 func TestSetWiredLimitRejectsOversizeWithoutChangingLimit(t *testing.T) {
-	skipIfNoMLX(t)
-	if !GPUIsAvailable() {
-		t.Skip("MLX GPU not available")
-	}
-
 	var testErr error
 	withMLXThread(t, func() {
+		if !MetalIsAvailable() {
+			t.Skip("MLX Metal not available")
+		}
 		testErr = checkWiredLimitRejectsOversize()
 	})
 	if testErr != nil {

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"slices"
+	"runtime"
 	"strings"
 
 	"github.com/ollama/ollama/x/mlxrunner/batch"
@@ -83,9 +83,6 @@ type Model struct {
 	Layers      []*Layer
 	Norm        *nn.RMSNorm
 	LMHead      nn.LinearLayer
-
-	// auxHiddenLayers are the tapped layers; empty means the final hidden.
-	auxHiddenLayers []int
 
 	tok *tokenizer.Tokenizer
 	*Config
@@ -669,6 +666,16 @@ func canFuseQuantizedGateUp(gateW, upW *stackedExpertWeights) bool {
 	return gateW.Weight.NumDims() == 3 && upW.Weight.NumDims() == 3
 }
 
+func deviceSupportsQuantizedGateUpFusion() bool {
+	return platformSupportsQuantizedGateUpFusion(runtime.GOOS, runtime.GOARCH)
+}
+
+func platformSupportsQuantizedGateUpFusion(goos, goarch string) bool {
+	// Packing the full expert stacks exceeds the usable shared system-memory
+	// budget on Windows/ARM64 during load. Keep the unfused representation.
+	return goos != "windows" || goarch != "arm64"
+}
+
 func canFuseDenseQuantizedLinears(a, b *nn.QuantizedLinear) bool {
 	if a == nil || b == nil || a.Scales == nil || b.Scales == nil {
 		return false
@@ -1096,7 +1103,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			}
 			sw := &SwitchMLP{}
 			if gateW.Scales != nil && upW.Scales != nil {
-				if canFuseQuantizedGateUp(gateW, upW) {
+				if canFuseQuantizedGateUp(gateW, upW) && deviceSupportsQuantizedGateUpFusion() {
 					sw.GateUpWeightQ = fuseExpertStacks(gateW.Weight, upW.Weight, 1)
 					sw.GateUpScales = fuseExpertStacks(gateW.Scales, upW.Scales, 1)
 					sw.GateUpBiases = fuseExpertStacks(gateW.Biases, upW.Biases, 1)
@@ -1243,7 +1250,11 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 		idxAll := mlx.Flatten(idxFlat)
 		order := mlx.Argsort(idxAll, 0)
 		invOrder = mlx.Argsort(order, 0)
-		xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
+		if sortedX, ok := mlx.FastSortedMoEDispatch(xFlat, order); ok {
+			xFlat = sortedX
+		} else {
+			xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
+		}
 		idxFlat = mlx.Reshape(mlx.Take(idxAll, order, 0), n, 1)
 	}
 
@@ -1284,7 +1295,11 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 		down = mlx.GatherMM(hidden, weightForGatherMM(s.DownWeight, s.DownWeightSourceLayout), nil, idxFlat, doSort)
 	}
 	if doSort {
-		down = mlx.Reshape(mlx.Take(mlx.Squeeze(mlx.Squeeze(down, 2), 1), invOrder, 0), B*L, topK, cfg.HiddenSize)
+		if sortedDown, ok := mlx.FastSortedMoEUnsort(down, invOrder); ok {
+			down = mlx.Reshape(sortedDown, B*L, topK, cfg.HiddenSize)
+		} else {
+			down = mlx.Reshape(mlx.Take(mlx.Squeeze(mlx.Squeeze(down, 2), 1), invOrder, 0), B*L, topK, cfg.HiddenSize)
+		}
 	} else {
 		down = mlx.Squeeze(down, 2)
 	}
@@ -1310,6 +1325,15 @@ func (m *SparseMoE) route(xFlat *mlx.Array, cfg *Config) (scores, inds *mlx.Arra
 	var probs, neg *mlx.Array
 	if m.EScoreCorrectionBias != nil && cfg.NumExpertsPerTok == 8 {
 		normalize := cfg.NormTopKProb
+		if normalize && m.SwitchMLP != nil &&
+			m.SwitchMLP.UpGlobalScale == nil && m.SwitchMLP.DownGlobalScale == nil {
+			if scores, inds, ok := mlx.FastSigmoidMoERouter256(
+				gates,
+				m.EScoreCorrectionBias,
+			); ok {
+				return scores, inds, false
+			}
+		}
 		if m.SwitchMLP != nil && m.SwitchMLP.UpGlobalScale != nil && m.SwitchMLP.DownGlobalScale != nil {
 			fn := lagunaSigmoidTopK8Scaled
 			if normalize {
@@ -1391,15 +1415,14 @@ func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *
 	return mlx.Add(h, r)
 }
 
-func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) (hidden, auxHidden *mlx.Array) {
+func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) *mlx.Array {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	return m.forward(b, caches, B, L)
 }
 
-func (m *Model) forward(b *batch.Batch, caches []cache.Cache, B, L int32) (hidden, auxHidden *mlx.Array) {
+func (m *Model) forward(b *batch.Batch, caches []cache.Cache, B, L int32) *mlx.Array {
 	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
-	var features []*mlx.Array
 	h := m.EmbedTokens.Forward(b.InputIDs)
 	for i, layer := range m.Layers {
 		var c cache.Cache
@@ -1407,32 +1430,8 @@ func (m *Model) forward(b *batch.Batch, caches []cache.Cache, B, L int32) (hidde
 			c = caches[i]
 		}
 		h = layer.Forward(h, b, c, positions, B, L, m.Config)
-		if slices.Contains(m.auxHiddenLayers, i) {
-			features = append(features, h)
-		}
 	}
-	out := m.Norm.Forward(h, m.RMSNormEps)
-	if features != nil {
-		return out, mlx.Concatenate(features, -1)
-	}
-	return out, out
-}
-
-// SetAuxHiddenLayers taps the listed layers' outputs, which Forward then
-// returns as the draft-conditioning state in place of the final hidden.
-func (m *Model) SetAuxHiddenLayers(layers []int) {
-	m.auxHiddenLayers = layers
-}
-
-// TokenEmbeddings is the raw lookup, for a draft that embeds with the
-// target's table.
-func (m *Model) TokenEmbeddings(ids *mlx.Array) *mlx.Array {
-	return m.EmbedTokens.Forward(ids)
-}
-
-// RawLogits matches Unembed: this head applies no output decoration.
-func (m *Model) RawLogits(hidden *mlx.Array) *mlx.Array {
-	return m.LMHead.Forward(hidden)
+	return m.Norm.Forward(h, m.RMSNormEps)
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {

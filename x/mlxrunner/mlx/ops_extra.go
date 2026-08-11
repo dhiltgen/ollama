@@ -4,11 +4,31 @@ package mlx
 import "C"
 
 import (
+	"os"
 	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
+// qmmDequantDenseGate, when MLX_CUDA_QMM_DEQUANT_DENSE=1, routes
+// non-double-scaled dense quantized GEMMs through the generic
+// dequantize+matmul path instead of the native qqmm kernels. N1x (615.x)
+// driver workaround: the globalScale==nil qqmm branch collapses on this
+// driver (26b-nvfp4 decode 34.8 t/s ungated vs 66.9 dequant+nvjet; llama
+// 43.9), while the double-scale fastNVFP4ScaledQMV branch is healthy and is
+// intentionally left on the fast path. See notes/MLX-CUDA-UM-QMM-
+// EXPERIMENTS.md (2026-08-07 "Gate A/B results"). Off by default.
+var qmmDequantDenseGate = sync.OnceValue(func() bool {
+	return os.Getenv("MLX_CUDA_QMM_DEQUANT_DENSE") == "1"
+})
+
 // Quantization operations
+
+var fastQuantizedMatmulBackendState atomic.Int32 // 0 unknown, 1 unsupported, 2 supported
+
+const nvfp4GlobalScaleDenominator = float32(448 * 6)
 
 func Quantize(w *Array, groupSize, bits int, mode string) (weights, scales, biases *Array) {
 	cMode := C.CString(mode)
@@ -87,6 +107,133 @@ func QuantizedMatmul(x, w, scales, biases *Array, transpose bool, groupSize, bit
 	out := New("QUANTIZED_MATMUL")
 	C.mlx_quantized_matmul(&out.ctx, x.ctx, w.ctx, scales.ctx, b, C.bool(transpose), optGroupSize, optBits, cMode, DefaultStream().ctx)
 	return out
+}
+
+// FastQuantizedMatmul uses CUDA's native block-scaled matrix multiply when the
+// input shape and quantization mode are supported. nativeGlobalScale uses
+// MLX's NVFP4 amax convention rather than Ollama's direct output multiplier.
+func FastQuantizedMatmul(x, w, scales, biases, globalScale, nativeGlobalScale *Array, transpose bool, groupSize, bits int, mode string) *Array {
+	if globalScale != nil && nativeGlobalScale != nil &&
+		globalScale.Valid() && nativeGlobalScale.Valid() &&
+		globalScale.Size() == 1 &&
+		nativeGlobalScale.Size() == 1 &&
+		transpose &&
+		biases == nil &&
+		strings.EqualFold(mode, "nvfp4") {
+		if out, ok := fastNVFP4ScaledQMV(x, w, scales, globalScale); ok {
+			return out
+		}
+		if supportsQQMatmul(x, mode) {
+			identityGlobalScale := NewScalarArray(nvfp4GlobalScaleDenominator)
+			return qqMatmul(
+				x,
+				w,
+				scales,
+				identityGlobalScale,
+				nativeGlobalScale,
+				groupSize,
+				bits,
+				mode,
+			)
+		}
+	}
+	if !qmmDequantDenseGate() && globalScale == nil && transpose && biases == nil && supportsQQMatmul(x, mode) {
+		return qqMatmul(x, w, scales, nil, nil, groupSize, bits, mode)
+	}
+
+	out := QuantizedMatmul(x, w, scales, biases, transpose, groupSize, bits, mode)
+	if globalScale != nil {
+		out = Mul(out, globalScale).AsType(out.DType())
+	}
+	return out
+}
+
+// NativeQuantizedGlobalScale converts Ollama's direct NVFP4 output multiplier
+// to the amax convention expected by MLX's native block-scaled kernels.
+func NativeQuantizedGlobalScale(globalScale *Array, mode string) *Array {
+	if globalScale == nil || !globalScale.Valid() || globalScale.Size() != 1 ||
+		!strings.EqualFold(mode, "nvfp4") ||
+		!supportsFastQuantizedMatmulMode(mode) {
+		return nil
+	}
+	return MulScalar(globalScale, nvfp4GlobalScaleDenominator)
+}
+
+func supportsFastQuantizedMatmulMode(mode string) bool {
+	switch strings.ToLower(mode) {
+	case "nvfp4", "mxfp8":
+		return supportsFastQuantizedMatmulBackend()
+	default:
+		return false
+	}
+}
+
+func supportsFastQuantizedMatmulBackend() bool {
+	switch fastQuantizedMatmulBackendState.Load() {
+	case 1:
+		return false
+	case 2:
+		return true
+	}
+	if CheckInit() != nil {
+		fastQuantizedMatmulBackendState.Store(1)
+		return false
+	}
+
+	supported := CUDAIsAvailable() && cudaComputeCapabilityAtLeast(10, 0)
+	if supported {
+		fastQuantizedMatmulBackendState.Store(2)
+	} else {
+		fastQuantizedMatmulBackendState.Store(1)
+	}
+	return supported
+}
+
+func resetFastQuantizedMatmulBackendCache() {
+	fastQuantizedMatmulBackendState.Store(0)
+}
+
+func qqMatmul(x, w, scales, globalScaleX, globalScaleW *Array, groupSize, bits int, mode string) *Array {
+	cMode := C.CString(mode)
+	defer C.free(unsafe.Pointer(cMode))
+	optGroupSize := C.mlx_optional_int{value: C.int(groupSize), has_value: true}
+	optBits := C.mlx_optional_int{value: C.int(bits), has_value: true}
+
+	var s, gsX, gsW C.mlx_array
+	if scales != nil {
+		s = scales.ctx
+	}
+	if globalScaleX != nil {
+		gsX = globalScaleX.ctx
+	}
+	if globalScaleW != nil {
+		gsW = globalScaleW.ctx
+	}
+
+	out := New("QQMM")
+	C.mlx_qqmm(&out.ctx, x.ctx, w.ctx, s, optGroupSize, optBits, cMode, gsX, gsW, DefaultStream().ctx)
+	return out
+}
+
+func supportsQQMatmul(x *Array, mode string) bool {
+	if x == nil || !x.Valid() || x.NumDims() == 0 {
+		return false
+	}
+	if !supportsFastQuantizedMatmulMode(mode) {
+		return false
+	}
+	return quantizedMatmulRows(x) >= 128
+}
+
+func quantizedMatmulRows(x *Array) int {
+	if x == nil || !x.Valid() || x.NumDims() == 0 {
+		return 0
+	}
+	lastDim := x.Dim(x.NumDims() - 1)
+	if lastDim <= 0 {
+		return 0
+	}
+	return x.Size() / lastDim
 }
 
 func GatherQMM(x, w, scales *Array, biases, lhsIndices, rhsIndices *Array, transpose bool, groupSize, bits int, mode string, sortedIndices bool) *Array {

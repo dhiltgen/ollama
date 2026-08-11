@@ -115,10 +115,12 @@ type sharedHistory struct {
 
 // Attention implements Gemma 4 attention with Q/K normalization and v-norm.
 type Attention struct {
-	QProj nn.LinearLayer
-	KProj nn.LinearLayer
-	VProj nn.LinearLayer
-	OProj nn.LinearLayer
+	QProj       nn.LinearLayer
+	KProj       nn.LinearLayer
+	VProj       nn.LinearLayer
+	FusedKVProj nn.LinearLayer
+	KVSplitDim  int32
+	OProj       nn.LinearLayer
 
 	QNorm *nn.RMSNorm
 	KNorm *nn.RMSNorm
@@ -188,6 +190,29 @@ func transposeForGatherMM(w *mlx.Array) *mlx.Array {
 	t := mlx.Transpose(w, 0, 2, 1).Clone()
 	mlx.Eval(t)
 	return t
+}
+
+func fuseCUDAKVBFloat16(kProj, vProj nn.LinearLayer) (nn.LinearLayer, int32) {
+	if !mlx.CUDAIsAvailable() {
+		return nil, 0
+	}
+	k, ok := kProj.(*nn.Linear)
+	if !ok || (k.Bias != nil && k.Bias.Valid()) ||
+		k.Weight == nil || k.Weight.DType() != mlx.DTypeBFloat16 ||
+		k.Weight.NumDims() != 2 {
+		return nil, 0
+	}
+	v, ok := vProj.(*nn.Linear)
+	if !ok || (v.Bias != nil && v.Bias.Valid()) ||
+		v.Weight == nil || v.Weight.DType() != mlx.DTypeBFloat16 ||
+		v.Weight.NumDims() != 2 ||
+		k.Weight.Dim(1) != v.Weight.Dim(1) {
+		return nil, 0
+	}
+
+	weight := mlx.Concatenate([]*mlx.Array{k.Weight, v.Weight}, 0).Clone()
+	mlx.Eval(weight)
+	return nn.NewLinear(weight, nil), k.OutputDim()
 }
 
 // collectExpertProjection collects per-expert tensors, stacks them, and
@@ -289,8 +314,10 @@ func (m *Model) loadFusedExperts(moe *MoEBlock, tensors map[string]*mlx.Array, g
 
 // Router implements Gemma 4's expert routing mechanism.
 type Router struct {
-	Proj  nn.LinearLayer // [hidden_size -> num_experts]
-	Scale *mlx.Array     // learnable scale [hidden_size]
+	Proj        nn.LinearLayer // [hidden_size -> num_experts]
+	Scale       *mlx.Array     // learnable scale [hidden_size]
+	NormScale   *mlx.Array     // CUDA-folded learnable and scalar norm scale
+	ExpertScale *mlx.Array     // static output scale [num_experts]
 }
 
 // MoEBlock implements the Gemma 4 mixture-of-experts block.
@@ -308,9 +335,12 @@ type MoEBlock struct {
 	UpWeightQ, UpScales, UpBiases             *mlx.Array
 	DownWeightQ, DownScales, DownBiases       *mlx.Array
 
-	PerExpertScale *mlx.Array // [num_experts]
-	UseQuantized   bool
-	UseFusedGateUp bool // true when gate+up are stored as single tensor
+	PerExpertScale         *mlx.Array // [num_experts]
+	DecodeGateUpLHSIndices *mlx.Array // CUDA decode identity index [1, 1]
+	DecodeDownLHSIndices   *mlx.Array // CUDA decode identity indices [1, top_k]
+	UseQuantized           bool
+	UseFusedGateUp         bool // true when gate+up are stored as single tensor
+	UseCompiledWeightedSum bool
 
 	// Per-projection quant params (may differ due to mixed-precision).
 	GateUpGroupSize, GateUpBits int
@@ -320,6 +350,30 @@ type MoEBlock struct {
 	QuantMode                   string // gate/up mode
 	DownQuantMode               string // down mode (may differ for mixed mxfp4/mxfp8)
 }
+
+func gemma4MoEWeightedSumEager(down, scores, expertScales *mlx.Array) *mlx.Array {
+	down = mlx.Mul(down, mlx.ExpandDims(expertScales, -1))
+	return mlx.Sum(mlx.Mul(down, mlx.ExpandDims(scores, -1)), 1, false)
+}
+
+var gemma4MoEWeightedSumCompiled = mlx.Compile3(
+	"Gemma4MoEWeightedSum",
+	gemma4MoEWeightedSumEager,
+)
+
+var gemma4MoEScaledWeightedSumCompiled = mlx.Compile2(
+	"Gemma4MoEScaledWeightedSum",
+	func(down, scaledScores *mlx.Array) *mlx.Array {
+		return mlx.Sum(mlx.Mul(down, mlx.ExpandDims(scaledScores, -1)), 1, false)
+	},
+)
+
+var gemma4ResidualScaleCompiled = mlx.Compile3(
+	"Gemma4ResidualScale",
+	func(residual, update, scale *mlx.Array) *mlx.Array {
+		return mlx.Mul(mlx.Add(residual, update), scale)
+	},
+)
 
 // PLELayer holds per-layer PLE weights for a single decoder layer.
 type PLELayer struct {
@@ -371,6 +425,8 @@ type DecoderLayer struct {
 	LayerIdx     int32
 	KVShareDonor int32 // -1 if not shared, else index of donor layer
 	IsDonor      bool  // true if this layer's KV is shared by later layers
+
+	UseCompiledResidualScale bool
 }
 
 // Model is the Gemma 4 model (text + optional vision).
@@ -559,6 +615,10 @@ func isLayerSliding(layerIdx int32, cfg *TextConfig) bool {
 // Gemma 4 uses scale_shift=0.0 for all norms (no +1.0 adjustment), so the
 // precomputed weights are just the raw weights from the model.
 func precomputeGemmaScaledWeights(m *Model) {
+	var precomputed []*mlx.Array
+	var decodeGateUpLHSIndices, decodeDownLHSIndices *mlx.Array
+	cudaAvailable := mlx.CUDAIsAvailable()
+
 	if m.Norm != nil {
 		m.NormScaled = m.Norm.Weight
 	}
@@ -602,6 +662,35 @@ func precomputeGemmaScaledWeights(m *Model) {
 		if layer.PreFFNorm2 != nil {
 			layer.PreFFNorm2Scaled = layer.PreFFNorm2.Weight
 		}
+		if cudaAvailable && layer.Router != nil && layer.Router.Scale != nil {
+			layer.Router.NormScale = mlx.MulScalar(layer.Router.Scale, m.RouterScale)
+			precomputed = append(precomputed, layer.Router.NormScale)
+		}
+		if cudaAvailable && layer.MoE != nil {
+			if decodeGateUpLHSIndices == nil {
+				decodeGateUpLHSIndices = mlx.FromValues([]uint32{0}, 1, 1)
+				downIndices := make([]uint32, m.TopKExperts)
+				for i := range downIndices {
+					downIndices[i] = uint32(i)
+				}
+				decodeDownLHSIndices = mlx.FromValues(
+					downIndices,
+					1,
+					int(m.TopKExperts),
+				)
+				precomputed = append(
+					precomputed,
+					decodeGateUpLHSIndices,
+					decodeDownLHSIndices,
+				)
+			}
+			layer.MoE.DecodeGateUpLHSIndices = decodeGateUpLHSIndices
+			layer.MoE.DecodeDownLHSIndices = decodeDownLHSIndices
+		}
+	}
+
+	if len(precomputed) > 0 {
+		mlx.Eval(precomputed...)
 	}
 }
 
@@ -675,6 +764,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	m.weightPrefix = resolveWeightPrefix(tensors)
 	prefix := m.weightPrefix
 	linears := model.NewLinearFactory(tensors, m.QuantGroupSize, m.QuantBits, m.QuantMode, m.TensorQuant)
+	cudaAvailable := mlx.CUDAIsAvailable()
 
 	// Embeddings.
 	embedTokens := model.MakeEmbeddingLayer(tensors, prefix+"embed_tokens", m.QuantGroupSize, m.QuantBits, m.QuantMode, m.TensorQuant)
@@ -731,12 +821,13 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		}
 
 		layer := &DecoderLayer{
-			LayerIdx:     i,
-			IsSliding:    isSliding,
-			KVShareDonor: donor,
-			IsDonor:      m.KVDonors[i],
-			Attention:    &Attention{},
-			MLP:          &MLP{},
+			LayerIdx:                 i,
+			IsSliding:                isSliding,
+			KVShareDonor:             donor,
+			IsDonor:                  m.KVDonors[i],
+			Attention:                &Attention{},
+			MLP:                      &MLP{},
+			UseCompiledResidualScale: cudaAvailable,
 		}
 
 		// Norms.
@@ -755,8 +846,15 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 
 		// Attention projections.
 		layer.Attention.QProj = linears.Make(layerPrefix + ".self_attn.q_proj")
-		layer.Attention.KProj = linears.Make(layerPrefix + ".self_attn.k_proj")
-		layer.Attention.VProj = linears.Make(layerPrefix + ".self_attn.v_proj")
+		kProj := linears.Make(layerPrefix + ".self_attn.k_proj")
+		vProj := linears.Make(layerPrefix + ".self_attn.v_proj")
+		if fusedKV, splitDim := fuseCUDAKVBFloat16(kProj, vProj); fusedKV != nil {
+			layer.Attention.FusedKVProj = fusedKV
+			layer.Attention.KVSplitDim = splitDim
+		} else {
+			layer.Attention.KProj = kProj
+			layer.Attention.VProj = vProj
+		}
 		layer.Attention.OProj = linears.Make(layerPrefix + ".self_attn.o_proj")
 
 		if w := tensors[layerPrefix+".self_attn.q_norm.weight"]; w != nil {
@@ -802,8 +900,12 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			if perExpertScale == nil {
 				return fmt.Errorf("layer %d: missing MoE per_expert_scale", i)
 			}
+			layer.Router.ExpertScale = perExpertScale
 
-			moe := &MoEBlock{PerExpertScale: perExpertScale}
+			moe := &MoEBlock{
+				PerExpertScale:         perExpertScale,
+				UseCompiledWeightedSum: cudaAvailable,
+			}
 
 			// Experts ship with gate+up fused into one pre-stacked tensor under
 			// a few different names: HF (.experts./.moe.) and the create
@@ -958,12 +1060,12 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		if layer.Attention.QProj == nil || layer.Attention.OProj == nil {
 			return fmt.Errorf("layer %d: missing attention q/o projections", i)
 		}
-		if layer.Attention.KProj == nil {
+		if layer.Attention.KProj == nil && layer.Attention.FusedKVProj == nil {
 			return fmt.Errorf("layer %d: missing attention k projection", i)
 		}
 		// VProj is nil for K=V full-attention layers (value_states = key_states).
 		useAltAttn := m.AttentionKEqV && !isSliding
-		if layer.Attention.VProj == nil && !useAltAttn {
+		if layer.Attention.VProj == nil && layer.Attention.FusedKVProj == nil && !useAltAttn {
 			return fmt.Errorf("layer %d: missing attention v projection", i)
 		}
 		if layer.Attention.QNorm == nil || layer.Attention.KNorm == nil {
@@ -1156,6 +1258,8 @@ func sliceLayerDim(combined *mlx.Array, layerIdx, B, L, pleDim int32) *mlx.Array
 }
 
 func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *TextConfig, pleInput *mlx.Array, donor *sharedHistory) (*mlx.Array, *sharedHistory) {
+	fuseResidualScale := l.UseCompiledResidualScale && l.LayerScalar != nil && l.PLE == nil
+
 	normed := mlx.RMSNormFn(x, l.InputNormScaled, cfg.RMSNormEps)
 	attnOut, kv := l.Attention.Forward(normed, b, c, positions, B, L, l.IsSliding, cfg, donor)
 	attnOut = mlx.RMSNormFn(attnOut, l.PostAttnNormScaled, cfg.RMSNormEps)
@@ -1171,21 +1275,43 @@ func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, posi
 		mlpOut = mlx.RMSNormFn(mlpOut, l.PostFFNorm1Scaled, cfg.RMSNormEps)
 
 		// Path 2: MoE.
-		scores, inds := l.Router.Forward(h, cfg)
+		scores, inds, scoresIncludeExpertScale := l.Router.Forward(h, cfg)
 		normed2 := mlx.RMSNormFn(h, l.PreFFNorm2Scaled, cfg.RMSNormEps)
-		moeOut := l.MoE.Forward(normed2, scores, inds, cfg)
+		moeOut := l.MoE.Forward(normed2, scores, inds, scoresIncludeExpertScale, cfg)
 		moeOut = mlx.RMSNormFn(moeOut, l.PostFFNorm2Scaled, cfg.RMSNormEps)
 
 		// Combine and apply outer post-norm.
-		combined := mlx.Add(mlpOut, moeOut)
-		combined = mlx.RMSNormFn(combined, l.PostFFNormScaled, cfg.RMSNormEps)
-		h = mlx.Add(residual, combined)
+		fusedMoEFinal := false
+		if fuseResidualScale {
+			h, fusedMoEFinal = mlx.FastMoEFinalResidual(
+				residual,
+				mlpOut,
+				moeOut,
+				l.PostFFNormScaled,
+				l.LayerScalar,
+				cfg.RMSNormEps,
+			)
+		}
+		if !fusedMoEFinal {
+			combined := mlx.Add(mlpOut, moeOut)
+			combined = mlx.RMSNormFn(combined, l.PostFFNormScaled, cfg.RMSNormEps)
+			if fuseResidualScale {
+				h = gemma4ResidualScaleCompiled(residual, combined, l.LayerScalar)
+			} else {
+				h = mlx.Add(residual, combined)
+			}
+		}
 	} else {
 		// Standard single MLP path.
+		residual := h
 		normed = mlx.RMSNormFn(h, l.PreFFNormScaled, cfg.RMSNormEps)
 		mlpOut := l.MLP.Forward(normed)
 		mlpOut = mlx.RMSNormFn(mlpOut, l.PostFFNormScaled, cfg.RMSNormEps)
-		h = mlx.Add(h, mlpOut)
+		if fuseResidualScale {
+			h = gemma4ResidualScaleCompiled(residual, mlpOut, l.LayerScalar)
+		} else {
+			h = mlx.Add(residual, mlpOut)
+		}
 	}
 
 	// PLE injection (after MLP residual).
@@ -1198,7 +1324,7 @@ func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, posi
 	}
 
 	// Layer scalar for full-attention layers.
-	if l.LayerScalar != nil {
+	if l.LayerScalar != nil && !fuseResidualScale {
 		h = mlx.Mul(h, l.LayerScalar)
 	}
 
@@ -1206,6 +1332,9 @@ func (l *DecoderLayer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, posi
 }
 
 func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, isSliding bool, cfg *TextConfig, donor *sharedHistory) (*mlx.Array, *sharedHistory) {
+	cudaAvailable := mlx.CUDAIsAvailable()
+	directDecodeLayout := L == 1 && cudaAvailable
+
 	// Determine head dim and scale based on layer type.
 	headDim := cfg.HeadDim
 	scale := cfg.SlidingScale
@@ -1219,8 +1348,12 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 	}
 
 	q := a.QProj.Forward(x)
-	q = mlx.Reshape(q, B, L, cfg.NumAttentionHeads, headDim)
-	q = mlx.Transpose(q, 0, 2, 1, 3)
+	if directDecodeLayout {
+		q = mlx.Reshape(q, B, cfg.NumAttentionHeads, L, headDim)
+	} else {
+		q = mlx.Reshape(q, B, L, cfg.NumAttentionHeads, headDim)
+		q = mlx.Transpose(q, 0, 2, 1, 3)
+	}
 
 	// Apply Q norm.
 	q = mlx.RMSNormFn(q, a.QNormScaled, cfg.RMSNormEps)
@@ -1235,19 +1368,43 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 	if kv == nil {
 		// Determine KV head count: K=V full-attention layers use NumGlobalKeyValueHeads.
 		kvHeads := cfg.NumKeyValueHeads
-		if a.VProj == nil && !isSliding && cfg.NumGlobalKeyValueHeads > 0 {
+		if a.VProj == nil && a.FusedKVProj == nil && !isSliding && cfg.NumGlobalKeyValueHeads > 0 {
 			kvHeads = cfg.NumGlobalKeyValueHeads
 		}
 
-		k := a.KProj.Forward(x)
-		k = mlx.Reshape(k, B, L, kvHeads, headDim)
-		k = mlx.Transpose(k, 0, 2, 1, 3)
+		var k, v *mlx.Array
+		if a.FusedKVProj != nil {
+			kvPacked := a.FusedKVProj.Forward(x)
+			k = mlx.SliceStartStop(
+				kvPacked,
+				[]int32{0, 0, 0},
+				[]int32{B, L, a.KVSplitDim},
+			)
+			v = mlx.SliceStartStop(
+				kvPacked,
+				[]int32{0, 0, a.KVSplitDim},
+				[]int32{B, L, int32(kvPacked.Dim(2))},
+			)
+		} else {
+			k = a.KProj.Forward(x)
+			if a.VProj != nil {
+				v = a.VProj.Forward(x)
+			}
+		}
+		if directDecodeLayout {
+			k = mlx.Reshape(k, B, kvHeads, L, headDim)
+		} else {
+			k = mlx.Reshape(k, B, L, kvHeads, headDim)
+			k = mlx.Transpose(k, 0, 2, 1, 3)
+		}
 
-		var v *mlx.Array
-		if a.VProj != nil {
-			v = a.VProj.Forward(x)
-			v = mlx.Reshape(v, B, L, kvHeads, headDim)
-			v = mlx.Transpose(v, 0, 2, 1, 3)
+		if v != nil {
+			if directDecodeLayout {
+				v = mlx.Reshape(v, B, kvHeads, L, headDim)
+			} else {
+				v = mlx.Reshape(v, B, L, kvHeads, headDim)
+				v = mlx.Transpose(v, 0, 2, 1, 3)
+			}
 		} else {
 			// K=V: value_states = key_states (raw, before k_norm/rope).
 			v = k
@@ -1274,54 +1431,21 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 		}
 	}
 
-	var out *mlx.Array
-	if headDim > 128 && L > 1 && !mlx.MetalIsAvailable() {
-		// Manual attention for CUDA prefill with head_dim > 128.
-		// cuDNN SDPA requires head_dim <= 128, and the MLX CUDA SDPA vector
-		// kernel only handles L < 4 (generation). For prefill, we fall back
-		// to explicit matmul+softmax+matmul on CUDA.
-		var k, v *mlx.Array
-		mask := nn.CausalMask().Intersect(nn.QPaddingMask(b, q.DType()))
-		if kv.history != nil {
-			k, v = kv.history.K(), kv.history.V()
-			mask = kv.history.Mask(mask)
-		} else {
-			k, v = kv.k, kv.v
-			mask = mask.Intersect(nn.KPaddingMask(b, k.Dim(2), b.SeqQueryLens, q.DType()))
-			mask = mask.Intersect(kv.mask)
-		}
-		kvHeads := int32(k.Dim(1))
-		nRepeats := cfg.NumAttentionHeads / kvHeads
-		kLen := int32(k.Dim(2))
-		// AsArray returns [B, 1, L, K]; reshape to rank 5 so that
-		// right-to-left broadcast against scores [B, kvHeads,
-		// nRepeats, L, K] aligns the batch dim correctly.
-		maskArr := mlx.Reshape(mask.AsArray(b, int(kLen), q.DType()), B, 1, 1, L, kLen)
-
-		q = mlx.MulScalar(q, scale)
-		q = mlx.Reshape(q, B, kvHeads, nRepeats, L, headDim)
-		k = mlx.Reshape(k, B, kvHeads, 1, kLen, headDim)
-		v = mlx.Reshape(v, B, kvHeads, 1, kLen, headDim)
-
-		kT := mlx.Transpose(k, 0, 1, 2, 4, 3)
-		scores := mlx.Matmul(q, kT)
-		scores = mlx.Add(scores, maskArr)
-		scores = mlx.SoftmaxAxis(scores, -1, true)
-		out = mlx.Matmul(scores, v)
-		out = mlx.Reshape(out, B, cfg.NumAttentionHeads, L, headDim)
+	var opt nn.SDPAOption
+	mask := nn.CausalMask()
+	if kv.history != nil {
+		opt = nn.WithKVHistory(kv.history)
 	} else {
-		var opt nn.SDPAOption
-		mask := nn.CausalMask()
-		if kv.history != nil {
-			opt = nn.WithKVHistory(kv.history)
-		} else {
-			opt = nn.WithKV(kv.k, kv.v, b.SeqQueryLens)
-			mask = mask.Intersect(kv.mask)
-		}
-		out = nn.ScaledDotProductAttention(b, q, scale, opt, nn.WithMask(mask))
+		opt = nn.WithKV(kv.k, kv.v, b.SeqQueryLens)
+		mask = mask.Intersect(kv.mask)
 	}
-	out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*headDim)
-	if !mlx.MetalIsAvailable() {
+	out := nn.ScaledDotProductAttention(b, q, scale, opt, nn.WithMask(mask))
+	if directDecodeLayout {
+		out = mlx.Reshape(out, B, L, cfg.NumAttentionHeads*headDim)
+	} else {
+		out = mlx.Reshape(mlx.Transpose(out, 0, 2, 1, 3), B, L, cfg.NumAttentionHeads*headDim)
+	}
+	if cudaAvailable {
 		// Force contiguous layout before OProj on CUDA where matmul handles
 		// strided views differently. Metal handles them natively.
 		out = mlx.Contiguous(out, false)
@@ -1330,6 +1454,18 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 }
 
 func (m *MLP) Forward(x *mlx.Array) *mlx.Array {
+	if gate, ok := m.GateProj.(*nn.Linear); ok && (gate.Bias == nil || !gate.Bias.Valid()) {
+		if up, ok := m.UpProj.(*nn.Linear); ok && (up.Bias == nil || !up.Bias.Valid()) {
+			if hidden, ok := mlx.FastBF16GeGLUProjection(x, gate.Weight, up.Weight); ok {
+				if down, ok := m.DownProj.(*nn.Linear); ok && (down.Bias == nil || !down.Bias.Valid()) {
+					if out, ok := mlx.FastBF16Projection(hidden, down.Weight); ok {
+						return out
+					}
+				}
+				return m.DownProj.Forward(hidden)
+			}
+		}
+	}
 	gate := m.GateProj.Forward(x)
 	up := m.UpProj.Forward(x)
 	return m.DownProj.Forward(mlx.GeGLU(gate, up))
@@ -1337,20 +1473,26 @@ func (m *MLP) Forward(x *mlx.Array) *mlx.Array {
 
 // Forward runs the router to select top-k experts per token.
 // Returns (scores [B*L, topK], indices [B*L, topK]).
-func (r *Router) Forward(x *mlx.Array, cfg *TextConfig) (*mlx.Array, *mlx.Array) {
+func (r *Router) Forward(x *mlx.Array, cfg *TextConfig) (*mlx.Array, *mlx.Array, bool) {
 	dims := x.Dims()
 	BL := int32(dims[0]) * int32(dims[1])
 
 	// Flatten to [B*L, hidden].
 	xFlat := mlx.Reshape(x, BL, cfg.HiddenSize)
 
-	// Norm (no weight) -> scale by 1/sqrt(hidden_size) -> multiply by learnable scale.
-	normed := mlx.RMSNormFn(xFlat, nil, cfg.RMSNormEps)
-	normed = mlx.MulScalar(normed, cfg.RouterScale)
-	normed = mlx.Mul(normed, r.Scale)
+	// CUDA folds both router scales into RMSNorm to avoid two decode kernels.
+	normed := mlx.RMSNormFn(xFlat, r.NormScale, cfg.RMSNormEps)
+	if r.NormScale == nil {
+		normed = mlx.MulScalar(normed, cfg.RouterScale)
+		normed = mlx.Mul(normed, r.Scale)
+	}
 
 	// Project to expert scores: [B*L, num_experts].
 	expertScores := r.Proj.Forward(normed)
+
+	if scores, inds, ok := mlx.FastMoERouter(expertScores, r.ExpertScale); ok {
+		return scores, inds, true
+	}
 
 	// Top-k selection via argpartition on negated scores.
 	neg := mlx.Neg(expertScores)
@@ -1365,12 +1507,12 @@ func (r *Router) Forward(x *mlx.Array, cfg *TextConfig) (*mlx.Array, *mlx.Array)
 	scores := mlx.TakeAlongAxis(expertScores, inds, -1)
 	scores = mlx.SoftmaxAxis(scores, -1, true) // [B*L, topK]
 
-	return scores, inds
+	return scores, inds, false
 }
 
 // Forward runs the MoE block using GatherQMM (quantized) or GatherMM (dense).
 // scores: [B*L, topK], inds: [B*L, topK], x: [B, L, hidden].
-func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfig) *mlx.Array {
+func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, scoresIncludeExpertScale bool, cfg *TextConfig) *mlx.Array {
 	dims := x.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	topK := cfg.TopKExperts
@@ -1384,6 +1526,11 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 	// enabling coalesced memory access. Testing confirmed the sort is
 	// beneficial for prefill (2x faster with sort at 2048 tokens).
 	doSort := B*L >= 64
+	var gateUpLHSIndices, downLHSIndices *mlx.Array
+	if B*L == 1 {
+		gateUpLHSIndices = m.DecodeGateUpLHSIndices
+		downLHSIndices = m.DecodeDownLHSIndices
+	}
 	var invOrder *mlx.Array
 	n := B * L * topK
 
@@ -1391,7 +1538,11 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 		idxAll := mlx.Flatten(idxFlat)
 		order := mlx.Argsort(idxAll, 0)
 		invOrder = mlx.Argsort(order, 0)
-		xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
+		if sortedX, ok := mlx.FastSortedMoEDispatch(xFlat, order); ok {
+			xFlat = sortedX
+		} else {
+			xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
+		}
 		idxFlat = mlx.Reshape(mlx.Take(idxAll, order, 0), n, 1)
 	}
 
@@ -1402,7 +1553,7 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 		if m.UseFusedGateUp {
 			// Fused gate+up: single GatherQMM produces [B*L*topK, 1, 1, 2*intermediate]
 			gateUp := mlx.GatherQMM(xFlat, m.GateUpWeightQ, m.GateUpScales, m.GateUpBiases,
-				nil, idxFlat, true, m.GateUpGroupSize, m.GateUpBits, m.QuantMode, doSort)
+				gateUpLHSIndices, idxFlat, true, m.GateUpGroupSize, m.GateUpBits, m.QuantMode, doSort)
 			// Split along last dim into gate and up
 			guDims := gateUp.Dims()
 			mid := int32(guDims[len(guDims)-1] / 2)
@@ -1415,9 +1566,9 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 			hidden = mlx.GeGLU(gate, up)
 		} else {
 			gate := mlx.GatherQMM(xFlat, m.GateWeightQ, m.GateScales, m.GateBiases,
-				nil, idxFlat, true, m.GateGroupSize, m.GateBits, m.QuantMode, doSort)
+				gateUpLHSIndices, idxFlat, true, m.GateGroupSize, m.GateBits, m.QuantMode, doSort)
 			up := mlx.GatherQMM(xFlat, m.UpWeightQ, m.UpScales, m.UpBiases,
-				nil, idxFlat, true, m.UpGroupSize, m.UpBits, m.QuantMode, doSort)
+				gateUpLHSIndices, idxFlat, true, m.UpGroupSize, m.UpBits, m.QuantMode, doSort)
 			hidden = mlx.GeGLU(gate, up)
 		}
 		downMode := m.DownQuantMode
@@ -1425,7 +1576,7 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 			downMode = m.QuantMode
 		}
 		down = mlx.GatherQMM(hidden, m.DownWeightQ, m.DownScales, m.DownBiases,
-			nil, idxFlat, true, m.DownGroupSize, m.DownBits, downMode, doSort)
+			downLHSIndices, idxFlat, true, m.DownGroupSize, m.DownBits, downMode, doSort)
 	} else {
 		if m.UseFusedGateUp && m.GateUpWeight != nil {
 			gateUp := mlx.GatherMM(xFlat, m.GateUpWeight, nil, idxFlat, doSort)
@@ -1448,6 +1599,16 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 
 	// Unsort if needed.
 	if doSort {
+		if y, ok := mlx.FastSortedMoECombine(
+			down,
+			invOrder,
+			scores,
+			inds,
+			m.PerExpertScale,
+			!scoresIncludeExpertScale,
+		); ok {
+			return mlx.Reshape(y, B, L, cfg.HiddenSize)
+		}
 		down = mlx.Reshape(mlx.Take(mlx.Squeeze(mlx.Squeeze(down, 2), 1), invOrder, 0), B*L, topK, cfg.HiddenSize)
 	} else {
 		down = mlx.Squeeze(down, 2)
@@ -1456,14 +1617,22 @@ func (m *MoEBlock) Forward(x *mlx.Array, scores, inds *mlx.Array, cfg *TextConfi
 	// Reshape to [B*L, topK, hidden_size].
 	down = mlx.Reshape(down, B*L, topK, cfg.HiddenSize)
 
-	// Gather per-expert scales at selected indices: flatten inds, take, reshape back.
-	indsFlat := mlx.Reshape(inds, B*L*topK)
-	expertScales := mlx.Take(m.PerExpertScale, indsFlat, 0) // [B*L*topK]
-	expertScales = mlx.Reshape(expertScales, B*L, topK)     // [B*L, topK]
-	down = mlx.Mul(down, mlx.ExpandDims(expertScales, -1))
-
 	// Weight by dispatch scores and sum across experts (axis 1 = topK dim).
-	y := mlx.Sum(mlx.Mul(down, mlx.ExpandDims(scores, -1)), 1, false) // [B*L, hidden_size]
+	var y *mlx.Array
+	if scoresIncludeExpertScale {
+		y = gemma4MoEScaledWeightedSumCompiled(down, scores)
+	} else if m.UseCompiledWeightedSum {
+		// Gather per-expert scales at selected indices: flatten inds, take, reshape back.
+		indsFlat := mlx.Reshape(inds, B*L*topK)
+		expertScales := mlx.Take(m.PerExpertScale, indsFlat, 0) // [B*L*topK]
+		expertScales = mlx.Reshape(expertScales, B*L, topK)     // [B*L, topK]
+		y = gemma4MoEWeightedSumCompiled(down, scores, expertScales)
+	} else {
+		indsFlat := mlx.Reshape(inds, B*L*topK)
+		expertScales := mlx.Take(m.PerExpertScale, indsFlat, 0)
+		expertScales = mlx.Reshape(expertScales, B*L, topK)
+		y = gemma4MoEWeightedSumEager(down, scores, expertScales)
+	}
 
 	return mlx.Reshape(y, B, L, cfg.HiddenSize)
 }

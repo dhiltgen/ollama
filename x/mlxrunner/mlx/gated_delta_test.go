@@ -6,6 +6,22 @@ import (
 	"testing"
 )
 
+func TestCUDAPlatformGatedDeltaVectorLoadPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		goos, goarch string
+		want         bool
+	}{
+		{goos: "linux", goarch: "arm64", want: true},
+		{goos: "linux", goarch: "amd64", want: true},
+		{goos: "windows", goarch: "arm64", want: false},
+		{goos: "windows", goarch: "amd64", want: true},
+	} {
+		if got := cudaPlatformSupportsGatedDeltaVectorLoads(tc.goos, tc.goarch); got != tc.want {
+			t.Errorf("cudaPlatformSupportsGatedDeltaVectorLoads(%q, %q) = %v, want %v", tc.goos, tc.goarch, got, tc.want)
+		}
+	}
+}
+
 type gatedDeltaTestGeometry struct {
 	Hk, Dk, Hv, Dv int
 }

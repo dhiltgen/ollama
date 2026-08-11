@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
+	"runtime"
 	"strings"
 
 	"github.com/ollama/ollama/x/mlxrunner/batch"
@@ -163,9 +165,12 @@ type MLPBlock interface {
 
 // DenseMLP is SwiGLU feed-forward.
 type DenseMLP struct {
-	GateProj nn.LinearLayer
-	UpProj   nn.LinearLayer
-	DownProj nn.LinearLayer
+	GateProj        nn.LinearLayer
+	UpProj          nn.LinearLayer
+	DownProj        nn.LinearLayer
+	GateUpProj      nn.LinearLayer
+	GateGlobalScale *mlx.Array
+	UpGlobalScale   *mlx.Array
 }
 
 // SparseMoE is Qwen3.5's sparse MoE with shared expert.
@@ -176,22 +181,23 @@ type SparseMoE struct {
 	SharedExpertGate nn.LinearLayer
 }
 
-// SwitchMLP executes selected expert MLPs. Gate and up are always held
-// packed as one gate_up tensor; checkpoints that ship them separately are
-// fused at load.
+// SwitchMLP executes selected expert MLPs. Gate and up are normally packed as
+// one gate_up tensor. Memory-constrained devices can retain separate quantized
+// stacks to avoid materializing a second full copy during load.
 type SwitchMLP struct {
 	GateUpWeight *mlx.Array
 	DownWeight   *mlx.Array
 
 	GateUpWeightQ, GateUpScales, GateUpBias *mlx.Array
+	GateWeightQ, GateScales, GateBiases     *mlx.Array
+	UpWeightQ, UpScales, UpBiases           *mlx.Array
 	DownWeightQ, DownScales, DownBiases     *mlx.Array
+	DecodeGateUpLHSIndices                  *mlx.Array
+	DecodeDownLHSIndices                    *mlx.Array
 
-	GateUpBits      int
-	DownBits        int
-	GateUpGroupSize int
-	DownGroupSize   int
-	GateUpMode      string
-	DownMode        string
+	GateUpBits, GateBits, UpBits, DownBits                     int
+	GateUpGroupSize, GateGroupSize, UpGroupSize, DownGroupSize int
+	GateUpMode, GateMode, UpMode, DownMode                     string
 }
 
 type stackedExpertWeights struct {
@@ -504,6 +510,65 @@ func fuseExpertStacks(a, b *mlx.Array, axis int) *mlx.Array {
 	return out
 }
 
+func scalarGlobalScale(scale *mlx.Array) bool {
+	return scale == nil || scale.NumDims() == 0 || (scale.NumDims() == 1 && scale.Dim(0) == 1)
+}
+
+func fuseDenseQuantizedLinears(first, second nn.LinearLayer) (nn.LinearLayer, *mlx.Array, *mlx.Array) {
+	firstQ, firstOK := first.(*nn.QuantizedLinear)
+	secondQ, secondOK := second.(*nn.QuantizedLinear)
+	if !firstOK || !secondOK ||
+		firstQ.QBiases != nil || secondQ.QBiases != nil ||
+		firstQ.Bias != nil || secondQ.Bias != nil ||
+		!scalarGlobalScale(firstQ.GlobalScale) || !scalarGlobalScale(secondQ.GlobalScale) ||
+		firstQ.Bits != secondQ.Bits || firstQ.GroupSize != secondQ.GroupSize || firstQ.Mode != secondQ.Mode ||
+		firstQ.Weight.NumDims() != 2 || secondQ.Weight.NumDims() != 2 ||
+		firstQ.Scales.NumDims() != 2 || secondQ.Scales.NumDims() != 2 ||
+		firstQ.Weight.Dim(1) != secondQ.Weight.Dim(1) ||
+		firstQ.Scales.Dim(1) != secondQ.Scales.Dim(1) {
+		return nil, nil, nil
+	}
+
+	return &nn.QuantizedLinear{
+		Weight:    fuseExpertStacks(firstQ.Weight, secondQ.Weight, 0),
+		Scales:    fuseExpertStacks(firstQ.Scales, secondQ.Scales, 0),
+		GroupSize: firstQ.GroupSize,
+		Bits:      firstQ.Bits,
+		Mode:      firstQ.Mode,
+	}, firstQ.GlobalScale, secondQ.GlobalScale
+}
+
+func applyDenseGlobalScale(x, scale *mlx.Array) *mlx.Array {
+	if scale == nil {
+		return x
+	}
+	return mlx.Mul(x, scale).AsType(x.DType())
+}
+
+func cudaSupportsSharedGateUpFusion() bool {
+	major, minor, ok := mlx.CUDAComputeCapability()
+	return ok && cudaPlatformSupportsSharedGateUpFusion(runtime.GOOS, runtime.GOARCH, major, minor)
+}
+
+func cudaPlatformSupportsSharedGateUpFusion(goos, goarch string, major, minor int) bool {
+	return (goos != "windows" || goarch != "arm64") &&
+		(major != 12 || minor != 0)
+}
+
+func deviceSupportsQuantizedExpertGateUpFusion() bool {
+	return platformSupportsQuantizedExpertGateUpFusion(runtime.GOOS, runtime.GOARCH)
+}
+
+func platformSupportsQuantizedExpertGateUpFusion(goos, goarch string) bool {
+	// Packing the full expert stacks exceeds the usable shared system-memory
+	// budget on Windows/ARM64 during load. Keep the unfused representation.
+	return goos != "windows" || goarch != "arm64"
+}
+
+func shouldCacheDecodeExpertIndices(useQuantizedExperts bool, topK int32) bool {
+	return useQuantizedExperts && topK > 0
+}
+
 // fuseGateUpProjections joins gate and up stacks along the output dimension,
 // which is exact for quantized stacks: groups run along the input dimension.
 func fuseGateUpProjections(gate, up *stackedExpertWeights) *stackedExpertWeights {
@@ -742,12 +807,13 @@ func loadSwitchMLP(tensors map[string]*mlx.Array, cfg *Config, useQuantized bool
 		layerPrefix+".mlp.switch_mlp.down_proj",
 		layerPrefix+".mlp.experts.down_proj",
 	)
+	var gateW, upW *stackedExpertWeights
 	if gateUpW == nil {
-		gateW := loadStackedProjection(tensors, cfg, useQuantized,
+		gateW = loadStackedProjection(tensors, cfg, useQuantized,
 			layerPrefix+".mlp.switch_mlp.gate_proj",
 			layerPrefix+".mlp.experts.gate_proj",
 		)
-		upW := loadStackedProjection(tensors, cfg, useQuantized,
+		upW = loadStackedProjection(tensors, cfg, useQuantized,
 			layerPrefix+".mlp.switch_mlp.up_proj",
 			layerPrefix+".mlp.experts.up_proj",
 		)
@@ -757,17 +823,37 @@ func loadSwitchMLP(tensors map[string]*mlx.Array, cfg *Config, useQuantized bool
 		if upW == nil {
 			upW = collectPerExpertProjection(tensors, cfg, useQuantized, layerPrefix, "up_proj", cfg.NumExperts)
 		}
-		gateUpW = fuseGateUpProjections(gateW, upW)
+		if gateW == nil || upW == nil ||
+			gateW.Scales == nil || upW.Scales == nil ||
+			deviceSupportsQuantizedExpertGateUpFusion() {
+			gateUpW = fuseGateUpProjections(gateW, upW)
+		}
 	}
 	if downW == nil {
 		downW = collectPerExpertProjection(tensors, cfg, useQuantized, layerPrefix, "down_proj", cfg.NumExperts)
 	}
-	if gateUpW == nil || downW == nil {
+	if (gateUpW == nil && (gateW == nil || upW == nil)) || downW == nil {
 		return nil, fmt.Errorf("missing switch expert weights")
 	}
 
 	switchMLP := &SwitchMLP{}
-	if gateUpW.Scales != nil {
+	if gateUpW == nil {
+		if gateW.Scales == nil || upW.Scales == nil {
+			return nil, fmt.Errorf("separate switch expert gate/up weights must be quantized")
+		}
+		switchMLP.GateWeightQ = gateW.Weight
+		switchMLP.GateScales = gateW.Scales
+		switchMLP.GateBiases = gateW.Biases
+		switchMLP.GateBits = gateW.Bits
+		switchMLP.GateGroupSize = gateW.GroupSize
+		switchMLP.GateMode = gateW.Mode
+		switchMLP.UpWeightQ = upW.Weight
+		switchMLP.UpScales = upW.Scales
+		switchMLP.UpBiases = upW.Biases
+		switchMLP.UpBits = upW.Bits
+		switchMLP.UpGroupSize = upW.GroupSize
+		switchMLP.UpMode = upW.Mode
+	} else if gateUpW.Scales != nil {
 		switchMLP.GateUpWeightQ = gateUpW.Weight
 		switchMLP.GateUpScales = gateUpW.Scales
 		switchMLP.GateUpBias = gateUpW.Biases
@@ -858,6 +944,18 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		m.LMHead = m.EmbedTokens.AsLinear()
 	}
 
+	// Quantized-body artifacts keep lm_head dense, which costs a full bf16
+	// vocabulary scan every decode step (on qwen3.6-35b: 1.0GB/token versus
+	// ~0.5GB for a quantized head — the dominant decode-side gap to llama's
+	// q8 output rows). Repack to the model's quant mode so decode takes the
+	// fast fp_qmv path. Gated: MLX_MX_MODEL_QUANTIZED_LMHEAD=1.
+	if dense, ok := m.LMHead.(*nn.Linear); ok && dense != nil &&
+	    supportsGatherQMM(cfg.QuantMode, cfg.QuantBits) &&
+	    os.Getenv("MLX_MX_MODEL_QUANTIZED_LMHEAD") == "1" {
+		m.LMHead = nn.NewQuantizedLinear(
+			dense.Weight, dense.Bias,
+			cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode)
+	}
 	useQuantizedExperts := supportsGatherQMM(cfg.QuantMode, cfg.QuantBits)
 	if !useQuantizedExperts && cfg.TensorQuant != nil {
 		for _, tq := range cfg.TensorQuant {
@@ -871,10 +969,21 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			}
 		}
 	}
+	var decodeGateUpLHSIndices, decodeDownLHSIndices *mlx.Array
+	if mlx.CUDAIsAvailable() && shouldCacheDecodeExpertIndices(useQuantizedExperts, cfg.NumExpertsPerTok) {
+		gateUpIndices := make([]uint32, cfg.NumExpertsPerTok)
+		downIndices := make([]uint32, cfg.NumExpertsPerTok)
+		for i := range downIndices {
+			downIndices[i] = uint32(i)
+		}
+		decodeGateUpLHSIndices = mlx.FromValues(gateUpIndices, 1, int(cfg.NumExpertsPerTok))
+		decodeDownLHSIndices = mlx.FromValues(downIndices, 1, int(cfg.NumExpertsPerTok))
+		mlx.Eval(decodeGateUpLHSIndices, decodeDownLHSIndices)
+	}
 
 	for i := range cfg.NumHiddenLayers {
 		layerPrefix := fmt.Sprintf("%slayers.%d", modelPrefix, i)
-		layer, err := loadLayer(linears, tensors, cfg, layerPrefix, layerIsLinear(cfg, i), layerUsesMoE(cfg, i), useQuantizedExperts, shouldShiftNormWeights)
+		layer, err := loadLayer(linears, tensors, cfg, layerPrefix, layerIsLinear(cfg, i), layerUsesMoE(cfg, i), useQuantizedExperts, shouldShiftNormWeights, decodeGateUpLHSIndices, decodeDownLHSIndices)
 		if err != nil {
 			return err
 		}
@@ -885,7 +994,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	// num_nextn_predict_layers while a package ships without them. mtp.* names
 	// carry no container prefix.
 	if fc, _ := tensorByBase(tensors, "mtp.fc"); fc != nil {
-		if err := m.loadMTPHead(linears, tensors, useQuantizedExperts, shouldShiftNormWeights); err != nil {
+		if err := m.loadMTPHead(linears, tensors, useQuantizedExperts, shouldShiftNormWeights, decodeGateUpLHSIndices, decodeDownLHSIndices); err != nil {
 			return err
 		}
 	}
@@ -895,7 +1004,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 
 // loadLayer builds a decoder layer from tensors at layerPrefix. It serves both
 // the main stack and the MTP head's single full-attention layer.
-func loadLayer(linears model.LinearFactory, tensors map[string]*mlx.Array, cfg *Config, layerPrefix string, isLinear, useMoE, useQuantizedExperts, shiftNorms bool) (*Layer, error) {
+func loadLayer(linears model.LinearFactory, tensors map[string]*mlx.Array, cfg *Config, layerPrefix string, isLinear, useMoE, useQuantizedExperts, shiftNorms bool, decodeGateUpLHSIndices, decodeDownLHSIndices *mlx.Array) (*Layer, error) {
 	layer := &Layer{IsLinear: isLinear}
 
 	layer.InputNorm = loadNorm(tensors, layerPrefix+".input_layernorm.weight", shiftNorms, cfg.RMSNormEps)
@@ -985,17 +1094,28 @@ func loadLayer(linears model.LinearFactory, tensors map[string]*mlx.Array, cfg *
 		if err != nil {
 			return nil, fmt.Errorf("layer %s: %w", layerPrefix, err)
 		}
+		switchMLP.DecodeGateUpLHSIndices = decodeGateUpLHSIndices
+		switchMLP.DecodeDownLHSIndices = decodeDownLHSIndices
 		moe.SwitchMLP = switchMLP
 
 		sharedGateProj := linears.Make(layerPrefix + ".mlp.shared_expert.gate_proj")
 		sharedUpProj := linears.Make(layerPrefix + ".mlp.shared_expert.up_proj")
 		sharedDownProj := linears.Make(layerPrefix + ".mlp.shared_expert.down_proj")
 		if sharedGateProj != nil && sharedUpProj != nil && sharedDownProj != nil {
-			moe.SharedExpert = &DenseMLP{
+			sharedExpert := &DenseMLP{
 				GateProj: sharedGateProj,
 				UpProj:   sharedUpProj,
 				DownProj: sharedDownProj,
 			}
+			if cudaSupportsSharedGateUpFusion() {
+				sharedExpert.GateUpProj, sharedExpert.GateGlobalScale, sharedExpert.UpGlobalScale =
+					fuseDenseQuantizedLinears(sharedGateProj, sharedUpProj)
+				if sharedExpert.GateUpProj != nil {
+					sharedExpert.GateProj = nil
+					sharedExpert.UpProj = nil
+				}
+			}
+			moe.SharedExpert = sharedExpert
 			moe.SharedExpertGate = linears.Make(layerPrefix + ".mlp.shared_expert_gate")
 		}
 
@@ -1018,7 +1138,7 @@ func loadLayer(linears model.LinearFactory, tensors map[string]*mlx.Array, cfg *
 // loadMTPHead builds the MTP head from the mtp.* tensors. Its single decoder
 // layer is full attention even when the main stack is hybrid; lm_head and
 // embeddings are shared with the target.
-func (m *Model) loadMTPHead(linears model.LinearFactory, tensors map[string]*mlx.Array, useQuantizedExperts, shiftNorms bool) error {
+func (m *Model) loadMTPHead(linears model.LinearFactory, tensors map[string]*mlx.Array, useQuantizedExperts, shiftNorms bool, decodeGateUpLHSIndices, decodeDownLHSIndices *mlx.Array) error {
 	cfg := m.Config
 	mtpPrefix := "mtp."
 
@@ -1031,7 +1151,7 @@ func (m *Model) loadMTPHead(linears model.LinearFactory, tensors map[string]*mlx
 		return fmt.Errorf("mtp head: missing enorm/hnorm/fc/norm tensors")
 	}
 
-	layer, err := loadLayer(linears, tensors, cfg, mtpPrefix+"layers.0", false, cfg.NumExperts > 0, useQuantizedExperts, shiftNorms)
+	layer, err := loadLayer(linears, tensors, cfg, mtpPrefix+"layers.0", false, cfg.NumExperts > 0, useQuantizedExperts, shiftNorms, decodeGateUpLHSIndices, decodeDownLHSIndices)
 	if err != nil {
 		return err
 	}
@@ -1095,11 +1215,17 @@ func (g *GatedDeltaNet) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, 
 	z = mlx.Reshape(z, B, L, cfg.LinearNumValueHeads, cfg.LinearValueHeadDim)
 	convTail := cfg.LinearConvKernelDim - 1
 	var rc *cache.RecurrentCache
+	var deltaPrior *mlx.Array
 	opts := make([]nn.RecurrentOption, 0, 3)
-	opts = append(opts, nn.WithConvSiLU())
+	fastCUDA := mlx.CUDAIsAvailable() && B == 1 && L == 1
+	if !fastCUDA {
+		opts = append(opts, nn.WithConvSiLU())
+	}
 	if typed, ok := c.(*cache.RecurrentCache); ok {
 		rc = typed
-		opts = append(opts, nn.WithRecurrentHistory(rc.Get(b, x.DType())))
+		history := rc.Get(b, x.DType())
+		deltaPrior = history.DeltaState()
+		opts = append(opts, nn.WithRecurrentHistory(history))
 		// When the cache has scheduled per-token snapshots, segment the
 		// recurrent kernels at the interior offsets so each boundary state
 		// can be captured.
@@ -1107,17 +1233,44 @@ func (g *GatedDeltaNet) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, 
 			opts = append(opts, nn.WithSnapshotSplits(splits))
 		}
 	} else {
+		deltaPrior = mlx.Zeros(mlx.DTypeFloat32, int(B), int(cfg.LinearNumValueHeads), int(cfg.LinearValueHeadDim), int(cfg.LinearKeyHeadDim))
 		opts = append(opts, nn.WithRecurrentState(
 			mlx.Zeros(x.DType(), int(B), int(convTail), qkv.Dim(2)),
-			mlx.Zeros(mlx.DTypeFloat32, int(B), int(cfg.LinearNumValueHeads), int(cfg.LinearValueHeadDim), int(cfg.LinearKeyHeadDim)),
+			deltaPrior,
 		))
 	}
 
 	convOut, convStates := nn.CausalConv1D(b, qkv, g.Conv1D, int(convTail), opts...)
-	out, deltaStates := nn.GatedDelta(b, convOut, mixedBA, g.DtBias, g.AExp, opts...)
-	outDType := out.DType()
-	out = mlx.RMSNormFn(out, g.NormWeight, cfg.RMSNormEps)
-	out = mlx.Mul(out.AsType(mlx.DTypeFloat32), mlx.SiLU(z.AsType(mlx.DTypeFloat32))).AsType(outDType)
+	var out *mlx.Array
+	var deltaStates []*mlx.Array
+	fastOutput := false
+	if fastCUDA {
+		beta := mlx.SliceStartStop(mixedBA, []int32{0, 0, 0}, []int32{B, L, cfg.LinearNumValueHeads})
+		alpha := mlx.SliceStartStop(mixedBA, []int32{0, 0, cfg.LinearNumValueHeads}, []int32{B, L, 2 * cfg.LinearNumValueHeads})
+		q, k, v, decay, betaGate, ok := mlx.FastQwenGatedDeltaInputs(
+			convOut, alpha, beta, g.AExp, g.DtBias,
+		)
+		if ok {
+			var next *mlx.Array
+			out, next = mlx.GatedDeltaRecurrence(q, k, v, decay, betaGate, deltaPrior)
+			deltaStates = []*mlx.Array{next}
+			if fused, ok := mlx.FastQwenGatedDeltaOutput(out, z, g.NormWeight); ok {
+				out = fused
+				fastOutput = true
+			}
+		}
+	}
+	if out == nil {
+		if fastCUDA {
+			convOut = mlx.SiLU(convOut)
+		}
+		out, deltaStates = nn.GatedDelta(b, convOut, mixedBA, g.DtBias, g.AExp, opts...)
+	}
+	if !fastOutput {
+		outDType := out.DType()
+		out = mlx.RMSNormFn(out, g.NormWeight, cfg.RMSNormEps)
+		out = mlx.Mul(out.AsType(mlx.DTypeFloat32), mlx.SiLU(z.AsType(mlx.DTypeFloat32))).AsType(outDType)
+	}
 	out = mlx.Reshape(out, B, L, valueDim)
 	out = g.OutProj.Forward(out)
 	if rc != nil {
@@ -1127,6 +1280,18 @@ func (g *GatedDeltaNet) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, B, 
 }
 
 func (m *DenseMLP) Forward(x *mlx.Array, _ *Config) *mlx.Array {
+	if m.GateUpProj != nil {
+		gateUp := m.GateUpProj.Forward(x)
+		if m.GateGlobalScale == nil && m.UpGlobalScale == nil {
+			if hidden, ok := mlx.FastQwenSharedSwiGLU(gateUp); ok {
+				return m.DownProj.Forward(hidden)
+			}
+		}
+		gate, up := splitLastAxisHalves(gateUp)
+		gate = applyDenseGlobalScale(gate, m.GateGlobalScale)
+		up = applyDenseGlobalScale(up, m.UpGlobalScale)
+		return m.DownProj.Forward(mlx.SwiGLU(gate, up))
+	}
 	return m.DownProj.Forward(mlx.SwiGLU(m.GateProj.Forward(x), m.UpProj.Forward(x)))
 }
 
@@ -1150,21 +1315,35 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 		xFlat = mlx.ExpandDims(mlx.Take(mlx.Squeeze(xFlat, 1), mlx.FloorDivideScalar(order, topK), 0), 1)
 		idxFlat = mlx.Reshape(mlx.Take(idxAll, order, 0), n, 1)
 	}
-
-	var gateUp, down *mlx.Array
-	if s.GateUpWeightQ != nil {
-		gateUp = mlx.GatherQMM(xFlat, s.GateUpWeightQ, s.GateUpScales, s.GateUpBias,
-			nil, idxFlat, true, s.GateUpGroupSize, s.GateUpBits, s.GateUpMode, doSort)
-	} else {
-		gateUp = mlx.GatherMM(xFlat, s.GateUpWeight, nil, idxFlat, doSort)
+	var gateUpLHSIndices, downLHSIndices *mlx.Array
+	if B*L == 1 {
+		gateUpLHSIndices = s.DecodeGateUpLHSIndices
+		downLHSIndices = s.DecodeDownLHSIndices
 	}
-	gate, up := splitLastAxisHalves(gateUp)
-	hidden := mlx.SwiGLU(gate, up)
+
+	var gate, up, hidden, down *mlx.Array
+	switch {
+	case s.GateUpWeightQ != nil:
+		gateUp := mlx.GatherQMM(xFlat, s.GateUpWeightQ, s.GateUpScales, s.GateUpBias,
+			gateUpLHSIndices, idxFlat, true, s.GateUpGroupSize, s.GateUpBits, s.GateUpMode, doSort)
+		gate, up = splitLastAxisHalves(gateUp)
+		hidden = mlx.SwiGLU(gate, up)
+	case s.GateWeightQ != nil && s.UpWeightQ != nil:
+		gate = mlx.GatherQMM(xFlat, s.GateWeightQ, s.GateScales, s.GateBiases,
+			gateUpLHSIndices, idxFlat, true, s.GateGroupSize, s.GateBits, s.GateMode, doSort)
+		up = mlx.GatherQMM(xFlat, s.UpWeightQ, s.UpScales, s.UpBiases,
+			gateUpLHSIndices, idxFlat, true, s.UpGroupSize, s.UpBits, s.UpMode, doSort)
+		hidden = mlx.SwiGLU(gate, up)
+	default:
+		gateUp := mlx.GatherMM(xFlat, s.GateUpWeight, gateUpLHSIndices, idxFlat, doSort)
+		gate, up = splitLastAxisHalves(gateUp)
+		hidden = mlx.SwiGLU(gate, up)
+	}
 	if s.DownWeightQ != nil {
 		down = mlx.GatherQMM(hidden, s.DownWeightQ, s.DownScales, s.DownBiases,
-			nil, idxFlat, true, s.DownGroupSize, s.DownBits, s.DownMode, doSort)
+			downLHSIndices, idxFlat, true, s.DownGroupSize, s.DownBits, s.DownMode, doSort)
 	} else {
-		down = mlx.GatherMM(hidden, s.DownWeight, nil, idxFlat, doSort)
+		down = mlx.GatherMM(hidden, s.DownWeight, downLHSIndices, idxFlat, doSort)
 	}
 
 	if doSort {
@@ -1180,16 +1359,27 @@ func (m *SparseMoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 	dims := x.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 
-	probs := mlx.SoftmaxAxis(m.Gate.Forward(x), -1, true)
-	neg := mlx.Neg(probs)
-	inds := mlx.Argpartition(neg, int(cfg.NumExpertsPerTok)-1, -1)
-	shape := inds.Dims()
-	inds = mlx.SliceStartStop(inds, []int32{0, 0, 0}, []int32{int32(shape[0]), int32(shape[1]), cfg.NumExpertsPerTok})
+	logits := m.Gate.Forward(x)
+	var scores, inds *mlx.Array
+	if cfg.NumExperts == 256 && cfg.NumExpertsPerTok == 8 && cfg.NormTopKProb {
+		flatLogits := mlx.Reshape(logits, B*L, cfg.NumExperts)
+		if fastScores, fastInds, ok := mlx.FastNormalizedMoERouter256(flatLogits); ok {
+			scores = mlx.Reshape(fastScores, B, L, cfg.NumExpertsPerTok)
+			inds = mlx.Reshape(fastInds, B, L, cfg.NumExpertsPerTok)
+		}
+	}
+	if scores == nil {
+		probs := mlx.SoftmaxAxis(logits, -1, true)
+		neg := mlx.Neg(probs)
+		inds = mlx.Argpartition(neg, int(cfg.NumExpertsPerTok)-1, -1)
+		shape := inds.Dims()
+		inds = mlx.SliceStartStop(inds, []int32{0, 0, 0}, []int32{int32(shape[0]), int32(shape[1]), cfg.NumExpertsPerTok})
 
-	scores := mlx.TakeAlongAxis(probs, inds, -1)
-	if cfg.NormTopKProb && cfg.NumExpertsPerTok > 1 {
-		sumScores := mlx.Sum(scores, -1, true)
-		scores = mlx.Div(scores, sumScores)
+		scores = mlx.TakeAlongAxis(probs, inds, -1)
+		if cfg.NormTopKProb && cfg.NumExpertsPerTok > 1 {
+			sumScores := mlx.Sum(scores, -1, true)
+			scores = mlx.Div(scores, sumScores)
+		}
 	}
 
 	expertOut := m.SwitchMLP.Forward(x, inds, cfg)

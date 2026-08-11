@@ -2,6 +2,7 @@ package laguna
 
 import (
 	"math"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -10,6 +11,79 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/models/nn"
 )
+
+func TestSigmoidMoERouter256CUDAMatchesMLX(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	skipIfNoMLX(t)
+
+	biasValues := make([]float32, 256)
+	for i := range biasValues {
+		biasValues[i] = float32((i*19)%37-18) * 0.0078125
+	}
+	bias := mlx.FromValues(biasValues, 256)
+
+	for _, rows := range []int{1, 3, 8} {
+		t.Logf("rows=%d", rows)
+		logitValues := make([]float32, rows*256)
+		for row := range rows {
+			for i := range 256 {
+				logitValues[row*256+i] =
+					float32((i*73+row*29)%257-128) * 0.03125
+			}
+		}
+		logits := mlx.FromValues(logitValues, rows, 256).AsType(mlx.DTypeBFloat16)
+		gotWeights, gotIndices, ok := mlx.FastSigmoidMoERouter256(logits, bias)
+		if !ok {
+			t.Skip("MLX CUDA custom kernels unavailable")
+		}
+
+		probs, neg := mlx.SigmoidRouter(logits.AsType(mlx.DTypeFloat32), bias)
+		wantIndices := mlx.Argpartition(neg, 7, -1)
+		wantIndices = mlx.SliceStartStop(
+			wantIndices,
+			[]int32{0, 0},
+			[]int32{int32(rows), 8},
+		)
+		wantWeights := mlx.TakeAlongAxis(probs, wantIndices, -1)
+		wantWeights = mlx.Div(wantWeights, mlx.Sum(wantWeights, -1, true))
+
+		gotWeightsF32 := gotWeights.AsType(mlx.DTypeFloat32)
+		wantWeightsF32 := wantWeights.AsType(mlx.DTypeFloat32)
+		gotIndicesI32 := gotIndices.AsType(mlx.DTypeInt32)
+		wantIndicesI32 := wantIndices.AsType(mlx.DTypeInt32)
+		mlx.Eval(gotWeightsF32, wantWeightsF32, gotIndicesI32, wantIndicesI32)
+
+		gotWeightValues := gotWeightsF32.Floats()
+		wantWeightValues := wantWeightsF32.Floats()
+		gotIndexValues := gotIndicesI32.Ints()
+		wantIndexValues := wantIndicesI32.Ints()
+		for row := range rows {
+			got := make(map[int]float32, 8)
+			want := make(map[int]float32, 8)
+			for i := range 8 {
+				offset := row*8 + i
+				got[gotIndexValues[offset]] = gotWeightValues[offset]
+				want[wantIndexValues[offset]] = wantWeightValues[offset]
+			}
+			if len(got) != len(want) {
+				t.Fatalf("row %d: selected experts = %v, want %v", row, got, want)
+			}
+			for index, wantWeight := range want {
+				gotWeight, exists := got[index]
+				if !exists {
+					t.Fatalf("row %d: selected experts = %v, want %v", row, got, want)
+				}
+				if diff := math.Abs(float64(gotWeight - wantWeight)); diff > 1e-4 {
+					t.Fatalf(
+						"row %d expert %d: weight = %v, want %v",
+						row, index, gotWeight, wantWeight,
+					)
+				}
+			}
+		}
+	}
+}
 
 func TestParseConfigLagunaXS(t *testing.T) {
 	skipIfNoMLX(t)
@@ -85,6 +159,22 @@ func TestParseConfigLagunaXS(t *testing.T) {
 	}
 	if got := numHeadsForLayer(&cfg, 1); got != 64 {
 		t.Fatalf("numHeadsForLayer(1) = %d, want 64", got)
+	}
+}
+
+func TestPlatformQuantizedGateUpFusionPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		goos, goarch string
+		want         bool
+	}{
+		{goos: "linux", goarch: "arm64", want: true},
+		{goos: "linux", goarch: "amd64", want: true},
+		{goos: "windows", goarch: "arm64", want: false},
+		{goos: "darwin", goarch: "arm64", want: true},
+	} {
+		if got := platformSupportsQuantizedGateUpFusion(tc.goos, tc.goarch); got != tc.want {
+			t.Errorf("platformSupportsQuantizedGateUpFusion(%q, %q) = %v, want %v", tc.goos, tc.goarch, got, tc.want)
+		}
 	}
 }
 
@@ -598,8 +688,11 @@ func TestLagunaMoEWeightedSumCompiledMatchesEager(t *testing.T) {
 	wantAdd = wantAdd.AsType(mlx.DTypeFloat32)
 	wantAdd2 = wantAdd2.AsType(mlx.DTypeFloat32)
 	mlx.Eval(gotAdd, gotAdd2, wantAdd, wantAdd2)
-	assertFloatSlicesClose(t, gotAdd.Floats(), wantAdd.Floats(), 1e-6)
-	assertFloatSlicesClose(t, gotAdd2.Floats(), wantAdd2.Floats(), 1e-6)
+	// Compile may fuse across the eager graph's BF16 intermediate rounding
+	// boundaries. Keep the result within one BF16 ULP at this value range.
+	const bf16ULP = 4e-3
+	assertFloatSlicesClose(t, gotAdd.Floats(), wantAdd.Floats(), bf16ULP)
+	assertFloatSlicesClose(t, gotAdd2.Floats(), wantAdd2.Floats(), bf16ULP)
 }
 
 func TestSwitchMLPFusedGateUpMatchesSeparate(t *testing.T) {

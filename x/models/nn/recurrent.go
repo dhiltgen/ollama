@@ -19,6 +19,7 @@ type recurrentConfig struct {
 	deltaState *mlx.Array
 	splits     []int
 	convSiLU   bool
+	convRound  *mlx.DType
 }
 
 // WithRecurrentHistory supplies a cache's per-layer view of conv and
@@ -43,6 +44,15 @@ func WithRecurrentState(convState, deltaState *mlx.Array) RecurrentOption {
 // ignore it, so it can ride a shared option list.
 func WithConvSiLU() RecurrentOption {
 	return func(c *recurrentConfig) { c.convSiLU = true }
+}
+
+// WithConvSiLURoundTrip applies SiLU and rounds its result through dtype while
+// retaining the convolution input dtype for subsequent recurrent state math.
+func WithConvSiLURoundTrip(dtype mlx.DType) RecurrentOption {
+	return func(c *recurrentConfig) {
+		c.convSiLU = true
+		c.convRound = &dtype
+	}
 }
 
 // WithSnapshotSplits requests that the scan run in segments cut at the given

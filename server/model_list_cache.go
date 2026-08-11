@@ -402,14 +402,6 @@ func filterUnsupportedModelListCapabilities(capabilities []model.Capability, cfg
 			return c == model.CapabilityVision || c == model.CapabilityAudio
 		})
 	}
-	// Mirrors suppressAudioCapability in images.go so /api/tags and /api/show
-	// agree for safetensors models whose MLX runner serves vision but not audio.
-	if cfg.ModelFormat == "safetensors" && cfg.Renderer == "glimmer" {
-		capabilities = slices.DeleteFunc(capabilities, func(c model.Capability) bool {
-			return c == model.CapabilityAudio
-		})
-	}
-
 	return capabilities
 }
 

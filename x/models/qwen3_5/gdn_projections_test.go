@@ -57,7 +57,7 @@ func scatterRows(packed *mlx.Array, perm []int32) *mlx.Array {
 }
 
 func TestPackGatedDeltaProjectionsNativeMatchesSplit(t *testing.T) {
-	skipIfNoMLX(t)
+	useMLXTestThread(t)
 	cfg := gdnTestConfig()
 	keyDim := int(cfg.LinearNumKeyHeads * cfg.LinearKeyHeadDim)
 	valueDim := int(cfg.LinearNumValueHeads * cfg.LinearValueHeadDim)
@@ -96,7 +96,7 @@ func TestPackGatedDeltaProjectionsNativeMatchesSplit(t *testing.T) {
 }
 
 func TestConcatProjectionPairQuantized(t *testing.T) {
-	skipIfNoMLX(t)
+	useMLXTestThread(t)
 	in := 64
 	hi := nn.NewQuantizedLinear(patternArray(16, in).AsType(mlx.DTypeFloat32), nil, 32, 4, "affine")
 	lo := nn.NewQuantizedLinear(patternArray(8, in).AsType(mlx.DTypeFloat32), nil, 32, 4, "affine")
@@ -114,7 +114,7 @@ func TestConcatProjectionPairQuantized(t *testing.T) {
 }
 
 func TestConcatProjectionPairMixedFallsBackToDense(t *testing.T) {
-	skipIfNoMLX(t)
+	useMLXTestThread(t)
 	in := 64
 	hi := nn.NewQuantizedLinear(patternArray(16, in).AsType(mlx.DTypeFloat32), nil, 32, 4, "affine")
 	loW := patternArray(8, in)

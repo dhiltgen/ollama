@@ -27,15 +27,20 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
+	"github.com/ollama/ollama/x/mlxrunner/model/base"
 )
 
-const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
+const defaultMaxPagedOutBytes int64 = 8 << 30
 
 type prefixCache struct {
 	root          *trieNode   // root of the prefix trie
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
 	caches        []cache.Cache
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
+
+	maxPagedOutBytes    int64
+	maxPagedOutBytesSet bool
+	cudaTotalMemory     int64
 
 	// draftLookahead is how far the draft caches' entries reference past
 	// their own slot; trie keys pack each token with its look-ahead (see key).
@@ -52,10 +57,9 @@ type pendingSnapshot struct {
 // Callers should append generated tokens to outputs and
 // defer close to save the cache state.
 type cacheSession struct {
-	cache     *prefixCache
-	inputs    []int32
-	effInputs []uint32 // inputs' key alphabet, media folds applied
-	outputs   []int32
+	cache   *prefixCache
+	inputs  []int32
+	outputs []int32
 
 	caches    []cache.Cache
 	remaining []int32
@@ -66,9 +70,26 @@ type cacheSession struct {
 	pendingSnapshots []pendingSnapshot
 }
 
-// newPrefixCache manages the given cache slots for the model's life.
-func newPrefixCache(caches []cache.Cache) *prefixCache {
-	return &prefixCache{caches: caches}
+func newPrefixCache(m base.Model) *prefixCache {
+	c := &prefixCache{
+		maxPagedOutBytes:    defaultMaxPagedOutBytes,
+		maxPagedOutBytesSet: true,
+	}
+	if cacheFactory, ok := m.(interface{ NewCaches() []cache.Cache }); ok {
+		c.caches = cacheFactory.NewCaches()
+		return c
+	}
+	c.caches = make([]cache.Cache, m.NumLayers())
+	for i := range c.caches {
+		c.caches[i] = cache.NewKVCache()
+	}
+	return c
+}
+
+func (c *prefixCache) configureDeviceMemory() {
+	if total, _, ok := mlx.CUDADeviceMemory(); ok {
+		c.cudaTotalMemory = int64(total)
+	}
 }
 
 func (c *prefixCache) ensureRoot() {
@@ -82,11 +103,10 @@ func (c *prefixCache) ensureRoot() {
 
 // begin prepares caches for a new request. It finds the nearest
 // matching cache or creates new caches if none match.
-func (c *prefixCache) begin(inputs []int32, items []mediaItem) *cacheSession {
+func (c *prefixCache) begin(inputs []int32) *cacheSession {
 	c.ensureRoot()
 
-	effInputs := effectiveKeyTokens(inputs, items)
-	keys := c.key(effInputs)
+	keys := c.key(inputs)
 	matchPath, matched := findBestMatch(c.root, keys)
 	originalMatched := matched
 
@@ -106,7 +126,6 @@ func (c *prefixCache) begin(inputs []int32, items []mediaItem) *cacheSession {
 	session := &cacheSession{
 		cache:     c,
 		inputs:    inputs,
-		effInputs: effInputs,
 		caches:    c.caches,
 		remaining: remaining,
 	}
@@ -126,26 +145,12 @@ func (c *prefixCache) begin(inputs []int32, items []mediaItem) *cacheSession {
 	return session
 }
 
-// effectiveKeyTokens returns the per-position key alphabet: the token ID
-// outside media expansions, the item's fold value across each expansion's
-// whole range.
-func effectiveKeyTokens(tokens []int32, items []mediaItem) []uint32 {
-	eff := make([]uint32, len(tokens))
-	for i, t := range tokens {
-		eff[i] = uint32(t)
-	}
-	for _, item := range items {
-		for i := item.pos; i < item.pos+item.length; i++ {
-			eff[i] = item.fold
-		}
-	}
-	return eff
-}
-
-// key packs (token i, token i+1) per restorable offset: draft caches
-// pair each slot with the next token, so matching k keys verifies k+1
-// tokens and every match is a valid restore point.
-func (c *prefixCache) key(tokens []uint32) []trieKey {
+// key converts tokens to trie keys, one per restorable cache offset. A model
+// that drafts through MTP-style draft caches pairs each cache slot with the
+// token after it, so slot i is reusable only if token i+1 also matched. The
+// key for offset i then packs (token i, token i+1): matching k keys verifies
+// k+1 tokens, making every match a valid restore point.
+func (c *prefixCache) key(tokens []int32) []trieKey {
 	keys := make([]trieKey, max(len(tokens)-c.draftLookahead, 0))
 	switch c.draftLookahead {
 	case 0:
@@ -154,26 +159,12 @@ func (c *prefixCache) key(tokens []uint32) []trieKey {
 		}
 	case 1:
 		for i := range keys {
-			keys[i] = trieKey(tokens[i])<<32 | trieKey(tokens[i+1])
+			keys[i] = trieKey(uint32(tokens[i]))<<32 | trieKey(uint32(tokens[i+1]))
 		}
 	default:
 		panic(fmt.Sprintf("prefixCache: unsupported draft look-ahead %d", c.draftLookahead))
 	}
 	return keys
-}
-
-// storedKeys keys the session's evaluated stream: the prompt's effective
-// tokens plus generated tokens, which are never media.
-func (s *cacheSession) storedKeys() []trieKey {
-	eff := s.effInputs
-	if len(s.outputs) > 0 {
-		eff = make([]uint32, 0, len(s.effInputs)+len(s.outputs))
-		eff = append(eff, s.effInputs...)
-		for _, t := range s.outputs {
-			eff = append(eff, uint32(t))
-		}
-	}
-	return s.cache.key(eff)
 }
 
 // switchToPath transitions from the current active path to a new path,
@@ -208,7 +199,7 @@ func (c *prefixCache) switchToPath(newPath []*trieNode, matched int) {
 	leafNeedsRewind := matched < c.activePath[leaf].endOffset
 	if leafDiverges || leafNeedsRewind {
 		node := c.activePath[leaf]
-		if !hasAllSnapshots(node, c.caches) {
+		if !node.hasAllSnapshots() {
 			fromOffset := node.startOffset()
 			snaps := make([]cache.Snapshot, len(c.caches))
 			for j, kv := range c.caches {
@@ -412,7 +403,7 @@ func (s *cacheSession) attachPrefillSnapshots() {
 	// no captured state. Skip it rather than materialize a node whose edge
 	// claims tokens the cache never wrote. Closing its (nil) row is a no-op.
 	reached := c.minCacheOffset()
-	stored := s.storedKeys()
+	stored := c.key(append(s.inputs, s.outputs...))
 	for i, p := range pending {
 		if p.offset > reached {
 			// Never crossed by a write, so the row is nil; close any entry
@@ -521,6 +512,7 @@ func (s *cacheSession) close() {
 	// PrepareSnapshots would overwrite the schedule without closing them,
 	// leaking the pinned/lazy snapshots and their VRAM.
 	s.discardPrefillSnapshots()
+	defer s.cache.observeMemoryPressure()
 
 	offset := s.cache.minCacheOffset()
 	if offset <= 0 {
@@ -535,14 +527,16 @@ func (s *cacheSession) close() {
 		arrays = append(arrays, kv.State()...)
 	}
 
-	// Ensure that if we have run the forward pass and set the metadata
-	// that we also actually have the data.
+	// Keep cache materialization asynchronous. Synchronously evaluating every
+	// cache state at teardown can push otherwise viable near-capacity CUDA
+	// workloads over their memory limit. The completed forward pass has already
+	// contributed to the peak sampled by observeMemoryPressure below.
 	mlx.AsyncEval(arrays...)
 
 	// The caches never advance past the stored keys; anything more
 	// means positions desynced.
 	c := s.cache
-	stored := s.storedKeys()
+	stored := c.key(append(s.inputs, s.outputs...))
 	if offset > len(stored) {
 		panic(fmt.Sprintf("cache: offset %d exceeds %d stored keys", offset, len(stored)))
 	}
@@ -558,9 +552,63 @@ func (s *cacheSession) close() {
 	}
 }
 
+func constrainedPagedOutLimit(total, peak, pagedOut, current int64) int64 {
+	if total <= 0 || peak < 0 || pagedOut < 0 || current < 0 || peak > total {
+		return current
+	}
+
+	reserve := max(int64(2<<30), total/8)
+	overage := peak - (total - reserve)
+	if overage <= 0 {
+		return current
+	}
+
+	// Keep enough budget for a handful of useful snapshots instead of
+	// repeatedly evicting and recreating the active conversation frontier.
+	floor := min(current, int64(512<<20))
+	return min(current, max(pagedOut-overage, floor))
+}
+
+func (c *prefixCache) pagedOutLimit() int64 {
+	if !c.maxPagedOutBytesSet {
+		return defaultMaxPagedOutBytes
+	}
+	return c.maxPagedOutBytes
+}
+
+func (c *prefixCache) observeMemoryPressure() {
+	if c.cudaTotalMemory <= 0 {
+		return
+	}
+
+	current := c.pagedOutLimit()
+	peak := mlx.PeakMemory()
+	next := constrainedPagedOutLimit(
+		c.cudaTotalMemory,
+		int64(peak),
+		c.pagedOutBytes,
+		current,
+	)
+	if next >= current {
+		return
+	}
+
+	slog.Debug(
+		"reducing prefix cache memory limit",
+		"from", mlx.PrettyBytes(int(current)),
+		"to", mlx.PrettyBytes(int(next)),
+		"peak", mlx.PrettyBytes(peak),
+		"device_total", mlx.PrettyBytes(int(c.cudaTotalMemory)),
+	)
+	c.maxPagedOutBytes = next
+	c.maxPagedOutBytesSet = true
+	c.enforceEvictionPolicy()
+}
+
 // enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
 func (c *prefixCache) enforceEvictionPolicy() {
-	if c.pagedOutBytes <= maxPagedOutBytes {
+	limit := c.pagedOutLimit()
+	if c.pagedOutBytes <= limit {
 		return
 	}
 
@@ -569,7 +617,7 @@ func (c *prefixCache) enforceEvictionPolicy() {
 		activeSet[n] = true
 	}
 
-	for c.pagedOutBytes > maxPagedOutBytes {
+	for c.pagedOutBytes > limit {
 		var best *trieNode
 		walkNodes(c.root, func(n *trieNode) bool {
 			if n == c.root || activeSet[n] || len(n.children) > 1 {
@@ -664,7 +712,7 @@ func (c *prefixCache) dumpTree() {
 		if n.user {
 			flags = append(flags, "user")
 		}
-		if hasAllSnapshots(n, c.caches) {
+		if n.hasAllSnapshots() {
 			snapshotCount++
 			flags = append(flags, "snap")
 		}

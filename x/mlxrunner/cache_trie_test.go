@@ -291,6 +291,45 @@ func TestMergeWithChild(t *testing.T) {
 		checkTrieInvariants(t, root)
 	})
 
+	t.Run("NilCacheSlots", func(t *testing.T) {
+		now := time.Now()
+		root := &trieNode{lastUsed: now}
+		parent := &trieNode{
+			tokens:    []trieKey{1, 2},
+			endOffset: 2,
+			parent:    root,
+			lastUsed:  now,
+			snapshots: []cache.Snapshot{
+				&fakeSnapshot{tokens: []int32{1, 2}, from: 0, to: 2},
+				nil,
+			},
+		}
+		child := &trieNode{
+			tokens:    []trieKey{3, 4},
+			endOffset: 4,
+			parent:    parent,
+			lastUsed:  now,
+			snapshots: []cache.Snapshot{
+				&fakeSnapshot{tokens: []int32{3, 4}, from: 2, to: 4},
+				nil,
+			},
+		}
+		root.children = []*trieNode{parent}
+		parent.children = []*trieNode{child}
+
+		mc := &fakeRewindableCache{tracker: &snapshotTracker{}, tokens: []int32{1, 2, 3, 4}}
+		mergeWithChild(parent, []cache.Cache{mc, nil}, nil)
+
+		if got := parent.snapshots[1]; got != nil {
+			t.Fatalf("nil cache slot snapshot = %T, want nil", got)
+		}
+		merged := parent.snapshots[0].(*fakeSnapshot)
+		if merged.from != 0 || merged.to != 4 {
+			t.Fatalf("merged snapshot = [%d,%d), want [0,4)", merged.from, merged.to)
+		}
+		checkTrieInvariants(t, root)
+	})
+
 	t.Run("UserFlag", func(t *testing.T) {
 		root := &trieNode{lastUsed: time.Now()}
 		parent := &trieNode{

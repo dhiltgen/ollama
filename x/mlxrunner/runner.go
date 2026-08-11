@@ -3,9 +3,12 @@ package mlxrunner
 import (
 	"context"
 	"errors"
+	"iter"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -104,7 +107,7 @@ func (r *Runner) Load(modelName string) error {
 		mlx.Pin(arr)
 	}
 	mlx.Sweep()
-	mlx.Eval(collected...)
+	materializeModelWeights(collected)
 	configureWiredMemory()
 
 	r.Model = m
@@ -112,7 +115,8 @@ func (r *Runner) Load(modelName string) error {
 	r.contextLength = m.MaxContextLength()
 	caches := m.NewCaches()
 	draftCaches := newDraftCaches(draftModel)
-	r.cache = newPrefixCache(slices.Concat(caches, draftCaches))
+	r.cache = newPrefixCache(m, slices.Concat(caches, draftCaches))
+	r.cache.configureDeviceMemory()
 	r.Sampler = sample.New(r.contextLength)
 	r.spec = newSpeculation(r, draftModel, caches, draftCaches)
 
@@ -127,6 +131,51 @@ func newDraftCaches(draft base.DraftModel) []cache.Cache {
 		return nil
 	}
 	return draft.NewCaches()
+}
+
+func materializeModelWeights(arrays []*mlx.Array) {
+	if runtime.GOOS != "windows" || !mlx.GPUIsAvailable() {
+		mlx.Eval(arrays...)
+		return
+	}
+
+	const maxBatchBytes = 512 << 20
+	maxBatchArrays := materializationBatchArrayLimit(runtime.GOOS, runtime.GOARCH)
+	var (
+		batch      []*mlx.Array
+		batchBytes int
+	)
+	evalBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		mlx.Eval(batch...)
+		mlx.Sweep()
+		batch = batch[:0]
+		batchBytes = 0
+	}
+
+	for _, arr := range arrays {
+		n := arr.NumBytes()
+		if batchBytes > 0 && batchBytes+n > maxBatchBytes {
+			evalBatch()
+		}
+		batch = append(batch, arr)
+		batchBytes += n
+		if maxBatchArrays > 0 && len(batch) >= maxBatchArrays {
+			evalBatch()
+		}
+	}
+	evalBatch()
+}
+
+func materializationBatchArrayLimit(goos, goarch string) int {
+	// Windows/ARM64 CUDA systems use shared system memory and can exhaust their
+	// usable budget before a multi-array lazy batch's temporary storage is swept.
+	if goos == "windows" && goarch == "arm64" {
+		return 1
+	}
+	return 0
 }
 
 func configureWiredMemory() {
@@ -164,6 +213,13 @@ func configureWiredMemory() {
 		"previous", mlx.PrettyBytes(previous))
 }
 
+// hostLoadBlobThreshold is the safetensors shard size above which a
+// hardware-coherent integrated GPU loads the shard host-pinned (managed
+// memory with GPU AccessedBy advise; see io.go and the CUDA allocator's
+// unified_malloc). It keeps multi-GiB shards out of the device's ~40 GiB
+// memory-pool ceiling while the driver retains GPU residency for hot data.
+const hostLoadBlobThreshold = 8 << 30
+
 // loadTensorsFromManifest loads all tensor blobs from the manifest into a
 // flat map, deduplicating by digest and remapping safetensors key suffixes.
 //
@@ -175,13 +231,25 @@ func loadTensorsFromManifest(root *model.Root) (map[string]*mlx.Array, error) {
 	// Phase 1: Load all tensors raw from all blobs
 	rawTensors := make(map[string]*mlx.Array)
 	seen := make(map[string]bool)
+	integrated := mlx.IntegratedDevice()
 	for _, layer := range root.Manifest.GetTensorLayers("") {
 		if seen[layer.Digest] {
 			continue
 		}
 		seen[layer.Digest] = true
 		blobPath := root.Manifest.BlobPath(layer.Digest)
-		for name, arr := range mlx.Load(blobPath) {
+		// On hardware-coherent integrated GPUs, weight shards are loaded
+		// host-pinned (managed memory with GPU AccessedBy advise): shards
+		// too large for the device's practical memory-pool ceiling would
+		// otherwise OOM during load, and the driver keeps them GPU-resident
+		// when hot, so decode does not pay interconnect reads.
+		var arrays iter.Seq2[string, *mlx.Array]
+		if fi, err := os.Stat(blobPath); err == nil && integrated && fi.Size() >= hostLoadBlobThreshold {
+			arrays = mlx.LoadOnHost(blobPath)
+		} else {
+			arrays = mlx.Load(blobPath)
+		}
+		for name, arr := range arrays {
 			rawTensors[name] = arr
 		}
 	}
