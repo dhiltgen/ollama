@@ -66,11 +66,15 @@ func TestIndexedBlockScaledDotProductAttentionMatchesGraph(t *testing.T) {
 					Eval(got, want)
 
 					gotValues, wantValues := got.Floats(), want.Floats()
+					if len(gotValues) != len(wantValues) || len(wantValues) == 0 {
+						t.Fatalf("output length = %d, want nonempty %d", len(gotValues), len(wantValues))
+					}
 					for i := range wantValues {
-						if math.IsNaN(float64(gotValues[i])) || math.IsInf(float64(gotValues[i]), 0) {
-							t.Fatalf("out[%d] = %v, want finite output", i, gotValues[i])
+						gotValue, wantValue := float64(gotValues[i]), float64(wantValues[i])
+						if math.IsNaN(gotValue) || math.IsInf(gotValue, 0) || math.IsNaN(wantValue) || math.IsInf(wantValue, 0) {
+							t.Fatalf("out[%d] = %v, want finite %v", i, gotValues[i], wantValues[i])
 						}
-						if diff := float32(math.Abs(float64(gotValues[i] - wantValues[i]))); diff > 0.005 {
+						if diff := math.Abs(gotValue - wantValue); diff > 0.005 {
 							t.Fatalf("out[%d] = %v, want %v (diff %v)", i, gotValues[i], wantValues[i], diff)
 						}
 					}

@@ -78,6 +78,54 @@ func TestHyperConnectionMatchesReferenceFormula(t *testing.T) {
 	})
 }
 
+func TestPackHyperConnectionInputRejectsGlobalScales(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		down, inject bool
+		wantPacked   bool
+	}{
+		{"unscaled", false, false, true},
+		{"input mix", true, false, false},
+		{"block inject", false, true, false},
+		{"both", true, true, false},
+	} {
+		mlxtest.RunSubtest(t, tc.name, func(t *mlxtest.T) {
+			projection := func(withGlobalScale bool) *nn.QuantizedLinear {
+				values := make([]float32, 2*16)
+				for i := range values {
+					values[i] = float32(i%7-3) * 0.1
+				}
+				weight, scales, _ := mlx.Quantize(mlx.FromValues(values, 2, 16), 16, 4, "nvfp4")
+				p := &nn.QuantizedLinear{
+					Weight:    weight,
+					Scales:    scales,
+					GroupSize: 16,
+					Bits:      4,
+					Mode:      "nvfp4",
+				}
+				if withGlobalScale {
+					p.GlobalScale = mlx.FromValue(float32(1))
+				}
+				return p
+			}
+
+			got := packHyperConnectionInput(projection(tc.down), projection(tc.inject))
+			if !tc.wantPacked {
+				if got != nil {
+					t.Fatal("packed projections with a global scale, want separate fallback")
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("unscaled projections did not pack")
+			}
+			if got.OutputDim() != 4 {
+				t.Fatalf("packed output dimension = %d, want 4", got.OutputDim())
+			}
+		})
+	}
+}
+
 func matrix(rows [][]float32) *mlx.Array {
 	values := make([]float32, 0, len(rows)*len(rows[0]))
 	for _, row := range rows {
@@ -101,8 +149,15 @@ func assertClose(t *mlxtest.T, name string, got, want []float32) {
 	if len(got) != len(want) {
 		t.Fatalf("%s length = %d, want %d", name, len(got), len(want))
 	}
+	if len(want) == 0 {
+		t.Fatalf("%s has no values to compare", name)
+	}
 	for i := range want {
-		if math.Abs(float64(got[i]-want[i])) > 1e-5 {
+		gotValue, wantValue := float64(got[i]), float64(want[i])
+		if math.IsNaN(gotValue) || math.IsInf(gotValue, 0) || math.IsNaN(wantValue) || math.IsInf(wantValue, 0) {
+			t.Fatalf("%s[%d] = %v, want finite %v", name, i, got[i], want[i])
+		}
+		if math.Abs(gotValue-wantValue) > 1e-5 {
 			t.Fatalf("%s[%d] = %v, want %v", name, i, got[i], want[i])
 		}
 	}

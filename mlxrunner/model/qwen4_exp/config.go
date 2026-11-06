@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"strings"
 )
 
 type ropeParameters struct {
@@ -231,8 +230,4 @@ func (cfg *Config) validate() error {
 	}
 	cfg.Scale = float32(1 / math.Sqrt(float64(cfg.HeadDim)))
 	return nil
-}
-
-func (cfg *Config) layerIsLinear(layer int) bool {
-	return strings.EqualFold(cfg.LayerTypes[layer], "linear_attention")
 }

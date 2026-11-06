@@ -33,11 +33,10 @@ type hostPLEShard struct {
 type hostPLETable struct {
 	shards         []*hostPLEShard
 	rows           int
-	rowWidth       int
 	hasGlobalScale bool
 }
 
-func (m *Model) HostTensorNames() []string {
+func (m *Model) SkippedTensorNames() []string {
 	var names []string
 	for prefix, table := range m.hostPLE {
 		for i := range table.shards {
@@ -82,8 +81,7 @@ func openHostPLETables(root *model.Root, cfg *Config) (map[string]*hostPLETable,
 
 func openHostPLETable(layers map[string]manifest.Layer, quant map[string]*model.TensorQuantInfo, prefix string, shardCount, rowWidth int) (*hostPLETable, error) {
 	table := &hostPLETable{
-		shards:   make([]*hostPLEShard, shardCount),
-		rowWidth: rowWidth,
+		shards: make([]*hostPLEShard, shardCount),
 	}
 	for i := range shardCount {
 		name := fmt.Sprintf("%s.ple_embedding.ngram_embedding.shard_%d.weight", prefix, i)

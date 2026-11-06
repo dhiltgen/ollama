@@ -70,10 +70,17 @@ func TestSparseMoEGlobalScales(t *testing.T) {
 					got, want := moe.Forward(x, m.Config), reference.Forward(x, m.Config)
 					mlx.Eval(got, want)
 					gotValues, wantValues := got.Floats(), want.Floats()
+					if len(gotValues) != len(wantValues) || len(wantValues) == 0 {
+						t.Fatalf("%d tokens: output lengths got %d, want nonempty %d", tokens, len(gotValues), len(wantValues))
+					}
 					var peak, errorMax float64
 					for j, v := range wantValues {
-						peak = math.Max(peak, math.Abs(float64(v)))
-						errorMax = math.Max(errorMax, math.Abs(float64(gotValues[j]-v)))
+						gotValue, wantValue := float64(gotValues[j]), float64(v)
+						if math.IsNaN(gotValue) || math.IsInf(gotValue, 0) || math.IsNaN(wantValue) || math.IsInf(wantValue, 0) {
+							t.Fatalf("%d tokens: output[%d] = %v, want finite %v", tokens, j, gotValues[j], v)
+						}
+						peak = math.Max(peak, math.Abs(wantValue))
+						errorMax = math.Max(errorMax, math.Abs(gotValue-wantValue))
 					}
 					if math.IsNaN(errorMax) || errorMax > 0.005*peak {
 						t.Fatalf("%d tokens: max error %g, reference peak %g", tokens, errorMax, peak)

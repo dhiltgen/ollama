@@ -78,8 +78,8 @@ func TestParseConfig(t *testing.T) {
 	if cfg.ModelType != "qwen4_exp_text" || cfg.HiddenSize != 2560 || cfg.HCCount != 4 {
 		t.Fatalf("unexpected config identity: model_type=%q hidden=%d hc_count=%d", cfg.ModelType, cfg.HiddenSize, cfg.HCCount)
 	}
-	if !cfg.layerIsLinear(0) || cfg.layerIsLinear(3) {
-		t.Fatalf("unexpected layer classification: %v", cfg.LayerTypes)
+	if cfg.LayerTypes[0] != "linear_attention" || cfg.LayerTypes[3] != "full_attention" {
+		t.Fatalf("unexpected layer types: %v", cfg.LayerTypes)
 	}
 	if cfg.RopeDim != 64 {
 		t.Fatalf("rope dimension = %d, want 64", cfg.RopeDim)

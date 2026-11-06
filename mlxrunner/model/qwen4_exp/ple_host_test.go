@@ -91,43 +91,46 @@ func TestHostPLELookupMatchesResidentEmbedding(t *testing.T) {
 			for _, layer := range layers {
 				wantNames = append(wantNames, layer.Name, layer.Name+".scale", layer.Name+".global_scale")
 			}
-			gotNames := m.HostTensorNames()
+			gotNames := m.SkippedTensorNames()
 			slices.Sort(gotNames)
 			slices.Sort(wantNames)
 			if !slices.Equal(gotNames, wantNames) {
-				t.Fatalf("host tensor names = %v, want %v", gotNames, wantNames)
+				t.Fatalf("skipped tensor names = %v, want %v", gotNames, wantNames)
 			}
 
 			mlxtest.Run(t, func(t *mlxtest.T) {
+				resident := &PLE{ShardRows: rowsPerShard}
+				for shard := range shardCount {
+					start := shard * rowsPerShard
+					var globalScale *mlx.Array
+					if tc.globals[shard] != 0 {
+						globalScale = model.ToMLXGlobalScale(mlx.FromValue(tc.globals[shard]))
+					}
+					resident.EmbeddingShards = append(resident.EmbeddingShards, &nn.QuantizedEmbedding{
+						Weight:      mlx.FromValues(weights[start*2:(start+rowsPerShard)*2], rowsPerShard, rowWidth/8),
+						Scales:      mlx.FromValues(scales[start:start+rowsPerShard], rowsPerShard, rowWidth/16),
+						GlobalScale: globalScale,
+						GroupSize:   16,
+						Bits:        4,
+						Mode:        "nvfp4",
+					})
+				}
+
 				ids := mlx.FromValues([]int64{5, 0, 3, 3, 2, 4}, 2, 3)
 				got := table.lookup(ids).AsType(mlx.DTypeFloat32)
-				want := (&nn.QuantizedEmbedding{
-					Weight:    mlx.FromValues(weights, shardCount*rowsPerShard, rowWidth/8),
-					Scales:    mlx.FromValues(scales, shardCount*rowsPerShard, rowWidth/16),
-					GroupSize: 16,
-					Bits:      4,
-					Mode:      "nvfp4",
-				}).Forward(ids).AsType(mlx.DTypeFloat32)
+				want := resident.lookup(ids).AsType(mlx.DTypeFloat32)
 				mlx.Eval(got, want)
-				wantValues := want.Floats()
-				for row, id := range []int{5, 0, 3, 3, 2, 4} {
-					if factor := tc.globals[id/rowsPerShard]; factor != 0 {
-						for col := range rowWidth {
-							wantValues[row*rowWidth+col] *= factor
-						}
-					}
-				}
-				if !slices.Equal(got.Floats(), wantValues) {
-					t.Fatalf("host lookup = %v, want %v", got.Floats(), wantValues)
+				if !slices.Equal(got.Floats(), want.Floats()) {
+					t.Fatalf("host lookup = %v, want resident lookup %v", got.Floats(), want.Floats())
 				}
 			})
 		})
 	}
 }
 
-func TestResidentPLEDoesNotExcludeTensors(t *testing.T) {
-	if got := (&Model{}).HostTensorNames(); len(got) != 0 {
-		t.Fatalf("host tensor names = %v, want none", got)
+func TestResidentPLEDoesNotSkipTensors(t *testing.T) {
+	if got := (&Model{}).SkippedTensorNames(); len(got) != 0 {
+		t.Fatalf("skipped tensor names = %v, want none", got)
 	}
 }
 

@@ -70,8 +70,15 @@ func TestQSASparseAttentionMatchesReference(t *testing.T) {
 		got := out.Floats()
 		p2 := float32(math.Exp(2) / (math.Exp(2) + math.Exp(1)))
 		want := []float32{p2*30 + (1-p2)*10, p2*3 + (1-p2)*1}
+		if len(got) != len(want) || len(want) == 0 {
+			t.Fatalf("sparse attention lengths got %d, want nonempty %d", len(got), len(want))
+		}
 		for i := range want {
-			if math.Abs(float64(got[i]-want[i])) > 1e-4 {
+			gotValue, wantValue := float64(got[i]), float64(want[i])
+			if math.IsNaN(gotValue) || math.IsInf(gotValue, 0) || math.IsNaN(wantValue) || math.IsInf(wantValue, 0) {
+				t.Fatalf("sparse attention[%d] = %v, want finite %v", i, got[i], want[i])
+			}
+			if math.Abs(gotValue-wantValue) > 1e-4 {
 				t.Fatalf("sparse attention[%d] = %v, want %v", i, got[i], want[i])
 			}
 		}
