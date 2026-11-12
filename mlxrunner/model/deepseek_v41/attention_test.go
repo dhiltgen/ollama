@@ -135,8 +135,8 @@ func TestRotateTailPreservesLeadingChannelsAndInverts(t *testing.T) {
 	mlxtest.Run(t, func(t *mlxtest.T) {
 		x := mlx.FromValues([]float32{10, 20, 1, 0, 10, 20, 1, 0}, 1, 2, 1, 4)
 		positions := mlx.FromValues([]int32{0, 1}, 1, 2)
-		rotated := rotateTail(x, positions, []float32{1}, false)
-		recovered := rotateTail(rotated, positions, []float32{1}, true)
+		rotated := mlx.RotateTail(x, positions, []float32{1}, false)
+		recovered := mlx.RotateTail(rotated, positions, []float32{1}, true)
 		mlx.Eval(rotated, recovered)
 		compareFloats(t, "rotated", rotated.Floats(), []float32{10, 20, 1, 0, 10, 20, float32(math.Cos(1)), float32(math.Sin(1))}, 1e-5)
 		compareFloats(t, "inverse", recovered.Floats(), x.Floats(), 1e-5)
